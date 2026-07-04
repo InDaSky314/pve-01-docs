@@ -176,27 +176,35 @@ ifreload -a
   ("Tunnel B") — procedure below. The Flint 2's default-no-VPN policy means
   the server works fine before this lands.
 
-## Tunnel B — Switzerland WireGuard for VM 103 only
+## Tunnel B — Switzerland OpenVPN (TCP) for VM 103 only
 
-The existing Surfshark subscription covers this; no second provider needed.
-Use WireGuard (the Flint 2 routes it far faster than OpenVPN) and bind it
-per-device so nothing else in the house is affected. This can all be done
-before the server is even moved — the policy simply starts applying when
-VM 103 first leases `192.168.9.50`.
+**Chosen approach: OpenVPN over TCP** (preferred for stability), matching
+the existing Surfshark-US tunnel — the router already has a `SurfShark-TCP`
+OpenVPN client group with the service credentials stored, so the CH tunnel
+is one more profile in that group. The existing Surfshark subscription
+covers it; no second provider needed. This can all be done before the
+server is even moved — the policy starts applying when VM 103 first leases
+`192.168.9.50`.
 
-1. **Get a CH WireGuard config from Surfshark** (account holder step):
-   Surfshark website → **VPN → Manual setup → Router → WireGuard** →
-   generate a key pair (choose "I don't have a key pair") → pick a
-   **Switzerland** location → download the `.conf` file. It contains the
-   private key — treat it like a password, don't commit it to this repo.
+Throughput note: OpenVPN/TCP tops out far lower than WireGuard on this box
+and adds TCP-over-TCP overhead, but an IPTV stream is ~8–15 Mbit/s — well
+within it. If 1080p buffering ever becomes chronic, switching Tunnel B to
+WireGuard is a drop-in change (same policy rule, different tunnel).
+
+1. **Get the CH OpenVPN config** (account holder step): Surfshark website →
+   **VPN → Manual setup → Router → OpenVPN** → download the
+   **Switzerland (Zurich) TCP** profile (`ch-zur.prod.surfshark.com_tcp.ovpn`).
+   The service credentials shown on that page are already stored on the
+   router from the US setup.
 2. **Install it on the Flint 2**: UI at `http://192.168.9.1` → **VPN →
-   WireGuard Client → Add Configuration → Upload/paste the `.conf`**, name
-   it `Surfshark-CH`. Do **not** connect it "globally".
+   OpenVPN Client → Add Configuration** → upload the `.ovpn` into the
+   existing `SurfShark-TCP` group (credentials auto-fill). Do **not**
+   connect it "globally".
 3. **Bind VM 103 to it**: VPN Dashboard → **VPN Policy / Proxy Mode →
    "Based on the Client Device"** → add a rule: device
    `BC:24:11:59:1F:60` / `192.168.9.50` (shows as `VM103-Docker` once
-   seen) → via `Surfshark-CH`. Firmware 4.9 supports this alongside the
-   existing OpenVPN rule (multi-tunnel policy is already enabled:
+   seen) → via the CH tunnel. Firmware 4.9 runs this alongside the
+   existing US rule (multi-tunnel policy is already enabled:
    `route_policy.global.instance_on='1'`).
 4. **Enable the kill switch ("Block Non-VPN Traffic") on that rule** so
    IPTV traffic can never leak out the WAN if the tunnel drops. LAN access
