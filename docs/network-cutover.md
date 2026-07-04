@@ -29,11 +29,14 @@ gateway network (`192.168.9.0/24`). This is Phase 1 of
 - [ ] pve-01 physically connected to the `192.168.9.x` L2
 - [ ] pve-01 re-IP'd to `192.168.9.11` (steps below)
 - [ ] Verification checklist passed
-- [ ] "Tunnel B" (Switzerland) for VM 103: **not configured yet.** WireGuard
-      configs on the router are provider stubs (AzireVPN/Mullvad groups,
-      empty; one Surfshark US-Chicago peer imported); the active tunnel is
-      OpenVPN (Surfshark US). Adding a CH WireGuard tunnel + policy-routing
-      it to `192.168.9.50` is media-core Phase 1 work, fine to do later.
+- [x] "Tunnel B" (Switzerland) for VM 103: **done 2026-07-04.** OpenVPN TCP
+      tunnel `VM103-Swiss` (tunnel_id 8925) using the already-imported
+      Surfshark profile `ch-zur.prod.surfshark.com_tcp` (group
+      `SurfSharkAll` 48771, client 468), running as `ovpnclient2` alongside
+      the US tunnel. Kill switch **on**; VM 103's MAC
+      (`BC:24:11:59:1F:60`) is the only device bound to it. Verified:
+      tunnel egress is `156.146.62.37` — Zurich, Switzerland; other LAN
+      clients unaffected.
 
 As of 2026-07-04 pve-01 is **not visible on the current network** (full ping
 sweep of `192.168.9.0/24`; neither the host nor VM 103's MAC has *ever*
@@ -176,44 +179,29 @@ ifreload -a
   ("Tunnel B") — procedure below. The Flint 2's default-no-VPN policy means
   the server works fine before this lands.
 
-## Tunnel B — Switzerland OpenVPN (TCP) for VM 103 only
+## Tunnel B — Switzerland OpenVPN (TCP) for VM 103 only ✅ done
 
-**Chosen approach: OpenVPN over TCP** (preferred for stability), matching
-the existing Surfshark-US tunnel — the router already has a `SurfShark-TCP`
-OpenVPN client group with the service credentials stored, so the CH tunnel
-is one more profile in that group. The existing Surfshark subscription
-covers it; no second provider needed. This can all be done before the
-server is even moved — the policy starts applying when VM 103 first leases
-`192.168.9.50`.
+**Implemented 2026-07-04** via the router API. OpenVPN over TCP was chosen
+for stability, matching the existing Surfshark-US tunnel. As built:
+
+| | |
+|---|---|
+| Tunnel | `VM103-Swiss`, tunnel_id `8925`, interface `ovpnclient2` |
+| Profile | `ch-zur.prod.surfshark.com_tcp` (port 1443/TCP) — was already imported on the router in group `SurfSharkAll` (48771, client 468) with stored service credentials |
+| Bound devices | only MAC `BC:24:11:59:1F:60` (VM 103 / `192.168.9.50`), assigned via `vpn-client set_single_mac` |
+| Kill switch | **on** (`route_policy.@rule[1].killswitch='1'`) — VM 103 gets no WAN if the tunnel drops; LAN (Jellyfin serving, SSH) unaffected |
+| Default policy | unchanged — every other device stays no-VPN; the US "Primary Tunnel" (`ovpnclient1`) keeps running untouched |
+| Verified | `curl --interface ovpnclient2 am.i.mullvad.net/json` → `156.146.62.37`, Zurich, Switzerland; a LAN client checked at the same time did **not** egress via CH |
+
+Both tunnels appear side by side in the UI under **VPN Dashboard**; the
+device binding is under **Clients → VM103-Docker → VPN policy**.
 
 Throughput note: OpenVPN/TCP tops out far lower than WireGuard on this box
 and adds TCP-over-TCP overhead, but an IPTV stream is ~8–15 Mbit/s — well
 within it. If 1080p buffering ever becomes chronic, switching Tunnel B to
-WireGuard is a drop-in change (same policy rule, different tunnel).
+WireGuard is a drop-in change (same device binding, different tunnel).
 
-1. **Get the CH OpenVPN config** (account holder step): Surfshark website →
-   **VPN → Manual setup → Router → OpenVPN** → download the
-   **Switzerland (Zurich) TCP** profile (`ch-zur.prod.surfshark.com_tcp.ovpn`).
-   The service credentials shown on that page are already stored on the
-   router from the US setup.
-2. **Install it on the Flint 2**: UI at `http://192.168.9.1` → **VPN →
-   OpenVPN Client → Add Configuration** → upload the `.ovpn` into the
-   existing `SurfShark-TCP` group (credentials auto-fill). Do **not**
-   connect it "globally".
-3. **Bind VM 103 to it**: VPN Dashboard → **VPN Policy / Proxy Mode →
-   "Based on the Client Device"** → add a rule: device
-   `BC:24:11:59:1F:60` / `192.168.9.50` (shows as `VM103-Docker` once
-   seen) → via the CH tunnel. Firmware 4.9 runs this alongside the
-   existing US rule (multi-tunnel policy is already enabled:
-   `route_policy.global.instance_on='1'`).
-4. **Enable the kill switch ("Block Non-VPN Traffic") on that rule** so
-   IPTV traffic can never leak out the WAN if the tunnel drops. LAN access
-   (Jellyfin from the TV/Chromecast, SSH from the LAN) is unaffected — the
-   kill switch only blocks WAN egress.
-5. Leave everything else alone: default policy stays **no VPN**; the
-   Surfshark-US OpenVPN rule keeps doing whatever it does today.
-
-**Verify** (after the server is on the network):
+**Re-verify once the server is on the network:**
 
 ```bash
 # on VM 103 — must print a Surfshark Switzerland IP:
