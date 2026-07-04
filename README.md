@@ -15,7 +15,7 @@ Documentation for my single-node Proxmox VE homelab server, including the
 | **Hypervisor** | Proxmox VE 9.2.4 (kernel 6.8.12-32-pve) |
 | **Base OS** | Debian 13 "trixie" |
 | **Desktop GUI** | KDE Plasma 6.3 (installed on the host itself — see [docs/desktop-gui.md](docs/desktop-gui.md)) |
-| **Management IP** | `192.168.9.11/24` on bridge `vmbr0` (gateway `192.168.9.1`, Brume 2) |
+| **Management IP** | `192.168.9.11/24` on bridge `vmbr0` (gateway `192.168.9.1`, GL-MT6000 "Flint 2") |
 | **Web UI** | https://192.168.9.11:8006 |
 | **Timezone** | Europe/Berlin |
 

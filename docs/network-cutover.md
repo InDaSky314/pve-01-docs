@@ -1,64 +1,83 @@
 # Network cutover runbook — `192.168.8.0/24` → `192.168.9.0/24`
 
 Moves `pve-01` from the old AXT1800 LAN (`192.168.8.0/24`) onto the current
-Brume 2 network (`192.168.9.0/24`). This is Phase 1 of
+gateway network (`192.168.9.0/24`). This is Phase 1 of
 [project-media-core.md](project-media-core.md), expanded into exact commands.
+
+> **Reality check (2026-07-04):** the deployed gateway is a **GL-MT6000
+> "Flint 2"** (firmware 4.9.0), *not* the Brume 2 the media-core plan
+> assumed. Same role in the design, one welcome difference: the Flint 2
+> **has Wi-Fi radios** (SSID `Big-GL` live on 2.4 GHz, plus a GL-BE3600 and
+> a UniFi UAP-AC-Lite already acting as APs on the LAN), so the
+> "AXT1800 as access point" step is **optional** — the Chromecast is
+> already on this LAN over the existing Wi-Fi.
 
 ## Status
 
-- [x] Brume 2 is live as the current network gateway — verified 2026-07-04:
-  `192.168.9.1` answers (GL.iNet console), DHCP is handing out
-  `192.168.9.12x`–`.18x` leases to Wi-Fi clients.
-- [ ] Static DHCP lease `192.168.9.50` reserved for VM 103 on the Brume 2
-- [ ] AXT1800 switched to Access-Point mode behind the Brume 2
+- [x] Gateway (Flint 2) live at `192.168.9.1/24`, DHCP pool
+  `192.168.9.100`–`.249` (start 100, limit 150) — so the static `.11` and
+  `.50` are **outside the pool**, no conflict. Verified 2026-07-04 via
+  router API + `uci`.
+- [x] Static DHCP lease `192.168.9.50` reserved for VM 103
+  (MAC `BC:24:11:59:1F:60`, tag `VM103-Docker`) — **added 2026-07-04**,
+  committed and dnsmasq reloaded.
+- [x] VPN policy safe for the server: the router's default route policy is
+  **no VPN** (an OpenVPN "Primary Tunnel" rule with kill switch exists but
+  binds no LAN device by MAC), so pve-01 and the VMs will egress direct.
+- [ ] ~~AXT1800 switched to Access-Point mode~~ — optional now (see note
+      above); only needed if its extra ports/SSIDs are wanted.
 - [ ] pve-01 physically connected to the `192.168.9.x` L2
 - [ ] pve-01 re-IP'd to `192.168.9.11` (steps below)
 - [ ] Verification checklist passed
-- [ ] WireGuard Tunnel B policy routing bound to VM 103 (media-core Phase 1,
-      can be done later)
+- [ ] "Tunnel B" (Switzerland) for VM 103: **not configured yet.** WireGuard
+      configs on the router are provider stubs (AzireVPN/Mullvad groups,
+      empty; one Surfshark US-Chicago peer imported); the active tunnel is
+      OpenVPN (Surfshark US). Adding a CH WireGuard tunnel + policy-routing
+      it to `192.168.9.50` is media-core Phase 1 work, fine to do later.
 
 As of 2026-07-04 pve-01 is **not visible on the current network** (full ping
-sweep of `192.168.9.0/24` found only the Brume 2, one Wi-Fi AP-ish device at
-`.183`, a TV and a laptop). It is either powered off or still cabled to the
-old AXT1800 LAN with its static `192.168.8.11` config — with that config it
-cannot talk on the new subnet even if the cable is moved, which is exactly
-what this runbook fixes.
+sweep of `192.168.9.0/24`; neither the host nor VM 103's MAC has *ever*
+appeared in the router's client history). It is either powered off or still
+cabled to the old AXT1800 LAN with its static `192.168.8.11` config — with
+that config it cannot talk on the new subnet even if the cable is moved,
+which is exactly what this runbook fixes.
 
 ## Address plan
 
 | Device | Old | New | How |
 |---|---|---|---|
-| Gateway / DNS / DHCP | `192.168.8.1` (AXT1800) | `192.168.9.1` (Brume 2) | Brume 2 is the only router; AXT1800 becomes an AP |
+| Gateway / DNS / DHCP | `192.168.8.1` (AXT1800) | `192.168.9.1` (Flint 2) | Flint 2 is the only router |
 | pve-01 host (`vmbr0`) | `192.168.8.11/24` static | `192.168.9.11/24` static | edit `/etc/network/interfaces` (step 4) |
-| VM 103 "Docker" | DHCP on old LAN | `192.168.9.50` | static DHCP lease on Brume 2 keyed to MAC `BC:24:11:59:1F:60` |
-| Other VMs (101/102/104) | DHCP | DHCP (`192.168.9.x` pool) | nothing to do if they use DHCP — verify, see step 6 |
-| pfSense (VM 100) | stopped | stays stopped | Brume 2 does all routing/VPN |
+| VM 103 "Docker" | DHCP on old LAN | `192.168.9.50` | ✅ static lease on the Flint 2, keyed to MAC `BC:24:11:59:1F:60` |
+| Other VMs (101/102/104) | DHCP | DHCP (`192.168.9.100`–`.249` pool) | nothing to do if they use DHCP — verify, see step 6 |
+| pfSense (VM 100) | stopped | stays stopped | Flint 2 does all routing/VPN |
 
-> Both static addresses (`.11`, `.50`) sit below the Brume 2's DHCP pool
-> (observed leases start at `.100`+). Confirm the pool in the Brume 2 UI
-> (Network → LAN) doesn't reach below `.100`; shrink it if it does.
+Note: the Flint 2 also runs a separate IoT subnet (`192.168.10.1/24`) and a
+guest network — the server belongs on the main LAN, not those.
 
-## Step 1 — Brume 2: static lease for VM 103
+## Step 1 — Flint 2: static lease for VM 103 ✅ done
 
-GL.iNet UI at <http://192.168.9.1> → Clients (or Network → LAN → Address
-Reservation): bind `192.168.9.50` to MAC `BC:24:11:59:1F:60` (VM 103 `net0`).
-The VM won't show as a client until it has booted on the new network once —
-GL.iNet lets you add a reservation manually by MAC before that.
+Added 2026-07-04 via the router API (visible in the GL.iNet UI under
+Clients / Address Reservation):
 
-## Step 2 — AXT1800: Access-Point mode
+```
+dhcp.@host[4].mac='BC:24:11:59:1F:60'   # VM 103 net0
+dhcp.@host[4].ip='192.168.9.50'
+dhcp.@host[4].tag='VM103-Docker'
+```
 
-AXT1800 UI → Network → Network Mode → **Access Point**, then uplink one of
-its ports **LAN→LAN** into the Brume 2. SSIDs (`GL-AXT1800-ef3`,
-`GL-AXT1800-ef3-5G`, `IOT`) carry over; all Wi-Fi clients now pull
-`192.168.9.x` from the Brume 2. In AP mode the AXT1800's remaining ports act
-as a plain switch — use one of them for pve-01 if the Brume 2's single LAN
-port is taken.
+## Step 2 — AXT1800: Access-Point mode (optional)
+
+Not required: the Flint 2 has its own radios (`Big-GL`), and a GL-BE3600 +
+UAP-AC-Lite already extend the LAN. Only do this if the AXT1800's SSIDs
+(`GL-AXT1800-ef3*`, `IOT`) or extra switch ports are wanted: AXT1800 UI →
+Network → Network Mode → **Access Point**, uplink LAN→LAN into the Flint 2.
 
 ## Step 3 — Physical
 
-Cable pve-01 `enp2s0` (the first NIC — the only one wired today) into the
-Brume 2 LAN or any AXT1800 port (same L2 once it's an AP). `enp3s0`–`enp5s0`
-stay unplugged.
+Cable pve-01 `enp2s0` (the first NIC — the only one wired today) into any
+Flint 2 LAN port (`lan1`–`lan4`, or a switch/AP port on the same L2).
+`enp3s0`–`enp5s0` stay unplugged.
 
 ## Step 4 — Re-IP pve-01
 
@@ -150,5 +169,9 @@ ifreload -a
 - Continue with [project-media-core.md](project-media-core.md) Phase 0/2
   (the Docker stack on VM 103) — from here on the agent build on pve-01 can
   proceed over SSH at `192.168.9.11`.
-- Optional (media-core Phase 1, item 1): WireGuard tunnels A/B on the
-  Brume 2 with Tunnel B policy-routed to `192.168.9.50` only.
+- Pending VPN work (media-core Phase 1, item 1), adapted to what's actually
+  on the Flint 2: normal clients already egress direct or via the existing
+  OpenVPN "Primary Tunnel" (Surfshark US) per policy; the missing piece is a
+  **Switzerland WireGuard tunnel policy-routed to `192.168.9.50` only**
+  ("Tunnel B"). The Flint 2's default-no-VPN policy means the server works
+  fine before this lands.
