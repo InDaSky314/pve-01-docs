@@ -44,10 +44,12 @@ The intent: pfSense can take over routing between physical segments as soon
 as the other NICs are cabled, without touching the VM config.
 
 > pfSense is currently **stopped** — routing for `192.168.9.0/24` is handled
-> upstream by the GL.iNet **Brume 2** at `192.168.9.1`. The GL-AXT1800
-> "Slate AX" (the old `192.168.8.1` router) is repurposed as a Wi-Fi access
-> point behind the Brume 2; its SSIDs are saved as Wi-Fi profiles in
-> NetworkManager on the host.
+> upstream by the GL.iNet **GL-MT6000 "Flint 2"** at `192.168.9.1` (the
+> media-core plan assumed a Brume 2; the Flint 2 fills the same role and has
+> its own Wi-Fi, SSID `Big-GL`). The GL-AXT1800 "Slate AX" (the old
+> `192.168.8.1` router) is no longer needed as an AP but can optionally be
+> added as one; its SSIDs are saved as Wi-Fi profiles in NetworkManager on
+> the host.
 
 ## Wi-Fi
 

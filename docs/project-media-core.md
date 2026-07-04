@@ -7,6 +7,12 @@ assumes a bare-metal headless mini-PC behind a **GL.iNet Brume 2** on
 the existing **Docker VM (103)**, and the network gets migrated from the
 current AXT1800 `192.168.8.0/24` LAN to the Brume 2 `192.168.9.0/24` design.
 
+> **2026-07-04:** the gateway actually deployed on `192.168.9.1` is a
+> **GL-MT6000 "Flint 2"**, not a Brume 2. Everything below reads the same
+> with "Flint 2" substituted; bonus: it has Wi-Fi radios, so the
+> AXT1800-as-AP step is optional. Live router state and completed steps are
+> tracked in [network-cutover.md](network-cutover.md).
+
 ## Target state
 
 ```
