@@ -173,5 +173,49 @@ ifreload -a
   on the Flint 2: normal clients already egress direct or via the existing
   OpenVPN "Primary Tunnel" (Surfshark US) per policy; the missing piece is a
   **Switzerland WireGuard tunnel policy-routed to `192.168.9.50` only**
-  ("Tunnel B"). The Flint 2's default-no-VPN policy means the server works
-  fine before this lands.
+  ("Tunnel B") — procedure below. The Flint 2's default-no-VPN policy means
+  the server works fine before this lands.
+
+## Tunnel B — Switzerland WireGuard for VM 103 only
+
+The existing Surfshark subscription covers this; no second provider needed.
+Use WireGuard (the Flint 2 routes it far faster than OpenVPN) and bind it
+per-device so nothing else in the house is affected. This can all be done
+before the server is even moved — the policy simply starts applying when
+VM 103 first leases `192.168.9.50`.
+
+1. **Get a CH WireGuard config from Surfshark** (account holder step):
+   Surfshark website → **VPN → Manual setup → Router → WireGuard** →
+   generate a key pair (choose "I don't have a key pair") → pick a
+   **Switzerland** location → download the `.conf` file. It contains the
+   private key — treat it like a password, don't commit it to this repo.
+2. **Install it on the Flint 2**: UI at `http://192.168.9.1` → **VPN →
+   WireGuard Client → Add Configuration → Upload/paste the `.conf`**, name
+   it `Surfshark-CH`. Do **not** connect it "globally".
+3. **Bind VM 103 to it**: VPN Dashboard → **VPN Policy / Proxy Mode →
+   "Based on the Client Device"** → add a rule: device
+   `BC:24:11:59:1F:60` / `192.168.9.50` (shows as `VM103-Docker` once
+   seen) → via `Surfshark-CH`. Firmware 4.9 supports this alongside the
+   existing OpenVPN rule (multi-tunnel policy is already enabled:
+   `route_policy.global.instance_on='1'`).
+4. **Enable the kill switch ("Block Non-VPN Traffic") on that rule** so
+   IPTV traffic can never leak out the WAN if the tunnel drops. LAN access
+   (Jellyfin from the TV/Chromecast, SSH from the LAN) is unaffected — the
+   kill switch only blocks WAN egress.
+5. Leave everything else alone: default policy stays **no VPN**; the
+   Surfshark-US OpenVPN rule keeps doing whatever it does today.
+
+**Verify** (after the server is on the network):
+
+```bash
+# on VM 103 — must print a Surfshark Switzerland IP:
+curl -4 ifconfig.me
+# on any other machine — must print the home WAN IP (or Tunnel A's):
+curl -4 ifconfig.me
+# DNS must not leak — should resolve via the tunnel DNS from VM 103:
+dig +short whoami.akamai.net
+```
+
+If VM 103 has no internet at all after this: the tunnel is down and the
+kill switch is doing its job — check the WireGuard client status on the
+router before debugging the VM.
