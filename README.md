@@ -40,6 +40,7 @@ Details in [docs/virtual-machines.md](docs/virtual-machines.md).
 - [docs/storage.md](docs/storage.md) — disks, LVM-thin layout, storage pools
 - [docs/virtual-machines.md](docs/virtual-machines.md) — per-VM configuration and snapshots
 - [docs/host-setup.md](docs/host-setup.md) — packages, repos, services, known quirks
+- [docs/project-media-core.md](docs/project-media-core.md) — **planned**: DVR/media stack on VM 103 + migration to Brume 2 gateway (`192.168.9.0/24`)
 
 ## Architecture overview
 
