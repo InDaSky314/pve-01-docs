@@ -15,8 +15,8 @@ Documentation for my single-node Proxmox VE homelab server, including the
 | **Hypervisor** | Proxmox VE 9.2.4 (kernel 6.8.12-32-pve) |
 | **Base OS** | Debian 13 "trixie" |
 | **Desktop GUI** | KDE Plasma 6.3 (installed on the host itself — see [docs/desktop-gui.md](docs/desktop-gui.md)) |
-| **Management IP** | `192.168.8.11/24` on bridge `vmbr0` (gateway `192.168.8.1`) |
-| **Web UI** | https://192.168.8.11:8006 |
+| **Management IP** | `192.168.9.11/24` on bridge `vmbr0` (gateway `192.168.9.1`, GL-MT6000 "Flint 2") |
+| **Web UI** | https://192.168.9.11:8006 |
 | **Timezone** | Europe/Berlin |
 
 ## What runs on it
@@ -35,12 +35,17 @@ Details in [docs/virtual-machines.md](docs/virtual-machines.md).
 
 ## Documentation index
 
+> 🤖 **Agents start at [CLAUDE.md](CLAUDE.md)** — reading order, current
+> project state, verified network facts, and hard rules.
+
 - [docs/desktop-gui.md](docs/desktop-gui.md) — how and why KDE Plasma is installed on the hypervisor
 - [docs/network.md](docs/network.md) — physical NICs, Linux bridges, pfSense wiring
+- [docs/network-cutover.md](docs/network-cutover.md) — **runbook**: migration from the old AXT1800 LAN (`192.168.8.0/24`) to the Brume 2 (`192.168.9.0/24`), with status checklist and rollback
 - [docs/storage.md](docs/storage.md) — disks, LVM-thin layout, storage pools
 - [docs/virtual-machines.md](docs/virtual-machines.md) — per-VM configuration and snapshots
 - [docs/host-setup.md](docs/host-setup.md) — packages, repos, services, known quirks
-- [docs/project-media-core.md](docs/project-media-core.md) — **planned**: DVR/media stack on VM 103 + migration to Brume 2 gateway (`192.168.9.0/24`)
+- [docs/project-media-core.md](docs/project-media-core.md) — **in progress**: DVR/media stack on VM 103; network migration to `192.168.9.0/24` (router side complete)
+- [docs/media-core-manifest.md](docs/media-core-manifest.md) — the original Media-Core manifest the plan above adapts (reference only)
 
 ## Architecture overview
 
@@ -48,7 +53,7 @@ Details in [docs/virtual-machines.md](docs/virtual-machines.md).
                         ┌─────────────────────────────────────────────┐
                         │  pve-01  (Proxmox VE 9.2 + KDE Plasma)      │
                         │                                             │
-  LAN 192.168.8.0/24 ───┤ enp2s0 ── vmbr0 ── host IP 192.168.8.11     │
+  LAN 192.168.9.0/24 ───┤ enp2s0 ── vmbr0 ── host IP 192.168.9.11     │
                         │             │                               │
                         │             ├── VM100 pfSense (net0)        │
                         │             ├── VM101 Zorn                  │

@@ -14,8 +14,10 @@ The box has four onboard 2.5GbE Intel NICs. Only the first is cabled today.
 
 ## Bridges (`/etc/network/interfaces`, managed by Proxmox)
 
-- **`vmbr0`** — static `192.168.8.11/24`, gateway `192.168.8.1`. Carries the
+- **`vmbr0`** — static `192.168.9.11/24`, gateway `192.168.9.1`. Carries the
   host management IP and the default network for every VM.
+  (Was `192.168.8.11/24` on the old AXT1800 LAN — see
+  [network-cutover.md](network-cutover.md) for the migration runbook.)
 - **`vmbr1`–`vmbr3`** — one bridge per spare physical NIC, no IP on the host.
   Ready to become dedicated pfSense WAN/LAN/OPT segments once cabled.
 - **`vmbr4`** — no physical port at all. A pure internal switch; used as an
@@ -41,9 +43,13 @@ pfSense has five virtio NICs — one per bridge:
 The intent: pfSense can take over routing between physical segments as soon
 as the other NICs are cabled, without touching the VM config.
 
-> pfSense is currently **stopped** — routing for `192.168.8.0/24` is handled
-> upstream by the GL.iNet router at `192.168.8.1` (a GL-AXT1800 "Slate AX";
-> its SSIDs are saved as Wi-Fi profiles in NetworkManager on the host).
+> pfSense is currently **stopped** — routing for `192.168.9.0/24` is handled
+> upstream by the GL.iNet **GL-MT6000 "Flint 2"** at `192.168.9.1` (the
+> media-core plan assumed a Brume 2; the Flint 2 fills the same role and has
+> its own Wi-Fi, SSID `Big-GL`). The GL-AXT1800 "Slate AX" (the old
+> `192.168.8.1` router) is no longer needed as an AP but can optionally be
+> added as one; its SSIDs are saved as Wi-Fi profiles in NetworkManager on
+> the host.
 
 ## Wi-Fi
 
