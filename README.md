@@ -35,13 +35,17 @@ Details in [docs/virtual-machines.md](docs/virtual-machines.md).
 
 ## Documentation index
 
+> 🤖 **Agents start at [CLAUDE.md](CLAUDE.md)** — reading order, current
+> project state, verified network facts, and hard rules.
+
 - [docs/desktop-gui.md](docs/desktop-gui.md) — how and why KDE Plasma is installed on the hypervisor
 - [docs/network.md](docs/network.md) — physical NICs, Linux bridges, pfSense wiring
 - [docs/network-cutover.md](docs/network-cutover.md) — **runbook**: migration from the old AXT1800 LAN (`192.168.8.0/24`) to the Brume 2 (`192.168.9.0/24`), with status checklist and rollback
 - [docs/storage.md](docs/storage.md) — disks, LVM-thin layout, storage pools
 - [docs/virtual-machines.md](docs/virtual-machines.md) — per-VM configuration and snapshots
 - [docs/host-setup.md](docs/host-setup.md) — packages, repos, services, known quirks
-- [docs/project-media-core.md](docs/project-media-core.md) — **planned**: DVR/media stack on VM 103 + migration to Brume 2 gateway (`192.168.9.0/24`)
+- [docs/project-media-core.md](docs/project-media-core.md) — **in progress**: DVR/media stack on VM 103; network migration to `192.168.9.0/24` (router side complete)
+- [docs/media-core-manifest.md](docs/media-core-manifest.md) — the original Media-Core manifest the plan above adapts (reference only)
 
 ## Architecture overview
 

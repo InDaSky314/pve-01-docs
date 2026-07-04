@@ -172,12 +172,9 @@ ifreload -a
 - Continue with [project-media-core.md](project-media-core.md) Phase 0/2
   (the Docker stack on VM 103) — from here on the agent build on pve-01 can
   proceed over SSH at `192.168.9.11`.
-- Pending VPN work (media-core Phase 1, item 1), adapted to what's actually
-  on the Flint 2: normal clients already egress direct or via the existing
-  OpenVPN "Primary Tunnel" (Surfshark US) per policy; the missing piece is a
-  **Switzerland WireGuard tunnel policy-routed to `192.168.9.50` only**
-  ("Tunnel B") — procedure below. The Flint 2's default-no-VPN policy means
-  the server works fine before this lands.
+- VPN ("Tunnel B") is already **done** — see the as-built section below.
+  Nothing VPN-related remains before or after the cutover; VM 103 starts
+  egressing via Zurich the moment it appears at `192.168.9.50`.
 
 ## Tunnel B — Switzerland OpenVPN (TCP) for VM 103 only ✅ done
 
@@ -213,5 +210,5 @@ dig +short whoami.akamai.net
 ```
 
 If VM 103 has no internet at all after this: the tunnel is down and the
-kill switch is doing its job — check the WireGuard client status on the
-router before debugging the VM.
+kill switch is doing its job — check the `VM103-Swiss` tunnel status in the
+router's VPN Dashboard before debugging anything inside the VM.
