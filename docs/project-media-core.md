@@ -77,6 +77,10 @@ first, then survive the router swap unchanged (it will just get a new IP).
 
 ## Phase 1 — Network cutover to the Brume 2
 
+> **Expanded into a step-by-step runbook with exact commands, verification
+> and rollback: [network-cutover.md](network-cutover.md).** The outline
+> below is kept for context; execute from the runbook.
+
 Do this in one maintenance window; everything is reversible.
 
 1. **Brume 2**: configure LAN `192.168.9.1/24`, DHCP on. Add the two
@@ -141,8 +145,9 @@ currently drives the KDE desktop on the host.** Options, in order:
   `lvs -a` data% as the DVR fills up.
 - **Secrets**: the provider M3U/EPG URLs embed account tokens. Keep them in
   `.env` on the VM only — never in this repo.
-- **Docs to update after cutover**: `README.md` (management IP) and
-  `docs/network.md` (gateway/subnet) both reference `192.168.8.x`.
+- **Docs**: `README.md` and `docs/network.md` have been updated to the
+  `192.168.9.x` addressing ahead of the cutover; the live status checklist
+  is in [network-cutover.md](network-cutover.md).
 - **Content sourcing**: the open-source stack itself is legitimate
   tooling; what's actually licensed to record/replay depends entirely on
   the IPTV provider behind the M3U URL.
