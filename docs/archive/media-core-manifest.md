@@ -1,3 +1,5 @@
+> **ARCHIVED** — kept for history; superseded by the consolidated [../../README.md](../../README.md). Links to other docs/ files may be dead.
+
 > Original "Media-Core" systems manifest, imported verbatim 2026-07-04
 > (architecture diagram image stripped). **Read [project-media-core.md](project-media-core.md)
 > first** — it adapts this manifest to pve-01 and supersedes it where they
