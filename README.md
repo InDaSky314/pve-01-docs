@@ -21,15 +21,14 @@ Documentation for my single-node Proxmox VE homelab server, including the
 
 ## What runs on it
 
-Five QEMU/KVM virtual machines (no LXC containers currently):
+Two QEMU/KVM virtual machines and one LXC container (VMs 100 PFSENSE,
+101 Zorn and 103 Docker were destroyed 2026-07-05):
 
-| VMID | Name | OS | vCPU | RAM | Purpose |
+| ID | Name | Type / OS | vCPU | RAM | Purpose |
 |---|---|---|---|---|---|
-| 100 | PFSENSE | pfSense CE 2.7.1 | 1 | 2 GB | Router/firewall — wired to all 5 bridges |
-| 101 | Zorn | Linux (Zorin OS 16.3) | 4 | 4 GB | Linux desktop VM |
-| 102 | WIN11 | Windows 11 (UEFI + vTPM) | 4 | 8 GB | Windows desktop VM |
-| 103 | Docker | Linux | 2 | 8 GB | Docker host (1 TB data disk) |
-| 104 | SRV-STD-2022 | Windows Server 2022 Eval | 2 | 8 GB | Windows Server lab |
+| 102 | WIN11 | VM — Windows 11 (UEFI + vTPM) | 4 | 8 GB | Windows desktop VM |
+| 104 | SRV-STD-2022 | VM — Windows Server 2022 Eval | 2 | 8 GB | Windows Server lab |
+| 105 | media-core | LXC — Debian 13 (unprivileged) | 2 | 8 GB | Media-Core Docker stack (Jellyfin/Threadfin/m3u2strm), `192.168.9.50`, 1 TB data mount |
 
 Details in [docs/virtual-machines.md](docs/virtual-machines.md).
 
@@ -44,7 +43,7 @@ Details in [docs/virtual-machines.md](docs/virtual-machines.md).
 - [docs/storage.md](docs/storage.md) — disks, LVM-thin layout, storage pools
 - [docs/virtual-machines.md](docs/virtual-machines.md) — per-VM configuration and snapshots
 - [docs/host-setup.md](docs/host-setup.md) — packages, repos, services, known quirks
-- [docs/project-media-core.md](docs/project-media-core.md) — **in progress**: DVR/media stack on VM 103; network migration to `192.168.9.0/24` (router side complete)
+- [docs/project-media-core.md](docs/project-media-core.md) — DVR/media stack in LXC 105 (`192.168.9.50`); Phases 0–1 deployed 2026-07-05, Phase 2 (provider URLs + UI config) pending
 - [docs/media-core-manifest.md](docs/media-core-manifest.md) — the original Media-Core manifest the plan above adapts (reference only)
 
 ## Architecture overview
@@ -55,17 +54,14 @@ Details in [docs/virtual-machines.md](docs/virtual-machines.md).
                         │                                             │
   LAN 192.168.9.0/24 ───┤ enp2s0 ── vmbr0 ── host IP 192.168.9.11     │
                         │             │                               │
-                        │             ├── VM100 pfSense (net0)        │
-                        │             ├── VM101 Zorn                  │
                         │             ├── VM102 WIN11                 │
-                        │             ├── VM103 Docker                │
-                        │             └── VM104 SRV-STD-2022          │
+                        │             ├── VM104 SRV-STD-2022          │
+                        │             └── CT105 media-core (.9.50)    │
                         │                                             │
-        (unplugged) ────┤ enp3s0 ── vmbr1 ──┐                         │
-        (unplugged) ────┤ enp4s0 ── vmbr2 ──┼── VM100 pfSense         │
-        (unplugged) ────┤ enp5s0 ── vmbr3 ──┘   (net2/net3/net4)      │
+        (unplugged) ────┤ enp3s0 ── vmbr1                             │
+        (unplugged) ────┤ enp4s0 ── vmbr2                             │
+        (unplugged) ────┤ enp5s0 ── vmbr3                             │
                         │                                             │
-                        │  (no NIC) vmbr4 ── VM100 pfSense (net1)     │
-                        │           internal-only lab bridge          │
+                        │  (no NIC) vmbr4 ── internal-only lab bridge │
                         └─────────────────────────────────────────────┘
 ```

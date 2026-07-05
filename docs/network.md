@@ -28,7 +28,7 @@ All VM NICs are virtio with the Proxmox firewall flag enabled
 (`firewall=1`); both `pve-firewall` and the newer nftables-based
 `proxmox-firewall` services are running.
 
-## pfSense wiring (VM 100)
+## pfSense wiring (VM 100) — historical; VM 100 destroyed 2026-07-05
 
 pfSense has five virtio NICs — one per bridge:
 
