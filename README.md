@@ -105,11 +105,14 @@ IPTV provider (Xtream API, cf.teltv.xyz — get.php M3U download is DISABLED, HT
    │  (all egress via Swiss tunnel)
    ▼
 xtream-sync.py  (CT 105, systemd timer, daily 04:00)
-   ├─→ threadfin/conf/playlist.m3u   ~550 channels in ordered, clean-named groups:
-   │       Wisconsin Local (23) → Wisconsin Sports (2) → US News (98)
-   │       → UK News (27) → Germany TV & News (108) → US Sports (159)
-   │       → UK Sports (41: Sky Sports + TNT VIP HD) → German Sports (68)
-   │       → Bundesliga (23)          [reshaped 2026-07-05: variety over PPV]
+   ├─→ threadfin/conf/playlist.m3u   ~535 channels, numbered blocks (tvg-chno),
+   │       English before German [owner request 2026-07-05]:
+   │       100s Wisconsin Local (33, all WI markets) → 150s Wisconsin Sports (2)
+   │       → 160s Chicago Local (14) → 200s US News (90) → 300s US Sports (147)
+   │       → 500s UK News (27) → 530s UK Sports (25) → 600s Germany TV & News (106)
+   │       → 750s German Sports (68) → 850s Bundesliga (23)
+   │       (dead CSN brand, TUDN EXTRA event channels, exact duplicate
+   │       names excluded; per-group start_chno in config.json)
    ├─→ epg/epg.xml                   a <channel> entry with LOGO for every channel
    │                                 (display-name == tuner name → Jellyfin auto-maps
    │                                 artwork) + provider programmes (~145 channels),
@@ -163,6 +166,15 @@ media/{movies,tvshows,recordings}
     log and zero bytes to clients). Without a buffer, Threadfin cannot
     enforce the tuner limit.
   - ffmpeg buffer runs pure stream-copy (`-c copy` remux, no transcode).
+  - **Channel numbers (2026-07-05):** Threadfin runs in **XEPG mode**
+    (`settings.json → epgSource: "XEPG"`); it auto-adopts the playlist's
+    `tvg-chno` as `x-channelID`, which becomes the HDHomeRun
+    `GuideNumber` Jellyfin sorts by. Gotcha: new channels arrive
+    **inactive** (dropped from the lineup) — `sync/activate-xepg.py`
+    (media-core-xepg.timer, 04:25) activates them; it stops/starts
+    threadfin because Threadfin rewrites xepg.json on shutdown. The
+    Threadfin-side XMLTV mapping stays "-" — Jellyfin gets its guide
+    from /epg/epg.xml directly.
 - **Threadfin tuner = 1 is the account's hard brake** (provider
   `max_connections: 1`). Never raise it. Recording a game and watching that
   same recording simultaneously still uses one provider stream (Jellyfin
@@ -240,8 +252,17 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
   (`media-core-sync.timer`: playlist + EPG incl. external backfill + VOD;
   on success it also API-triggers Jellyfin's Refresh Guide + library scan
   if they're idle) → 04:15 Threadfin re-reads the playlist
-  (`settings.json → update`) → 04:30 Jellyfin Refresh Guide (daily
-  trigger) → 04:45 Jellyfin library scan (daily trigger). Manual:
+  (`settings.json → update`) → 04:25 XEPG activation of new channels
+  (`media-core-xepg.timer`) → 04:30 Jellyfin Refresh Guide (daily
+  trigger) → 04:45 Jellyfin library scan (daily trigger).
+- **Streaming bandwidth ceiling:** the Swiss OpenVPN tunnel tops out
+  around **10 Mbit/s** (measured 2026-07-05: 1.3 MB/s to a fast mirror
+  and from the provider). 1080p web-rips play fine; Blu-ray/4K remuxes
+  (15–80 Mbit) **will buffer** — pick the non-4K copy or set a client
+  bitrate limit (~8 Mbit). The initial metadata scan competes for the
+  same tunnel (posters via TMDB); `LibraryScanFanoutConcurrency=2` set
+  to keep it polite. Real fix if wanted: switch the router tunnel to
+  WireGuard (typically 3–5× OpenVPN throughput on the Flint 2). Manual:
   `pct exec 105 -- python3 /srv/media-core/sync/xtream-sync.py` then
   restart threadfin or wait for its scheduled update.
 - **Sync reliability guards (v4):** provider API calls retry 3× with
@@ -308,6 +329,7 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | 2026-07-05 (later) | Lineup reshaped per owner: less PPV sports, more variety — Wisconsin locals first, then US News, German TV & News, US/German sports, Bundesliga (~480 channels). Sync v2: grouped/ordered selections, channel-name cleaning, logos injected into the EPG for every channel (~90% artwork coverage in Jellyfin), movie titles normalized for TMDB matching (21.8k after dedupe). Jellyfin xmltv cache gotcha documented. |
 | 2026-07-05 (v3) | Added UK News (27) + UK Sports (41, Sky/TNT VIP HD) → ~550 channels, 213 with guide data. VOD dedupe made English-first. Fanart plugin installed for extra movie artwork. |
 | 2026-07-05 (v4) | EPG + reliability pass. Sync v4: external XMLTV backfill (epgshare01 US/UK/DE) with call-sign/normalized-name matching + `epg_aliases` — guide coverage 192 → 322 of 549 channels (Wisconsin locals 22/23). Provider API retries; VOD prune guard (<70% ⇒ no deletes) fixes fluctuating movie counts. Nightly cascade reordered: 04:00 sync → 04:15 Threadfin → 04:30 guide refresh → 04:45 library scan (fixed daily triggers replace drifting intervals; sync also API-triggers both). Jellyfin automation API key added (CT-only). Diagnosed: movie-count churn = aborted scans + mid-scan pruning, not probing; remote ffprobe only fires on playback. VOD dedupe hardened after owner screenshots showed 4× "7 Days in Entebbe": year-less duplicate prints dropped when a (Year) copy exists, "EN-TOP - NN." compound prefixes stripped, superscript digits normalized (²→" 2") — 21,813 → 20,680 unique movies. Jellyfin gotcha: the web UI's A–Z jump bar "#" filter shows only symbol/digit titles (owner saw "844 movies"). |
+| 2026-07-05 (v5) | Lineup v5 + numbering: channel numbers via `tvg-chno` blocks (100s WI locals … 850s Bundesliga), English groups before German; Wisconsin broadened to all WI markets (33), Chicago Local added (14); CSN (dead brand), TUDN EXTRA, exact-duplicate names excluded → 535 channels, EPG coverage 288/461 unique ids. Threadfin switched to XEPG mode (auto-adopts tvg-chno; 04:25 activation timer for new channels). Prune guard caught provider VOD API returning an empty list — zero movies deleted. Measured VPN ceiling ~10 Mbit/s (buffering on high-bitrate remuxes); scan fanout capped at 2; WireGuard upgrade recommended. Jellyfin empty-PresentationUniqueKey bug fixed (users saw ~1k of 20.7k movies). |
 
 Historical deep-dives preserved in [`docs/archive/`](docs/archive/):
 the original Media-Core manifest (imported verbatim) and the network
