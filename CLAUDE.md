@@ -4,7 +4,12 @@ You are (most likely) running on `pve-01`, a single-node Proxmox VE 9.2
 homelab (Debian 13, KDE Plasma installed directly on the host). This repo is
 its documentation and the plan of record. The owner is Finley; the mission
 is **Project Media-Core**: a self-hosted DVR/VOD stack (Jellyfin + Threadfin
-+ m3u2strm) inside the existing Docker VM (VMID 103).
++ m3u2strm) in **LXC CT 105 `media-core`** (Debian 13, unprivileged,
+Docker inside). The stack was **deployed 2026-07-05** ("Phase 0 as-built"
+in the plan); what remains is Phase 2 (provider M3U/EPG URLs + UI config)
+and resolving the **egress anomaly** noted in the runbook. VM 103, the
+original target, was destroyed by the owner on 2026-07-05 along with VMs
+100 and 101.
 
 ## Read in this order
 
@@ -22,17 +27,15 @@ is **Project Media-Core**: a self-hosted DVR/VOD stack (Jellyfin + Threadfin
 ## First: establish where things stand
 
 ```bash
-ip -4 addr show vmbr0 | grep inet     # 192.168.9.11 = cutover done; 192.168.8.11 = NOT done
-qm list                                # VM state; 103 = Docker host
-qm guest cmd 103 network-get-interfaces 2>/dev/null | grep -o '"ip-address":"192[^"]*'  # VM 103 IP
+ip -4 addr show vmbr0 | grep inet   # expect 192.168.9.11 (cutover done 2026-07-05)
+pct list; qm list                    # CT 105 media-core should be running; VMs 102/104 exist
+pct exec 105 -- docker ps            # jellyfin + threadfin up; m3u2strm only after Phase 2
+curl -s -o /dev/null -w '%{http_code}\n' http://192.168.9.50:8096        # 200
+curl -s -o /dev/null -w '%{http_code}\n' http://192.168.9.50:34400/web/  # 200
 ```
 
-- If the host still has `192.168.8.11`: execute runbook steps 3–6 **from the
-  local KDE console, never over SSH** (the session dies mid-change). If you
-  are an SSH session, stop and tell the user to run step 4 at the console.
-- If the host has `192.168.9.11`: cutover is done; tick the runbook
-  checklist, then proceed to the media stack (Phase 0, then Phase 2 in
-  [docs/project-media-core.md](docs/project-media-core.md)).
+The stack lives in `/srv/media-core/` **inside CT 105** (compose + `.env` +
+data). Drive the container with `pct exec 105 -- …`.
 
 ## Network facts (verified 2026-07-04, from the router itself)
 
@@ -41,32 +44,34 @@ qm guest cmd 103 network-get-interfaces 2>/dev/null | grep -o '"ip-address":"192
 | Gateway/DNS/DHCP | `192.168.9.1` — GL.iNet **GL-MT6000 "Flint 2"**, fw 4.9.0 (docs may say "Brume 2"; the Flint 2 replaced it in the plan) |
 | DHCP pool | `.100`–`.249`; statics `.11` and `.50` are outside it |
 | pve-01 | `192.168.9.11/24` static on `vmbr0` (bridge over `enp2s0`, the only cabled NIC) |
-| VM 103 | DHCP, reserved lease `192.168.9.50` ← MAC `BC:24:11:59:1F:60` |
-| VM 103 VPN | **All WAN egress goes via OpenVPN TCP to Zurich** (router tunnel `VM103-Swiss`, kill switch ON). No internet on VM 103 = tunnel is down on the router — check there first, not in the VM. LAN traffic is unaffected. |
+| CT 105 | DHCP, reserved lease `192.168.9.50` ← MAC `BC:24:11:59:1F:60` (inherited from destroyed VM 103 — **never give this MAC to another guest**) |
+| CT 105 VPN | *Design:* all WAN egress via OpenVPN TCP to Zurich (router tunnel `VM103-Swiss`, kill switch ON); no internet in the CT = tunnel down on the router — check there first. *Reality 2026-07-05:* **not in effect** — the CT and the host both egress via the same US IP `45.43.19.29`; see the egress anomaly in [docs/network-cutover.md](docs/network-cutover.md). |
 | Other devices | default no-VPN; a separate Surfshark-US tunnel exists — leave both alone |
 | Router access | web UI / SSH root at `192.168.9.1`; password is **not** in this repo — ask the user. Router-side work is complete; you shouldn't need it. |
 
 ## Hard rules
 
 - **This repo is private and must stay free of secrets.** IPTV provider
-  M3U/EPG URLs embed account tokens → they live only in a `.env` on VM 103
-  (compose references `${M3U_URL}`). Never commit them; never paste them
-  into logs or commit messages.
-- **Do not start pfSense (VM 100)** — the Flint 2 does all routing; pfSense
-  wiring predates the current network and would conflict.
+  M3U/EPG URLs embed account tokens → they live only in
+  `/srv/media-core/.env` inside CT 105 (mode 600; compose references
+  `${MOVIES_M3U_URL}` / `${TVEPISODES_M3U_URL}`). Never commit them; never
+  paste them into logs or commit messages.
 - **No `/dev/dri` mapping into Jellyfin initially** — the N5105 iGPU drives
   the host's KDE desktop. Start without HW transcoding (IPTV is H.264
-  direct-play); see the Transcoding section of the plan for the escalation
-  path (LXC with shared render node, not GPU passthrough).
+  direct-play); if it's ever needed, bind-mount `/dev/dri/renderD128` into
+  CT 105 (LXC shares the render node with the host).
 - **Threadfin Simultaneous Streams = 1** — this protects a 1-connection
   IPTV account. Never raise it.
-- **Before DVR use, set `backup=0` on VM 103's 1 TB data disk** — otherwise
-  vzdump hauls the whole recordings library into every backup on `SSD`.
+- CT 105's 1 TB data mount (`mp0`, `/srv/media-core`) already has
+  **`backup=0`** — keep it that way, or vzdump hauls the recordings
+  library into every backup on `SSD`.
 - Recordings land on the `local-lvm` thin pool (1 TB promised of 1.7 TB) —
   check `lvs -a` data% when touching storage.
-- Verify Docker image names/tags upstream before pulling (the manifest's
-  `freetv/threadfin` and `jacobsnyder/m3u2strm` are unverified); pin
-  versions, don't use `:latest`.
+- Images are verified and pinned (Jellyfin `10.11.9`, Threadfin
+  `fyb3roptik/threadfin:1.2.37`, m3u2strm
+  `jamieeburgess/m3u2strm-docker:docker-b1d57dd`). Keep pinning on
+  upgrades; never `:latest` (Jellyfin's `latest` currently points at
+  12.0 release candidates).
 - Update the runbook checklist and relevant docs in the same commit as the
   work they describe; keep commits on a branch and PR to `main`.
 

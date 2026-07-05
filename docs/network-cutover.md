@@ -26,9 +26,12 @@ gateway network (`192.168.9.0/24`). This is Phase 1 of
   binds no LAN device by MAC), so pve-01 and the VMs will egress direct.
 - [ ] ~~AXT1800 switched to Access-Point mode~~ — optional now (see note
       above); only needed if its extra ports/SSIDs are wanted.
-- [ ] pve-01 physically connected to the `192.168.9.x` L2
-- [ ] pve-01 re-IP'd to `192.168.9.11` (steps below)
-- [ ] Verification checklist passed
+- [x] pve-01 physically connected to the `192.168.9.x` L2 — **done by 2026-07-05**
+- [x] pve-01 re-IP'd to `192.168.9.11` — **done by 2026-07-05** (host reachable
+      at `192.168.9.11`, default route via `192.168.9.1`)
+- [x] Verification checklist passed — **2026-07-05**: gateway ping, DNS,
+      internet egress OK from host and from the media node at `192.168.9.50`.
+      ⚠️ One anomaly: see "Egress anomaly" below.
 - [x] "Tunnel B" (Switzerland) for VM 103: **done 2026-07-04.** OpenVPN TCP
       tunnel `VM103-Swiss` (tunnel_id 8925) using the already-imported
       Surfshark profile `ch-zur.prod.surfshark.com_tcp` (group
@@ -38,12 +41,29 @@ gateway network (`192.168.9.0/24`). This is Phase 1 of
       tunnel egress is `156.146.62.37` — Zurich, Switzerland; other LAN
       clients unaffected.
 
-As of 2026-07-04 pve-01 is **not visible on the current network** (full ping
-sweep of `192.168.9.0/24`; neither the host nor VM 103's MAC has *ever*
-appeared in the router's client history). It is either powered off or still
-cabled to the old AXT1800 LAN with its static `192.168.8.11` config — with
-that config it cannot talk on the new subnet even if the cable is moved,
-which is exactly what this runbook fixes.
+~~As of 2026-07-04 pve-01 is **not visible on the current network**~~ —
+**superseded 2026-07-05: the cutover is complete.** pve-01 is live at
+`192.168.9.11` and the media node at `192.168.9.50`.
+
+> **2026-07-05 — the `.50` device is now LXC 105, not VM 103.** The owner
+> destroyed VMs 100/101/103 on 2026-07-05. The new media node is an
+> unprivileged Debian 13 LXC (**CT 105 `media-core`**) whose `net0` carries
+> VM 103's old MAC `BC:24:11:59:1F:60` — so the static lease *and* the
+> Swiss-tunnel policy binding on the Flint 2 apply to it unchanged, with no
+> router-side edits. (Never give another guest that MAC.)
+
+## ⚠️ Egress anomaly (open, 2026-07-05)
+
+Verified during the LXC build: **the Swiss policy binding is not taking
+effect.** Both pve-01 *and* the media node at `192.168.9.50` egress via the
+**same US IP `45.43.19.29`** (Tier.Net, New York — a datacenter address, so
+the whole LAN appears to be behind a US VPN/tunnel, likely the Surfshark-US
+"Primary Tunnel"). Per this runbook's design, `.50` should egress via
+Zurich (`156.146.62.x`) with a kill switch, and everything else direct.
+Check on the router (VPN Dashboard → `VM103-Swiss`, and the device policy
+under Clients): the tunnel may be down/disabled (a dead *disabled* tunnel
+bypasses its kill switch entirely), or the default policy changed since
+2026-07-04. **Resolve before feeding the provider M3U to Threadfin.**
 
 ## Address plan
 
