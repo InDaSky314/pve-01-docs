@@ -31,7 +31,8 @@ gateway network (`192.168.9.0/24`). This is Phase 1 of
       at `192.168.9.11`, default route via `192.168.9.1`)
 - [x] Verification checklist passed — **2026-07-05**: gateway ping, DNS,
       internet egress OK from host and from the media node at `192.168.9.50`.
-      ⚠️ One anomaly: see "Egress anomaly" below.
+      Swiss split-tunnel for `.50` verified working (see "Egress anomaly —
+      resolved" below).
 - [x] "Tunnel B" (Switzerland) for VM 103: **done 2026-07-04.** OpenVPN TCP
       tunnel `VM103-Swiss` (tunnel_id 8925) using the already-imported
       Surfshark profile `ch-zur.prod.surfshark.com_tcp` (group
@@ -52,18 +53,21 @@ gateway network (`192.168.9.0/24`). This is Phase 1 of
 > Swiss-tunnel policy binding on the Flint 2 apply to it unchanged, with no
 > router-side edits. (Never give another guest that MAC.)
 
-## ⚠️ Egress anomaly (open, 2026-07-05)
+## Egress anomaly — ✅ RESOLVED 2026-07-05
 
-Verified during the LXC build: **the Swiss policy binding is not taking
-effect.** Both pve-01 *and* the media node at `192.168.9.50` egress via the
-**same US IP `45.43.19.29`** (Tier.Net, New York — a datacenter address, so
-the whole LAN appears to be behind a US VPN/tunnel, likely the Surfshark-US
-"Primary Tunnel"). Per this runbook's design, `.50` should egress via
-Zurich (`156.146.62.x`) with a kill switch, and everything else direct.
-Check on the router (VPN Dashboard → `VM103-Swiss`, and the device policy
-under Clients): the tunnel may be down/disabled (a dead *disabled* tunnel
-bypasses its kill switch entirely), or the default policy changed since
-2026-07-04. **Resolve before feeding the provider M3U to Threadfin.**
+During the LXC build the Swiss policy binding was briefly not in effect
+(CT 105 and the host both egressed via the same US datacenter IP
+`45.43.19.29`). The owner fixed it on the router the same day. Verified
+after the fix:
+
+- CT 105 (`192.168.9.50`) → **`146.70.134.252`, Zurich, Switzerland**
+  (M247 — a Surfshark CH exit; the exit IP can differ from the
+  `156.146.62.x` seen on 2026-07-04, that's normal).
+- pve-01 host → `45.43.19.29` (US) — i.e. **not** via the Swiss tunnel;
+  split tunnel works as designed.
+- No DNS leak: from CT 105, `whoami.akamai.net` resolves via
+  `146.70.134.252` (queries exit through the tunnel); from the host, via
+  the US path.
 
 ## Address plan
 
