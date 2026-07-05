@@ -6,8 +6,8 @@ its documentation and the plan of record. The owner is Finley; the mission
 is **Project Media-Core**: a self-hosted DVR/VOD stack (Jellyfin + Threadfin
 + m3u2strm) in **LXC CT 105 `media-core`** (Debian 13, unprivileged,
 Docker inside). The stack was **deployed 2026-07-05** ("Phase 0 as-built"
-in the plan); what remains is Phase 2 (provider M3U/EPG URLs + UI config)
-and resolving the **egress anomaly** noted in the runbook. VM 103, the
+in the plan) and the Swiss split-tunnel for the CT is verified working;
+what remains is Phase 2 (provider M3U/EPG URLs + UI config). VM 103, the
 original target, was destroyed by the owner on 2026-07-05 along with VMs
 100 and 101.
 
@@ -45,7 +45,7 @@ data). Drive the container with `pct exec 105 -- …`.
 | DHCP pool | `.100`–`.249`; statics `.11` and `.50` are outside it |
 | pve-01 | `192.168.9.11/24` static on `vmbr0` (bridge over `enp2s0`, the only cabled NIC) |
 | CT 105 | DHCP, reserved lease `192.168.9.50` ← MAC `BC:24:11:59:1F:60` (inherited from destroyed VM 103 — **never give this MAC to another guest**) |
-| CT 105 VPN | *Design:* all WAN egress via OpenVPN TCP to Zurich (router tunnel `VM103-Swiss`, kill switch ON); no internet in the CT = tunnel down on the router — check there first. *Reality 2026-07-05:* **not in effect** — the CT and the host both egress via the same US IP `45.43.19.29`; see the egress anomaly in [docs/network-cutover.md](docs/network-cutover.md). |
+| CT 105 VPN | **All WAN egress goes via the Swiss tunnel** (router tunnel `VM103-Swiss`, kill switch ON) — verified 2026-07-05: CT egresses via `146.70.134.252` (Zurich) while the host does not, no DNS leak. No internet in the CT = tunnel down on the router — check there first, not in the CT. LAN traffic is unaffected. |
 | Other devices | default no-VPN; a separate Surfshark-US tunnel exists — leave both alone |
 | Router access | web UI / SSH root at `192.168.9.1`; password is **not** in this repo — ask the user. Router-side work is complete; you shouldn't need it. |
 
