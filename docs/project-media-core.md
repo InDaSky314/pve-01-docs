@@ -13,6 +13,29 @@ current AXT1800 `192.168.8.0/24` LAN to the Brume 2 `192.168.9.0/24` design.
 > AXT1800-as-AP step is optional. Live router state and completed steps are
 > tracked in [network-cutover.md](network-cutover.md).
 
+> **2026-07-05 — Phases 0 and 1 are DONE, with one design change:** the
+> owner destroyed VM 103 (and VMs 100/101), and the stack now runs in an
+> **unprivileged Debian 13 LXC, CT 105 `media-core`**, at `192.168.9.50`.
+> The LXC's `net0` reuses VM 103's MAC `BC:24:11:59:1F:60`, so the router's
+> static lease and Swiss-tunnel binding carry over untouched. See "Phase 0
+> as-built" below and the egress anomaly in
+> [network-cutover.md](network-cutover.md). Remaining work: Phase 2
+> (provider URLs + UI configuration).
+
+## Phase 0 as-built (2026-07-05)
+
+| | |
+|---|---|
+| Container | CT **105** `media-core`, Debian 13, unprivileged, `nesting=1,keyctl=1`, 2 vCPU / 8 GB / 512 MB swap, `onboot=1` |
+| Rootfs | 32 GB on `local-lvm` |
+| Data | `mp0` **1 TB** on `local-lvm` at `/srv/media-core`, **`backup=0`** (recordings excluded from vzdump by construction) |
+| Network | `eth0` on `vmbr0`, DHCP, MAC `BC:24:11:59:1F:60` → leases `192.168.9.50` |
+| Docker | Docker CE 29.6.1 + Compose v5.3.0 (official Docker apt repo) |
+| Jellyfin | `jellyfin/jellyfin:10.11.9` (latest stable; the `latest` tag currently points at 12.0 RCs — do not use), host network, **no `/dev/dri`**, healthy at `http://192.168.9.50:8096` |
+| Threadfin | `fyb3roptik/threadfin:1.2.37` (manifest's `freetv/threadfin` does not exist), up at `http://192.168.9.50:34400/web/` |
+| m3u2strm | `jamieeburgess/m3u2strm-docker:docker-b1d57dd` (manifest's `jacobsnyder/m3u2strm` does not exist). **Different env interface than the manifest**: `MOVIES_M3U_URL` + `TVEPISODES_M3U_URL` (not `M3U_URL`) and cron-style `UPDATE_INTERVAL` (`0 4 * * *` = daily), outputs to `/movieoutput` and `/TVEpisodesoutput`. Defined behind compose profile `vod` — **not started** until the URLs are filled in `.env`: `docker compose --profile vod up -d` |
+| Layout | `/srv/media-core/{docker-compose.yml,.env,jellyfin/{config,cache},threadfin/conf,media/{movies,tvshows,recordings}}`; `.env` is mode 600 and holds `TZ` + the provider URLs (empty placeholders — secrets never leave the CT) |
+
 ## Target state
 
 ```
