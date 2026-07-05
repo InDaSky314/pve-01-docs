@@ -105,18 +105,25 @@ IPTV provider (Xtream API, cf.teltv.xyz — get.php M3U download is DISABLED, HT
    │  (all egress via Swiss tunnel)
    ▼
 xtream-sync.py  (CT 105, systemd timer, daily 04:00)
-   ├─→ threadfin/conf/playlist.m3u   ~550 channels in ordered, clean-named groups:
-   │       Wisconsin Local (23) → Wisconsin Sports (2) → US News (98)
-   │       → UK News (27) → Germany TV & News (108) → US Sports (159)
-   │       → UK Sports (41: Sky Sports + TNT VIP HD) → German Sports (68)
-   │       → Bundesliga (23)          [reshaped 2026-07-05: variety over PPV]
+   ├─→ threadfin/conf/playlist.m3u   ~535 channels, numbered blocks (tvg-chno),
+   │       English before German [owner request 2026-07-05]:
+   │       100s Wisconsin Local (33, all WI markets) → 150s Wisconsin Sports (2)
+   │       → 160s Chicago Local (14) → 200s US News (90) → 300s US Sports (147)
+   │       → 500s UK News (27) → 530s UK Sports (25) → 600s Germany TV & News (106)
+   │       → 750s German Sports (68) → 850s Bundesliga (23)
+   │       (dead CSN brand, TUDN EXTRA event channels, exact duplicate
+   │       names excluded; per-group start_chno in config.json)
    ├─→ epg/epg.xml                   a <channel> entry with LOGO for every channel
    │                                 (display-name == tuner name → Jellyfin auto-maps
-   │                                 artwork) + programmes for the ~178 channels the
-   │                                 provider has guide data for
-   └─→ media/movies/**.strm          ~21,800 VOD movies, titles normalized to
-                                     "Title (Year)" (provider prefixes/quality tags
-                                     stripped, 4K/HD duplicates collapsed) → reliable
+   │                                 artwork) + provider programmes (~145 channels),
+   │                                 backfilled from external XMLTV (epgshare01
+   │                                 US/UK/DE dumps) for channels the provider has
+   │                                 no guide data for → 322/549 channels with guide
+   └─→ media/movies/**.strm          ~20,700 VOD movies, titles normalized to
+                                     "Title (Year)" (provider prefixes incl. "EN-TOP -
+                                     NN.", superscript digits ²→" 2", quality tags
+                                     stripped; 4K/HD copies, year-less duplicate
+                                     prints, and non-EN twins collapsed) → reliable
                                      TMDB artwork matching
    ▼
 Threadfin 1.2.37 (Docker, :34400) — HDHomeRun emulation, ffmpeg buffer,
@@ -159,6 +166,15 @@ media/{movies,tvshows,recordings}
     log and zero bytes to clients). Without a buffer, Threadfin cannot
     enforce the tuner limit.
   - ffmpeg buffer runs pure stream-copy (`-c copy` remux, no transcode).
+  - **Channel numbers (2026-07-05):** Threadfin runs in **XEPG mode**
+    (`settings.json → epgSource: "XEPG"`); it auto-adopts the playlist's
+    `tvg-chno` as `x-channelID`, which becomes the HDHomeRun
+    `GuideNumber` Jellyfin sorts by. Gotcha: new channels arrive
+    **inactive** (dropped from the lineup) — `sync/activate-xepg.py`
+    (media-core-xepg.timer, 04:25) activates them; it stops/starts
+    threadfin because Threadfin rewrites xepg.json on shutdown. The
+    Threadfin-side XMLTV mapping stays "-" — Jellyfin gets its guide
+    from /epg/epg.xml directly.
 - **Threadfin tuner = 1 is the account's hard brake** (provider
   `max_connections: 1`). Never raise it. Recording a game and watching that
   same recording simultaneously still uses one provider stream (Jellyfin
@@ -177,11 +193,32 @@ media/{movies,tvshows,recordings}
   element for *every* channel with `display-name` identical to the tuner
   channel name plus the provider's logo as `<icon>` — Jellyfin auto-maps by
   name and shows channel artwork (~90% coverage). Provider programme data
-  exists for ~178 channels (news + German TV are well covered; most US
-  sports/PPV channels carry no EPG — their names encode the schedule).
+  exists for only ~145 channels; sync v4 (2026-07-05) backfills the rest
+  from **external XMLTV** (free daily dumps at `epgshare01.online`,
+  per-selection `epg_region` → `external_epg` source list in
+  `config.json`). Matching is by US call sign (`(WITI)` → `WITI-DT`)
+  or loosely-normalized name (country prefix, quality tags, `(MOBIL)`
+  variants stripped; SPORTS≡SPORT), with manual overrides in
+  `config.json → epg_aliases` (e.g. `C-SPAN 1` → `CSPAN`,
+  `CW 18 [MILWAUKEE]` → `WVTV`). Some external channels are empty shells
+  (a `<channel>` entry, zero programmes), so every match candidate is
+  kept and a channel binds to the first candidate that actually carries
+  programmes. Genuinely unmatchable: event/PPV channels (TUDN EXTRA,
+  Bally PPV — names encode the schedule), defunct-brand channels (CSN),
+  and channels no public EPG carries.
   ⚠️ Jellyfin caches the parsed guide at `/cache/xmltv/` — after changing
   the EPG's structure, clear it (`docker exec jellyfin rm -rf /cache/xmltv`)
   and run the Refresh Guide task, or you'll be staring at stale mappings.
+- ⚠️ **Jellyfin 10.11 empty-PresentationUniqueKey gotcha:** after a bulk
+  library import, user-scoped listings may show only a fraction of the
+  movies (admin/API count is fine). Cause: rows are inserted with an
+  empty `PresentationUniqueKey` and user queries group by it, collapsing
+  all unkeyed items; the key only gets stamped as the (slow) metadata
+  scan touches each item. Fix: stop jellyfin, then in `jellyfin.db`:
+  `UPDATE BaseItems SET PresentationUniqueKey = lower(replace(Id,'-',''))
+  WHERE Path LIKE '/media/movies/%.strm' AND (PresentationUniqueKey IS
+  NULL OR PresentationUniqueKey='')` — the key is just the dash-less
+  lowercase item Id for movies. (Hit 2026-07-05: users saw ~1k of 20.7k.)
 - Movie artwork comes from TMDB, keyed off the normalized
   `Title (Year)` folder/file names the sync generates, plus the **Fanart**
   plugin (installed 2026-07-05; extra backdrops/logos from fanart.tv) and
@@ -203,19 +240,45 @@ media/{movies,tvshows,recordings}
 Provider credentials (Xtream username/password embedded in every stream
 URL) exist only in: `/srv/media-core/.env` (600), the generated
 `playlist.m3u`/`.strm` files, and Threadfin logs — all inside CT 105.
+The Jellyfin automation API key lives in
+`/srv/media-core/.jellyfin_api_key` (600) — same rules.
 **Never** in this repo, commit messages, or pasted logs. Jellyfin and
 Threadfin web passwords are user-managed (Threadfin UI auth enabled
 2026-07-05; first user gets created on next UI visit — do that soon).
 
 ## 6. Operations
 
-- **Daily sync** runs at 04:00 (`media-core-sync.timer`); Threadfin re-reads
-  the playlist at 04:30 (`settings.json → update`). Manual:
+- **Nightly cascade (all times CET, deliberately ordered):** 04:00 sync
+  (`media-core-sync.timer`: playlist + EPG incl. external backfill + VOD;
+  on success it also API-triggers Jellyfin's Refresh Guide + library scan
+  if they're idle) → 04:15 Threadfin re-reads the playlist
+  (`settings.json → update`) → 04:25 XEPG activation of new channels
+  (`media-core-xepg.timer`) → 04:30 Jellyfin Refresh Guide (daily
+  trigger) → 04:45 Jellyfin library scan (daily trigger).
+- **Streaming bandwidth ceiling:** the Swiss OpenVPN tunnel tops out
+  around **10 Mbit/s** (measured 2026-07-05: 1.3 MB/s to a fast mirror
+  and from the provider). 1080p web-rips play fine; Blu-ray/4K remuxes
+  (15–80 Mbit) **will buffer** — pick the non-4K copy or set a client
+  bitrate limit (~8 Mbit). The initial metadata scan competes for the
+  same tunnel (posters via TMDB); `LibraryScanFanoutConcurrency=2` set
+  to keep it polite. Real fix if wanted: switch the router tunnel to
+  WireGuard (typically 3–5× OpenVPN throughput on the Flint 2). Manual:
   `pct exec 105 -- python3 /srv/media-core/sync/xtream-sync.py` then
   restart threadfin or wait for its scheduled update.
+- **Sync reliability guards (v4):** provider API calls retry 3× with
+  backoff; the VOD prune step refuses to delete anything if the provider
+  returns <70% of the movies already on disk (a partial/flaky VOD
+  response used to mass-prune `.strm` folders and make Jellyfin's movie
+  count fluctuate day to day). A guarded run logs
+  `SKIPPING prune` — check `journalctl -u media-core-sync.service`.
+- **Jellyfin API access for automation:** key in
+  `/srv/media-core/.jellyfin_api_key` (600, inside CT only — created
+  directly in the `ApiKeys` table). The sync uses it for the post-run
+  refresh triggers.
 - **Changing the channel lineup:** edit `sync/config.json`, run the sync,
   `docker restart threadfin`, then in Jellyfin run the "Refresh Guide"
-  scheduled task.
+  scheduled task (the sync's post-run trigger does this for you if the
+  task is idle).
 - **Updating containers:** bump the pinned tag in `docker-compose.yml`,
   `docker compose up -d`. Check release notes; never `:latest`.
 - **Backups:** vzdump CT 105 covers only the 32 G rootfs (OS + Docker
@@ -237,13 +300,18 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 
 ## 7. Loose ends
 
-- [ ] Create the first Threadfin web-UI user (auth is on, account not yet made).
-- [ ] Change the Jellyfin `root` password to something memorable (set
-      programmatically during 2026-07-05 setup).
+- [x] Create the first Threadfin web-UI user (done by owner, 2026-07-05).
+- [x] Change the Jellyfin `root` password (done by owner, 2026-07-05).
 - [ ] Jellyfin's scan of ~21.8k `.strm` movies takes hours and hammers
       TMDB; artwork fills in progressively — let it finish before judging
       the "IPTV Cinema" library (stale pre-rename entries disappear when
-      the scan's cleanup pass runs).
+      the scan's cleanup pass runs). As of 2026-07-05 evening the scan is
+      still converging (~54% of movies had TMDB ids); movie counts settle
+      once it completes.
+- [ ] A client on the LAN polls Jellyfin every ~3 s with a stale/invalid
+      token (log spam: `Invalid token`). Sign out and back in on the
+      Jellyfin apps (Android TV etc.) — sessions were invalidated by the
+      password change.
 - [ ] Chromecast clients: install Jellyfin app → Add server manually →
       `http://192.168.9.50:8096`.
 - [ ] Optional: TiviMate on the Chromecast for casual channel-surfing —
@@ -260,6 +328,8 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | 2026-07-05 | LAN cutover done (`pve-01` → `192.168.9.11`). Owner destroyed VMs 100/101/103. CT 105 built (inherits VM 103's MAC). Stack deployed; brief egress anomaly (whole LAN behind one US exit) fixed on the router; split tunnel verified. Provider activated; `get.php` found disabled → custom Xtream sync written. Threadfin per-playlist buffer quirk found & fixed. End-to-end stream through Jellyfin verified. Threadfin auth enabled, CT sshd disabled. Docs consolidated into this file. |
 | 2026-07-05 (later) | Lineup reshaped per owner: less PPV sports, more variety — Wisconsin locals first, then US News, German TV & News, US/German sports, Bundesliga (~480 channels). Sync v2: grouped/ordered selections, channel-name cleaning, logos injected into the EPG for every channel (~90% artwork coverage in Jellyfin), movie titles normalized for TMDB matching (21.8k after dedupe). Jellyfin xmltv cache gotcha documented. |
 | 2026-07-05 (v3) | Added UK News (27) + UK Sports (41, Sky/TNT VIP HD) → ~550 channels, 213 with guide data. VOD dedupe made English-first. Fanart plugin installed for extra movie artwork. |
+| 2026-07-05 (v4) | EPG + reliability pass. Sync v4: external XMLTV backfill (epgshare01 US/UK/DE) with call-sign/normalized-name matching + `epg_aliases` — guide coverage 192 → 322 of 549 channels (Wisconsin locals 22/23). Provider API retries; VOD prune guard (<70% ⇒ no deletes) fixes fluctuating movie counts. Nightly cascade reordered: 04:00 sync → 04:15 Threadfin → 04:30 guide refresh → 04:45 library scan (fixed daily triggers replace drifting intervals; sync also API-triggers both). Jellyfin automation API key added (CT-only). Diagnosed: movie-count churn = aborted scans + mid-scan pruning, not probing; remote ffprobe only fires on playback. VOD dedupe hardened after owner screenshots showed 4× "7 Days in Entebbe": year-less duplicate prints dropped when a (Year) copy exists, "EN-TOP - NN." compound prefixes stripped, superscript digits normalized (²→" 2") — 21,813 → 20,680 unique movies. Jellyfin gotcha: the web UI's A–Z jump bar "#" filter shows only symbol/digit titles (owner saw "844 movies"). |
+| 2026-07-05 (v5) | Lineup v5 + numbering: channel numbers via `tvg-chno` blocks (100s WI locals … 850s Bundesliga), English groups before German; Wisconsin broadened to all WI markets (33), Chicago Local added (14); CSN (dead brand), TUDN EXTRA, exact-duplicate names excluded → 535 channels, EPG coverage 288/461 unique ids. Threadfin switched to XEPG mode (auto-adopts tvg-chno; 04:25 activation timer for new channels). Prune guard caught provider VOD API returning an empty list — zero movies deleted. Measured VPN ceiling ~10 Mbit/s (buffering on high-bitrate remuxes); scan fanout capped at 2; WireGuard upgrade recommended. Jellyfin empty-PresentationUniqueKey bug fixed (users saw ~1k of 20.7k movies). |
 
 Historical deep-dives preserved in [`docs/archive/`](docs/archive/):
 the original Media-Core manifest (imported verbatim) and the network
