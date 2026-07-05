@@ -105,9 +105,10 @@ IPTV provider (Xtream API, cf.teltv.xyz — get.php M3U download is DISABLED, HT
    │  (all egress via Swiss tunnel)
    ▼
 xtream-sync.py  (CT 105, systemd timer, daily 04:00)
-   ├─→ threadfin/conf/playlist.m3u   ~480 channels in ordered, clean-named groups:
+   ├─→ threadfin/conf/playlist.m3u   ~550 channels in ordered, clean-named groups:
    │       Wisconsin Local (23) → Wisconsin Sports (2) → US News (98)
-   │       → Germany TV & News (108) → US Sports (159) → German Sports (68)
+   │       → UK News (27) → Germany TV & News (108) → US Sports (159)
+   │       → UK Sports (41: Sky Sports + TNT VIP HD) → German Sports (68)
    │       → Bundesliga (23)          [reshaped 2026-07-05: variety over PPV]
    ├─→ epg/epg.xml                   a <channel> entry with LOGO for every channel
    │                                 (display-name == tuner name → Jellyfin auto-maps
@@ -182,9 +183,15 @@ media/{movies,tvshows,recordings}
   the EPG's structure, clear it (`docker exec jellyfin rm -rf /cache/xmltv`)
   and run the Refresh Guide task, or you'll be staring at stale mappings.
 - Movie artwork comes from TMDB, keyed off the normalized
-  `Title (Year)` folder/file names the sync generates. The full-library
-  metadata fetch takes hours after big renames; stale old-name entries are
-  purged by the scan's Clean Database post-task.
+  `Title (Year)` folder/file names the sync generates, plus the **Fanart**
+  plugin (installed 2026-07-05; extra backdrops/logos from fanart.tv) and
+  the bundled OMDb/Studio Images providers. The full-library metadata
+  fetch takes hours after big renames; stale old-name entries are purged
+  by the scan's Clean Database post-task.
+- VOD dedupe is **English-first**: `EN - *` categories are processed
+  before Netflix/Amazon/BluRay extras, so when a title exists in both,
+  the English copy wins (case-insensitive title+year key); non-English
+  titles without an English twin are kept.
 - Jellyfin: wizard user is `root`. DVR path `/media/recordings`.
   Guide + tuner were added via API; the XMLTV source is the *filtered*
   local file, not the provider's 77 MB original.
@@ -252,6 +259,7 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | 2026-07-04 | Media-Core project adopted (manifest imported). Router side prepared on the Flint 2: static lease `.50` for VM 103's MAC, Swiss OpenVPN tunnel `VM103-Swiss` (kill switch, MAC-bound). VM 103 found unfit (EOL Fedora, no Docker, raw disk). |
 | 2026-07-05 | LAN cutover done (`pve-01` → `192.168.9.11`). Owner destroyed VMs 100/101/103. CT 105 built (inherits VM 103's MAC). Stack deployed; brief egress anomaly (whole LAN behind one US exit) fixed on the router; split tunnel verified. Provider activated; `get.php` found disabled → custom Xtream sync written. Threadfin per-playlist buffer quirk found & fixed. End-to-end stream through Jellyfin verified. Threadfin auth enabled, CT sshd disabled. Docs consolidated into this file. |
 | 2026-07-05 (later) | Lineup reshaped per owner: less PPV sports, more variety — Wisconsin locals first, then US News, German TV & News, US/German sports, Bundesliga (~480 channels). Sync v2: grouped/ordered selections, channel-name cleaning, logos injected into the EPG for every channel (~90% artwork coverage in Jellyfin), movie titles normalized for TMDB matching (21.8k after dedupe). Jellyfin xmltv cache gotcha documented. |
+| 2026-07-05 (v3) | Added UK News (27) + UK Sports (41, Sky/TNT VIP HD) → ~550 channels, 213 with guide data. VOD dedupe made English-first. Fanart plugin installed for extra movie artwork. |
 
 Historical deep-dives preserved in [`docs/archive/`](docs/archive/):
 the original Media-Core manifest (imported verbatim) and the network
