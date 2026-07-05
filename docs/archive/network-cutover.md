@@ -1,3 +1,5 @@
+> **ARCHIVED** — kept for history; superseded by the consolidated [../../README.md](../../README.md). Links to other docs/ files may be dead.
+
 # Network cutover runbook — `192.168.8.0/24` → `192.168.9.0/24`
 
 Moves `pve-01` from the old AXT1800 LAN (`192.168.8.0/24`) onto the current
