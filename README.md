@@ -197,6 +197,16 @@ media/{movies,tvshows,recordings}
   ⚠️ Jellyfin caches the parsed guide at `/cache/xmltv/` — after changing
   the EPG's structure, clear it (`docker exec jellyfin rm -rf /cache/xmltv`)
   and run the Refresh Guide task, or you'll be staring at stale mappings.
+- ⚠️ **Jellyfin 10.11 empty-PresentationUniqueKey gotcha:** after a bulk
+  library import, user-scoped listings may show only a fraction of the
+  movies (admin/API count is fine). Cause: rows are inserted with an
+  empty `PresentationUniqueKey` and user queries group by it, collapsing
+  all unkeyed items; the key only gets stamped as the (slow) metadata
+  scan touches each item. Fix: stop jellyfin, then in `jellyfin.db`:
+  `UPDATE BaseItems SET PresentationUniqueKey = lower(replace(Id,'-',''))
+  WHERE Path LIKE '/media/movies/%.strm' AND (PresentationUniqueKey IS
+  NULL OR PresentationUniqueKey='')` — the key is just the dash-less
+  lowercase item Id for movies. (Hit 2026-07-05: users saw ~1k of 20.7k.)
 - Movie artwork comes from TMDB, keyed off the normalized
   `Title (Year)` folder/file names the sync generates, plus the **Fanart**
   plugin (installed 2026-07-05; extra backdrops/logos from fanart.tv) and
