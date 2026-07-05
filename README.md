@@ -112,8 +112,10 @@ xtream-sync.py  (CT 105, systemd timer, daily 04:00)
    │       → Bundesliga (23)          [reshaped 2026-07-05: variety over PPV]
    ├─→ epg/epg.xml                   a <channel> entry with LOGO for every channel
    │                                 (display-name == tuner name → Jellyfin auto-maps
-   │                                 artwork) + programmes for the ~178 channels the
-   │                                 provider has guide data for
+   │                                 artwork) + provider programmes (~145 channels),
+   │                                 backfilled from external XMLTV (epgshare01
+   │                                 US/UK/DE dumps) for channels the provider has
+   │                                 no guide data for → 322/549 channels with guide
    └─→ media/movies/**.strm          ~21,800 VOD movies, titles normalized to
                                      "Title (Year)" (provider prefixes/quality tags
                                      stripped, 4K/HD duplicates collapsed) → reliable
@@ -177,8 +179,19 @@ media/{movies,tvshows,recordings}
   element for *every* channel with `display-name` identical to the tuner
   channel name plus the provider's logo as `<icon>` — Jellyfin auto-maps by
   name and shows channel artwork (~90% coverage). Provider programme data
-  exists for ~178 channels (news + German TV are well covered; most US
-  sports/PPV channels carry no EPG — their names encode the schedule).
+  exists for only ~145 channels; sync v4 (2026-07-05) backfills the rest
+  from **external XMLTV** (free daily dumps at `epgshare01.online`,
+  per-selection `epg_region` → `external_epg` source list in
+  `config.json`). Matching is by US call sign (`(WITI)` → `WITI-DT`)
+  or loosely-normalized name (country prefix, quality tags, `(MOBIL)`
+  variants stripped; SPORTS≡SPORT), with manual overrides in
+  `config.json → epg_aliases` (e.g. `C-SPAN 1` → `CSPAN`,
+  `CW 18 [MILWAUKEE]` → `WVTV`). Some external channels are empty shells
+  (a `<channel>` entry, zero programmes), so every match candidate is
+  kept and a channel binds to the first candidate that actually carries
+  programmes. Genuinely unmatchable: event/PPV channels (TUDN EXTRA,
+  Bally PPV — names encode the schedule), defunct-brand channels (CSN),
+  and channels no public EPG carries.
   ⚠️ Jellyfin caches the parsed guide at `/cache/xmltv/` — after changing
   the EPG's structure, clear it (`docker exec jellyfin rm -rf /cache/xmltv`)
   and run the Refresh Guide task, or you'll be staring at stale mappings.
@@ -203,19 +216,36 @@ media/{movies,tvshows,recordings}
 Provider credentials (Xtream username/password embedded in every stream
 URL) exist only in: `/srv/media-core/.env` (600), the generated
 `playlist.m3u`/`.strm` files, and Threadfin logs — all inside CT 105.
+The Jellyfin automation API key lives in
+`/srv/media-core/.jellyfin_api_key` (600) — same rules.
 **Never** in this repo, commit messages, or pasted logs. Jellyfin and
 Threadfin web passwords are user-managed (Threadfin UI auth enabled
 2026-07-05; first user gets created on next UI visit — do that soon).
 
 ## 6. Operations
 
-- **Daily sync** runs at 04:00 (`media-core-sync.timer`); Threadfin re-reads
-  the playlist at 04:30 (`settings.json → update`). Manual:
+- **Nightly cascade (all times CET, deliberately ordered):** 04:00 sync
+  (`media-core-sync.timer`: playlist + EPG incl. external backfill + VOD;
+  on success it also API-triggers Jellyfin's Refresh Guide + library scan
+  if they're idle) → 04:15 Threadfin re-reads the playlist
+  (`settings.json → update`) → 04:30 Jellyfin Refresh Guide (daily
+  trigger) → 04:45 Jellyfin library scan (daily trigger). Manual:
   `pct exec 105 -- python3 /srv/media-core/sync/xtream-sync.py` then
   restart threadfin or wait for its scheduled update.
+- **Sync reliability guards (v4):** provider API calls retry 3× with
+  backoff; the VOD prune step refuses to delete anything if the provider
+  returns <70% of the movies already on disk (a partial/flaky VOD
+  response used to mass-prune `.strm` folders and make Jellyfin's movie
+  count fluctuate day to day). A guarded run logs
+  `SKIPPING prune` — check `journalctl -u media-core-sync.service`.
+- **Jellyfin API access for automation:** key in
+  `/srv/media-core/.jellyfin_api_key` (600, inside CT only — created
+  directly in the `ApiKeys` table). The sync uses it for the post-run
+  refresh triggers.
 - **Changing the channel lineup:** edit `sync/config.json`, run the sync,
   `docker restart threadfin`, then in Jellyfin run the "Refresh Guide"
-  scheduled task.
+  scheduled task (the sync's post-run trigger does this for you if the
+  task is idle).
 - **Updating containers:** bump the pinned tag in `docker-compose.yml`,
   `docker compose up -d`. Check release notes; never `:latest`.
 - **Backups:** vzdump CT 105 covers only the 32 G rootfs (OS + Docker
@@ -237,13 +267,18 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 
 ## 7. Loose ends
 
-- [ ] Create the first Threadfin web-UI user (auth is on, account not yet made).
-- [ ] Change the Jellyfin `root` password to something memorable (set
-      programmatically during 2026-07-05 setup).
+- [x] Create the first Threadfin web-UI user (done by owner, 2026-07-05).
+- [x] Change the Jellyfin `root` password (done by owner, 2026-07-05).
 - [ ] Jellyfin's scan of ~21.8k `.strm` movies takes hours and hammers
       TMDB; artwork fills in progressively — let it finish before judging
       the "IPTV Cinema" library (stale pre-rename entries disappear when
-      the scan's cleanup pass runs).
+      the scan's cleanup pass runs). As of 2026-07-05 evening the scan is
+      still converging (~54% of movies had TMDB ids); movie counts settle
+      once it completes.
+- [ ] A client on the LAN polls Jellyfin every ~3 s with a stale/invalid
+      token (log spam: `Invalid token`). Sign out and back in on the
+      Jellyfin apps (Android TV etc.) — sessions were invalidated by the
+      password change.
 - [ ] Chromecast clients: install Jellyfin app → Add server manually →
       `http://192.168.9.50:8096`.
 - [ ] Optional: TiviMate on the Chromecast for casual channel-surfing —
@@ -260,6 +295,7 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | 2026-07-05 | LAN cutover done (`pve-01` → `192.168.9.11`). Owner destroyed VMs 100/101/103. CT 105 built (inherits VM 103's MAC). Stack deployed; brief egress anomaly (whole LAN behind one US exit) fixed on the router; split tunnel verified. Provider activated; `get.php` found disabled → custom Xtream sync written. Threadfin per-playlist buffer quirk found & fixed. End-to-end stream through Jellyfin verified. Threadfin auth enabled, CT sshd disabled. Docs consolidated into this file. |
 | 2026-07-05 (later) | Lineup reshaped per owner: less PPV sports, more variety — Wisconsin locals first, then US News, German TV & News, US/German sports, Bundesliga (~480 channels). Sync v2: grouped/ordered selections, channel-name cleaning, logos injected into the EPG for every channel (~90% artwork coverage in Jellyfin), movie titles normalized for TMDB matching (21.8k after dedupe). Jellyfin xmltv cache gotcha documented. |
 | 2026-07-05 (v3) | Added UK News (27) + UK Sports (41, Sky/TNT VIP HD) → ~550 channels, 213 with guide data. VOD dedupe made English-first. Fanart plugin installed for extra movie artwork. |
+| 2026-07-05 (v4) | EPG + reliability pass. Sync v4: external XMLTV backfill (epgshare01 US/UK/DE) with call-sign/normalized-name matching + `epg_aliases` — guide coverage 192 → 322 of 549 channels (Wisconsin locals 22/23). Provider API retries; VOD prune guard (<70% ⇒ no deletes) fixes fluctuating movie counts. Nightly cascade reordered: 04:00 sync → 04:15 Threadfin → 04:30 guide refresh → 04:45 library scan (fixed daily triggers replace drifting intervals; sync also API-triggers both). Jellyfin automation API key added (CT-only). Diagnosed: movie-count churn = aborted scans + mid-scan pruning, not probing; remote ffprobe only fires on playback. |
 
 Historical deep-dives preserved in [`docs/archive/`](docs/archive/):
 the original Media-Core manifest (imported verbatim) and the network
