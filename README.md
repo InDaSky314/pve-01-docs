@@ -105,9 +105,18 @@ IPTV provider (Xtream API, cf.teltv.xyz — get.php M3U download is DISABLED, HT
    │  (all egress via Swiss tunnel)
    ▼
 xtream-sync.py  (CT 105, systemd timer, daily 04:00)
-   ├─→ threadfin/conf/playlist.m3u   498 sports channels (11 categories)
-   ├─→ epg/epg.xml                   provider XMLTV filtered to those channels
-   └─→ media/movies/**.strm          ~24,500 VOD movie links (EN + Netflix/Amazon/BluRay)
+   ├─→ threadfin/conf/playlist.m3u   ~480 channels in ordered, clean-named groups:
+   │       Wisconsin Local (23) → Wisconsin Sports (2) → US News (98)
+   │       → Germany TV & News (108) → US Sports (159) → German Sports (68)
+   │       → Bundesliga (23)          [reshaped 2026-07-05: variety over PPV]
+   ├─→ epg/epg.xml                   a <channel> entry with LOGO for every channel
+   │                                 (display-name == tuner name → Jellyfin auto-maps
+   │                                 artwork) + programmes for the ~178 channels the
+   │                                 provider has guide data for
+   └─→ media/movies/**.strm          ~21,800 VOD movies, titles normalized to
+                                     "Title (Year)" (provider prefixes/quality tags
+                                     stripped, 4K/HD duplicates collapsed) → reliable
+                                     TMDB artwork matching
    ▼
 Threadfin 1.2.37 (Docker, :34400) — HDHomeRun emulation, ffmpeg buffer,
    │                                 Tuner = 1  ← hard 1-stream brake
@@ -155,10 +164,27 @@ media/{movies,tvshows,recordings}
   splits it locally); tuning a *different* channel mid-recording is blocked
   by design.
 - Channel budget: keep the playlist under ~500 channels (Threadfin/Plex
-  soft limit, memory). Category selection lives in `sync/config.json`
-  (regexes; currently `US| SPORT` + NFL/NBA/MLB/NHL/NCAAF/NCAAB/MLS/World
-  Cup/UFC/Masters PPV = 498). Only ~45 named sports networks have EPG data;
-  per-game PPV slots have none (their names carry the schedule instead).
+  soft limit, memory). Selection lives in `sync/config.json` as an
+  **ordered list of `live_selections`** — each has a clean `group` label
+  (what clients see), a `category` regex on provider category names, and an
+  optional `name` regex on channel names (that's how the Wisconsin locals
+  are cherry-picked out of the giant NBC/CBS/ABC/FOX/CW affiliate
+  categories by call sign/city). Playlist order = channel-number order, so
+  Wisconsin comes first. `live_name_exclude` drops `###` separator
+  channels and low-quality duplicate feeds.
+- **Guide & artwork mechanics:** the sync writes an XMLTV `<channel>`
+  element for *every* channel with `display-name` identical to the tuner
+  channel name plus the provider's logo as `<icon>` — Jellyfin auto-maps by
+  name and shows channel artwork (~90% coverage). Provider programme data
+  exists for ~178 channels (news + German TV are well covered; most US
+  sports/PPV channels carry no EPG — their names encode the schedule).
+  ⚠️ Jellyfin caches the parsed guide at `/cache/xmltv/` — after changing
+  the EPG's structure, clear it (`docker exec jellyfin rm -rf /cache/xmltv`)
+  and run the Refresh Guide task, or you'll be staring at stale mappings.
+- Movie artwork comes from TMDB, keyed off the normalized
+  `Title (Year)` folder/file names the sync generates. The full-library
+  metadata fetch takes hours after big renames; stale old-name entries are
+  purged by the scan's Clean Database post-task.
 - Jellyfin: wizard user is `root`. DVR path `/media/recordings`.
   Guide + tuner were added via API; the XMLTV source is the *filtered*
   local file, not the provider's 77 MB original.
@@ -207,8 +233,10 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 - [ ] Create the first Threadfin web-UI user (auth is on, account not yet made).
 - [ ] Change the Jellyfin `root` password to something memorable (set
       programmatically during 2026-07-05 setup).
-- [ ] Jellyfin's initial scan of ~24.5k `.strm` movies takes hours and
-      hammers TMDB; let it finish before judging the "IPTV Cinema" library.
+- [ ] Jellyfin's scan of ~21.8k `.strm` movies takes hours and hammers
+      TMDB; artwork fills in progressively — let it finish before judging
+      the "IPTV Cinema" library (stale pre-rename entries disappear when
+      the scan's cleanup pass runs).
 - [ ] Chromecast clients: install Jellyfin app → Add server manually →
       `http://192.168.9.50:8096`.
 - [ ] Optional: TiviMate on the Chromecast for casual channel-surfing —
@@ -223,6 +251,7 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | ≤2024 | Box built: PVE + KDE desktop, pfSense experiments (Tailscale snapshots), desktop VMs. Old LAN `192.168.8.0/24` behind a GL-AXT1800. |
 | 2026-07-04 | Media-Core project adopted (manifest imported). Router side prepared on the Flint 2: static lease `.50` for VM 103's MAC, Swiss OpenVPN tunnel `VM103-Swiss` (kill switch, MAC-bound). VM 103 found unfit (EOL Fedora, no Docker, raw disk). |
 | 2026-07-05 | LAN cutover done (`pve-01` → `192.168.9.11`). Owner destroyed VMs 100/101/103. CT 105 built (inherits VM 103's MAC). Stack deployed; brief egress anomaly (whole LAN behind one US exit) fixed on the router; split tunnel verified. Provider activated; `get.php` found disabled → custom Xtream sync written. Threadfin per-playlist buffer quirk found & fixed. End-to-end stream through Jellyfin verified. Threadfin auth enabled, CT sshd disabled. Docs consolidated into this file. |
+| 2026-07-05 (later) | Lineup reshaped per owner: less PPV sports, more variety — Wisconsin locals first, then US News, German TV & News, US/German sports, Bundesliga (~480 channels). Sync v2: grouped/ordered selections, channel-name cleaning, logos injected into the EPG for every channel (~90% artwork coverage in Jellyfin), movie titles normalized for TMDB matching (21.8k after dedupe). Jellyfin xmltv cache gotcha documented. |
 
 Historical deep-dives preserved in [`docs/archive/`](docs/archive/):
 the original Media-Core manifest (imported verbatim) and the network
