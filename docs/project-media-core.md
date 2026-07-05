@@ -17,9 +17,9 @@ current AXT1800 `192.168.8.0/24` LAN to the Brume 2 `192.168.9.0/24` design.
 > owner destroyed VM 103 (and VMs 100/101), and the stack now runs in an
 > **unprivileged Debian 13 LXC, CT 105 `media-core`**, at `192.168.9.50`.
 > The LXC's `net0` reuses VM 103's MAC `BC:24:11:59:1F:60`, so the router's
-> static lease and Swiss-tunnel binding carry over untouched. See "Phase 0
-> as-built" below and the egress anomaly in
-> [network-cutover.md](network-cutover.md). Remaining work: Phase 2
+> static lease and Swiss-tunnel binding carry over untouched — Swiss egress
+> from the CT verified working (see the resolved egress-anomaly note in
+> [network-cutover.md](network-cutover.md)). Remaining work: Phase 2
 > (provider URLs + UI configuration).
 
 ## Phase 0 as-built (2026-07-05)
