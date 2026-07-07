@@ -28,6 +28,7 @@ Remaining user-side niceties are listed in [Loose ends](#loose-ends).
 | Health check | `curl -so /dev/null -w '%{http_code}' http://192.168.9.50:8096` → 200; same for `:34400/web/` |
 | Sync (playlist/EPG/VOD) | `systemctl status media-core-sync.timer` in CT; manual run: `python3 /srv/media-core/sync/xtream-sync.py` |
 | VPN check | `pct exec 105 -- wget -qO- https://am.i.mullvad.net/json` → must say Switzerland |
+| Recordings SMB share | `\\192.168.9.50\recordings` — user `tivimate` (password not in this repo) |
 
 ## 2. Hardware & host
 
@@ -347,6 +348,27 @@ the single source of truth.
 - Provider subscription: "World 8K", 3 months from 2026-06-28
   (expires ~2026-10-27), 1 connection, `m3u8/ts/rtmp` output allowed.
 
+### SMB recordings share (2026-07-07)
+
+Samba (`smbd`, enabled + active) runs **inside CT 105** and exports one
+share so the owner's TiviMate boxes can record straight onto the server:
+
+- Share: `\\192.168.9.50\recordings` → `/srv/media-core/media/recordings`
+  (read/write, `create mask 0644`), i.e. on the 1 TB `mp0` mount that is
+  `backup=0` by design — recordings are **not** in the vzdump backups.
+- Auth: CT-local user `tivimate` (uid 1000) is the only `valid users`
+  entry; its Samba password was set by the owner and is **not in this
+  repo**. Config hardening: `server min protocol = SMB2`,
+  `disable netbios = Yes` (port 445 only), printers off, standalone
+  server role.
+- The same directory is bind-mounted **rw** into the Jellyfin container
+  at `/media/recordings` (also Jellyfin's own DVR path), so SMB-written
+  recordings appear in Jellyfin alongside DVR output. TiviMate writes
+  into its own subfolders (`Tivimate/`, `Sports/`).
+- Verified working from the client on 2026-07-07.
+- Config lives at `/etc/samba/smb.conf` in the CT; check with
+  `pct exec 105 -- testparm -s`.
+
 ### Secrets
 
 Provider credentials (Xtream username/password embedded in every stream
@@ -477,6 +499,7 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | 2026-07-05 (v4) | EPG + reliability pass. Sync v4: external XMLTV backfill (epgshare01 US/UK/DE) with call-sign/normalized-name matching + `epg_aliases` — guide coverage 192 → 322 of 549 channels (Wisconsin locals 22/23). Provider API retries; VOD prune guard (<70% ⇒ no deletes) fixes fluctuating movie counts. Nightly cascade reordered: 04:00 sync → 04:15 Threadfin → 04:30 guide refresh → 04:45 library scan (fixed daily triggers replace drifting intervals; sync also API-triggers both). Jellyfin automation API key added (CT-only). Diagnosed: movie-count churn = aborted scans + mid-scan pruning, not probing; remote ffprobe only fires on playback. VOD dedupe hardened after owner screenshots showed 4× "7 Days in Entebbe": year-less duplicate prints dropped when a (Year) copy exists, "EN-TOP - NN." compound prefixes stripped, superscript digits normalized (²→" 2") — 21,813 → 20,680 unique movies. Jellyfin gotcha: the web UI's A–Z jump bar "#" filter shows only symbol/digit titles (owner saw "844 movies"). |
 | 2026-07-05 (v5) | Lineup v5 + numbering: channel numbers via `tvg-chno` blocks (100s WI locals … 850s Bundesliga), English groups before German; Wisconsin broadened to all WI markets (33), Chicago Local added (14); CSN (dead brand), TUDN EXTRA, exact-duplicate names excluded → 535 channels, EPG coverage 288/461 unique ids. Threadfin switched to XEPG mode (auto-adopts tvg-chno; 04:25 activation timer for new channels). Prune guard caught provider VOD API returning an empty list — zero movies deleted. Measured VPN ceiling ~10 Mbit/s (buffering on high-bitrate remuxes); scan fanout capped at 2; WireGuard upgrade recommended. Jellyfin empty-PresentationUniqueKey bug fixed (users saw ~1k of 20.7k movies). |
 | 2026-07-06 (v6) | **Lineup v6 + TV series.** Regional block numbering per owner spec (100s WI/Chicago locals, 150s German public/regional HR-first, 200s US news+cable, 300s premium sports incl. Bally WI + DAZN DE, 400s UK TV/news/Sky/TNT, 500s German cable, 600s German sports, 650s Bundesliga) — 366 channels, strictly US/UK/DE, 100% EPG-mapped, verified live in Threadfin XEPG + Jellyfin. TV-series ingestion added to the sync (`series_categories`, .strm + NFO tree, per-show `last_modified` cache, prune guard); "IPTV Series" library created (NFO readers + TMDB/Fanart, savers off — RO mounts). Fixed: series `episodes` list-vs-dict panel quirk (season 0 = specials); empty-200 API answers now retried; live playlist got the same <70% guard as VOD (an empty `get_live_streams` answer would previously have blanked the lineup). |
+| 2026-07-07 | **SMB recordings share.** Samba added inside CT 105: single share `recordings` → `/srv/media-core/media/recordings` (rw, user `tivimate` only, SMB2+, no netbios) so TiviMate records directly onto the server; same folder is Jellyfin's DVR path, so recordings surface in Jellyfin. Verified working from the client. |
 
 Historical deep-dives preserved in [`docs/archive/`](docs/archive/):
 the original Media-Core manifest (imported verbatim) and the network
