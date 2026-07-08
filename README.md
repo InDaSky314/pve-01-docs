@@ -138,8 +138,8 @@ Threadfin 1.2.37 (Docker, :34400) — HDHomeRun emulation, ffmpeg buffer,
 Jellyfin 10.11.9 (Docker, host network, :8096)
    ├─ Live TV tuner:  HDHomeRun @ http://127.0.0.1:34400
    ├─ Guide:          XMLTV @ /epg/epg.xml
-   ├─ Library:        "IPTV Cinema" → /media/movies (.strm)
-   ├─ Library:        "IPTV Series" → /media/shows (.strm, added 2026-07-06)
+   ├─ Library:        "Movies" → /media/movies (.strm; named "IPTV Cinema" until 2026-07-08)
+   ├─ Library:        "Series" → /media/shows (.strm, added 2026-07-06; named "IPTV Series" until 2026-07-08)
    └─ DVR:            records to /media/recordings (remux, no transcode)
    ▼
 Clients (Chromecast/web): Jellyfin app → Add server → http://192.168.9.50:8096
@@ -316,12 +316,25 @@ the single source of truth.
   the bundled OMDb/Studio Images providers. The full-library metadata
   fetch takes hours after big renames; stale old-name entries are purged
   by the scan's Clean Database post-task.
-- VOD dedupe is **English-first**: `EN - *` categories are processed
-  before Netflix/Amazon/BluRay extras, so when a title exists in both,
-  the English copy wins (case-insensitive title+year key); non-English
+- **VOD/series category selection is EXCLUDE-based since 2026-07-08**
+  (owner-supplied lists): `config.json → vod_exclude_categories` /
+  `series_exclude_categories` name the panel categories to drop;
+  **every other category — including ones the provider adds later — is
+  included automatically**. The old include keys stay in the config but
+  now only set dedupe priority: `vod_category_prefixes` (`EN - `) and
+  the `series_categories` order still decide which copy of a duplicated
+  title wins. Selection went from ~30 → 66 VOD and 24 → 52 series
+  categories (movies ~20.7k → ~27.7k).
+- VOD dedupe priority (title+year key, case-insensitive):
+  **HD copies beat 4K/Dolby prints** (`HIGH_BITRATE` regex in the sync —
+  the ~10 Mbit/s VPN can't sustain high-bitrate remuxes), then
+  **English-first** (`EN - *` categories before the rest), so when a
+  title exists in several categories the playable English copy wins;
   titles without an English twin are kept.
 - **TV series (2026-07-06):** `config.json → series_categories` (ordered,
-  English first — same first-category-wins dedupe as VOD) drives
+  English first — same first-category-wins dedupe as VOD; since
+  2026-07-08 it is only the priority head — all non-excluded panel
+  categories are appended after it, HD variants before 4K/Dolby) drives
   `build_series()`: per show a `Title (Year)/` folder with `tvshow.nfo`,
   `Season NN/Title SxxEyy.strm` + a minimal episode `.nfo` (episode title
   from the provider). `get_series_info` responses are cached in
@@ -333,7 +346,7 @@ the single source of truth.
   don't index-shift it); the sync handles both. Episodes that vanish
   upstream are cleaned per show; whole-library deletes go through the
   same <70% prune guard as VOD. Genre/artwork organization comes from
-  TMDB just like movies: the "IPTV Series" and "IPTV Cinema" libraries
+  TMDB just like movies: the "Series" and "Movies" libraries
   both expose a **Genres** view in Jellyfin once metadata converges —
   that (plus filters/sort in each library) is the "organized by genre"
   browsing surface; no folder-level genre split is needed or wanted
@@ -450,12 +463,21 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 
 - [x] Create the first Threadfin web-UI user (done by owner, 2026-07-05).
 - [x] Change the Jellyfin `root` password (done by owner, 2026-07-05).
-- [ ] Jellyfin's scan of ~20.7k `.strm` movies takes hours and hammers
-      TMDB; artwork fills in progressively — let it finish before judging
-      the "IPTV Cinema" library (stale pre-rename entries disappear when
-      the scan's cleanup pass runs). Same for the new "IPTV Series"
-      library (2026-07-06) — genre views in both libraries fill in as
-      TMDB metadata converges (~240 items/h behind the 10 Mbit tunnel).
+- [ ] Jellyfin's scan of the `.strm` movies (~27.7k since the 2026-07-08
+      exclude-mode expansion) takes hours and hammers TMDB; artwork fills
+      in progressively — let it finish before judging the "Movies"
+      library (stale pre-rename entries disappear when the scan's cleanup
+      pass runs). Same for the "Series" library (2026-07-06) — genre
+      views in both libraries fill in as TMDB metadata converges
+      (~240 items/h behind the 10 Mbit tunnel).
+- [ ] **Live lineup v7 pending owner channel selection** (2026-07-08):
+      owner's category exclude list keeps 98 live groups (~10.1k
+      channels); four v6 blocks lost their source category (400s UK TV ←
+      UK| GENERAL, 450s Sky Sports ← UK| SPORT ᴴᴰ ⱽᴵᴾ, 475s TNT ←
+      UK| TNT SPORT ᴴᴰ ⱽᴵᴾ, 600s DE sports ← DE| SPORT HD/4K). A
+      channel-review artifact was sent to the owner (pre-checked with the
+      267 current channels whose groups survive); rebuild the
+      `live_selections` blocks from the returned selection.
 - [ ] A client on the LAN polls Jellyfin every ~3 s with a stale/invalid
       token (log spam: `Invalid token`). Sign out and back in on the
       Jellyfin apps (Android TV etc.) — sessions were invalidated by the
@@ -500,6 +522,7 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | 2026-07-05 (v5) | Lineup v5 + numbering: channel numbers via `tvg-chno` blocks (100s WI locals … 850s Bundesliga), English groups before German; Wisconsin broadened to all WI markets (33), Chicago Local added (14); CSN (dead brand), TUDN EXTRA, exact-duplicate names excluded → 535 channels, EPG coverage 288/461 unique ids. Threadfin switched to XEPG mode (auto-adopts tvg-chno; 04:25 activation timer for new channels). Prune guard caught provider VOD API returning an empty list — zero movies deleted. Measured VPN ceiling ~10 Mbit/s (buffering on high-bitrate remuxes); scan fanout capped at 2; WireGuard upgrade recommended. Jellyfin empty-PresentationUniqueKey bug fixed (users saw ~1k of 20.7k movies). |
 | 2026-07-06 (v6) | **Lineup v6 + TV series.** Regional block numbering per owner spec (100s WI/Chicago locals, 150s German public/regional HR-first, 200s US news+cable, 300s premium sports incl. Bally WI + DAZN DE, 400s UK TV/news/Sky/TNT, 500s German cable, 600s German sports, 650s Bundesliga) — 366 channels, strictly US/UK/DE, 100% EPG-mapped, verified live in Threadfin XEPG + Jellyfin. TV-series ingestion added to the sync (`series_categories`, .strm + NFO tree, per-show `last_modified` cache, prune guard); "IPTV Series" library created (NFO readers + TMDB/Fanart, savers off — RO mounts). Fixed: series `episodes` list-vs-dict panel quirk (season 0 = specials); empty-200 API answers now retried; live playlist got the same <70% guard as VOD (an empty `get_live_streams` answer would previously have blanked the lineup). |
 | 2026-07-07 | **SMB recordings share.** Samba added inside CT 105: single share `recordings` → `/srv/media-core/media/recordings` (rw, user `tivimate` only, SMB2+, no netbios) so TiviMate records directly onto the server; same folder is Jellyfin's DVR path, so recordings surface in Jellyfin. Verified working from the client. |
+| 2026-07-08 | **Exclude-mode VOD/series + library renames.** Owner supplied panel-wide exclude lists (782 live / 24 VOD / 26 series categories, all verified against the panel). Sync switched to exclude-based selection for VOD (66 cats, ~27.7k movies) and series (52 cats, ~7.5k shows); old include keys now only order the dedupe (HD before 4K/Dolby — VPN can't play high-bitrate remuxes — then EN-first). Jellyfin libraries renamed "IPTV Cinema"→**Movies**, "IPTV Series"→**Series** (owner naming). Series backfill confirmed complete (6,124 shows); the pending empty-`PresentationUniqueKey` stamp applied to 28,225 `/media/shows` rows (jellyfin stopped → UPDATE → started). Live lineup unchanged pending owner's channel-level selection from the review artifact (v6 keeps working; 4 blocks flagged as source-less under the new list). |
 
 Historical deep-dives preserved in [`docs/archive/`](docs/archive/):
 the original Media-Core manifest (imported verbatim) and the network
