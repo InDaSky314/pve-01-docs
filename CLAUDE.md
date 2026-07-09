@@ -23,8 +23,10 @@ The media stack lives in `/srv/media-core/` inside CT 105; drive it with
 - **Secrets stay out of this repo** — provider credentials live only in
   `/srv/media-core/.env` (600) and generated files inside CT 105. Never in
   commits, logs, or chat pastes.
-- **Threadfin tuner stays at 1** (1-connection IPTV account) and the
-  playlist stays under ~500 channels.
+- **Threadfin tuner stays at 1** (1-connection IPTV account). The
+  playlist is ~1,856 channels as of lineup v7 (owner's explicit picks —
+  the old "<500 channels" cap is superseded); don't grow it further
+  without checking Jellyfin guide-refresh time.
 - **MAC `BC:24:11:59:1F:60` belongs to CT 105 only** — it carries the
   `.50` lease and the Swiss-VPN binding on the router.
 - **No `/dev/dri` into Jellyfin** (iGPU drives the host's KDE desktop);

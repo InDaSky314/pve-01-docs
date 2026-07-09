@@ -159,46 +159,80 @@ jellyfin/{config,cache}  # jellyfin state — note: excluded from vzdump with th
 media/{movies,shows,recordings}
 ```
 
-### Channel map v6 — the guide numbering protocol (2026-07-06)
+### Channel map v7 — the guide numbering protocol (2026-07-09)
 
-Owner spec: a block-based, regionalized guide — **strictly English (US/UK)
-and German (DE) content** — Wisconsin first, Hessen/Frankfurt first on the
-German side, everything else in a logical linguistic order. Live and
-verified in Threadfin XEPG + Jellyfin (366/366 active, zero duplicate
-numbers, 100% EPG-mapped):
+Owner spec (v7, replaces v6): guide priority order **Locals → News →
+Cable → Sports → 24/7 → German**, compact-hundreds numbering, built from
+the owner's hand-picked channel list (review-artifact CSV export,
+`refined-live-channels-no-espn.csv` — 1,599 explicit stream ids + the
+whole `US| SOCCER PPV` panel group; ESPN dropped by owner choice). Live
+and verified in Threadfin XEPG + Jellyfin (1,856/1,856 in the lineup):
 
 | Block | Range in use | # | Content (group label in clients) |
 |---|---|---|---|
-| 100–149 | 100–131 | 32 | **Wisconsin Locals** — ABC/CBS/NBC/FOX/CW for Milwaukee, Green Bay, Madison + all other WI markets |
-| ″ | 140–147 | 8 | **Chicago Locals** — WMAQ, WBBM, WFLD, WLS, WGN, CW |
-| ″ | 148 | 1 | **PBS** (national HD feed) |
-| 150–199 | 150–186 | 37 | **German Public & Regional** — HR (Hessen) first, then Das Erste/ZDF/arte/3sat/phoenix + all Dritte (WDR, NDR, MDR, SWR, BR, rbb, SR…) |
-| 200–299 | 200–215 | 16 | **US News** — ABC/CBS/CNN/MSNBC/FOX News/CNBC/Bloomberg/C-SPAN… |
-| ″ | 220–294 | 75 | **US Cable** — Discovery, TNT, TBS, USA, FX, AMC, HGTV, History… |
-| 300–399 | 300–303 | 4 | **Wisconsin & North Sports** — Bally Sports Wisconsin / North |
-| ″ | 310–348 | 39 | **US Sports** — ESPN tiers, BTN, SEC/ACC, Fox Sports, NFL/MLB/Golf, beIN, DAZN US |
-| ″ | 360–361 | 2 | **DAZN Germany** |
-| 400–499 | 400–437 | 38 | **UK Television** — BBC 1–4, ITV 1–4, Ch4/5, E4, Sky Atlantic/Arts/Witness… |
-| ″ | 440–444 | 5 | **UK News** — BBC News, Sky News, GB News |
-| ″ | 450–470 | 21 | **UK Sky Sports** (all tiers) |
-| ″ | 475–478 | 4 | **UK TNT Sports** 1–4 |
-| 500–599 | 500–536 | 37 | **German Cable & Entertainment** — RTL, ProSieben, Sat.1, VOX, WELT, n-tv, DMAX… |
-| 600–649 | 600–635 | 36 | **German Sports** — Sky Sport DE tiers, Sportdigital… |
-| 650+ | 650–660 | 11 | **Bundesliga** match channels |
+| 100–139 | 100–115 | 16 | **Wisconsin Locals** — Milwaukee → Madison → Green Bay (main + DirecTV CITY backup feeds, PBS WPNE) |
+| 140–149 | 140–144 | 5 | **Chicago Locals** — WLS, WMAQ, WBBM, WFLD, WTTW |
+| 150–199 | 150–164 | 15 | **NY/LA/Denver Locals** — ABC/NBC/CBS/FOX + PBS per city |
+| 200–299 | 200–256 | 57 | **US News** — majors first (CNN, MSNBC, FOX News, ABC/CBS News, …), rest A–Z |
+| 300–489 | 300–479 | 180 | **US Cable** — A–Z (A&E … USA Network, incl. Big Brother feeds) |
+| 490–519 | 490–507 | 18 | **HBO Max** originals channels |
+| 520–599 | 520–526 | 7 | **BBC & Discovery** — BBC News/World/Parliament, Discovery+ 4K, BBC Earth |
+| 600–649 | 600–638 | 39 | **Bally Sports** — Wisconsin first, then all RSN feeds |
+| 650–679 | 650–668 | 19 | **NFL** — Network, RedZone, event slots 01–15 + 4K |
+| 680–699 | 680–699 | 20 | **MLB** — Network ×2, event slots 01–18 |
+| 700–739 | 700–715 | 16 | **NBA** — NBA TV, event slots 01–15 (panel duplicates deduped) |
+| 740–799 | 740–760 | 21 | **NHL** — Alternate, Network, slots 01–18 + 4K |
+| 800–839 | 800–836 | 37 | **UEFA** event slots |
+| 840–879 | 840–873 | 34 | **UK Football** (Live Football event slots) |
+| 880–899 | 880–898 | 19 | **BBC Streams** 1–19 (event streams) |
+| 900–999 | 900–933 | 34 | **Bundesliga** — Sky Sport Bundesliga tiers + Mobil feeds |
+| 1000–1299 | 1000–1199 | 200 | **Soccer PPV** — whole panel group, slot names stable ("Soccer PPV 042") |
+| 1300–1499 | 1300–1456 | 157 | **DirecTV Stream** — "GO:" 24/7 streaming channels |
+| 1500–2099 | 1500–2079 | 580 | **Prime 24/7** — PRIME looping channels |
+| 2100–2499 | 2100–2407 | 308 | **Cinema TV** — "CM" Apple TV+/Disney+/Amazon/Netflix 4K loops |
+| 2500–2549 | 2500–2536 | 37 | **German Public & Regional** — v6 carryover (HR first), regex-selected |
+| 2550+ | 2550–2586 | 37 | **German Cable & Entertainment** — v6 carryover, regex-selected |
 
 Headroom inside each block is deliberate — new provider channels join at
-the end of their block without renumbering anything else.
+the end of their block without renumbering anything else. Reordering
+guide *priority* = changing a block's `start_chno` (guide order is
+channel-number order).
 
 **How it's enforced (authoritative path).** The numbering lives in
 `sync/config.json → live_selections`: an *ordered* list where each entry
-has a `group` label, a `category` regex (provider category names), an
-optional `name` regex / `name_exclude` regex (channel names), and a
-`start_chno`. The sync walks the list in order, assigns `tvg-chno`
-sequentially from each block's `start_chno`, warns if a block overflows
-into the next one, and writes the numbers into `playlist.m3u`. Threadfin
-(XEPG mode) adopts `tvg-chno` as the HDHomeRun `GuideNumber`, which is
-what Jellyfin sorts the guide by. **To change the lineup you edit
-`config.json` and re-run the sync — never renumber by hand in the UIs.**
+has a `group` label plus either an **explicit `ids` list** (v7 owner
+picks — listed order is channel order; robust against name churn on
+event slots) or a `category` regex with optional `name`/`name_exclude`
+regexes (Soccer PPV group, German carryover blocks), and a `start_chno`.
+Entries may also carry `slot` (stable display-name label for event-slot
+channels — the panel renames "MLB 12 | Brewers x Cardinals start:…" all
+day, but Threadfin keys channels by name, so the playlist always says
+"MLB 12" and the event lives in the EPG) and `epg_mode: "ppv"` (parse
+the current event out of the channel name into guide entries). The sync
+walks the list in order, assigns `tvg-chno` sequentially from each
+block's `start_chno`, warns if a block overflows into the next one, and
+writes the numbers into `playlist.m3u`. Threadfin (XEPG mode) adopts
+`tvg-chno` as the HDHomeRun `GuideNumber`, which is what Jellyfin sorts
+the guide by. **To change the lineup you edit `config.json` and re-run
+the sync — never renumber by hand in the UIs.**
+
+**EPG layers (v7).** In order of preference per channel: (1) provider
+XMLTV (~178 channels); (2) external free XMLTV — epgshare01
+US_LOCALS1/US2/US_SPORTS1/UK1/DE1 plus i.mjh.nz PlutoTV/SamsungTVPlus/
+Plex/Roku (FAST-channel mirrors; ~155 channels), matched by call sign /
+normalized name / `epg_aliases`; (3) **PPV event parsing** — for
+`epg_mode: "ppv"` slots the sync parses event title + UTC start/stop
+straight out of the channel name (~340 slots); (4) **synthesized looping
+guide** — every remaining channel gets 4-hour repeating entries titled
+from the channel name (~1,143 channels, mostly Prime/Cinema/GO 24/7
+loops), so the guide never shows empty cells. Layers 3+4 are generated
+locally — zero extra panel API load. The **hourly PPV refresh**
+(`sync/ppv-refresh.py`, `media-core-ppv.timer`, :07 every hour except
+04:xx) re-reads the live stream list (one API call), rewrites guide
+entries for the slots recorded in `sync/cache/ppv-xids.json`, and — only
+when an event actually changed — updates `epg.xml`, POSTs Threadfin
+`update.xmltv` (API enabled in `settings.json`, port 34400), and
+triggers Jellyfin's Refresh Guide.
 
 **Threadfin-UI equivalent (manual blueprint).** If a channel ever has to
 be bucketed ad hoc without touching the sync (or to rebuild the map on a
@@ -402,6 +436,12 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
   (`settings.json → update`) → 04:25 XEPG activation of new channels
   (`media-core-xepg.timer`) → 04:30 Jellyfin Refresh Guide (daily
   trigger) → 04:45 Jellyfin library scan (daily trigger).
+- **Hourly PPV guide refresh:** `media-core-ppv.timer` runs
+  `sync/ppv-refresh.py` at :07 every hour *except* 04:xx (the cascade
+  owns that window). One `get_live_streams` call; rewrites event-slot
+  guide entries only when an event changed, then Threadfin
+  `update.xmltv` + Jellyfin Refresh Guide. No-op runs log
+  `no event changes, guide untouched`.
 - **Streaming bandwidth ceiling:** the Swiss OpenVPN tunnel tops out
   around **10–20 Mbit/s** (1.3 MB/s measured 2026-07-05 daytime;
   2.25 MB/s sustained 2026-07-06 ~01:00 — varies with exit-server
@@ -429,9 +469,14 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
   directly in the `ApiKeys` table). The sync uses it for the post-run
   refresh triggers.
 - **Changing the channel lineup:** edit `sync/config.json`, run the sync,
-  `docker restart threadfin`, then in Jellyfin run the "Refresh Guide"
-  scheduled task (the sync's post-run trigger does this for you if the
-  task is idle).
+  then `curl -X POST -d '{"cmd":"update.m3u"}' http://127.0.0.1:34400/api/`
+  (Threadfin's API is enabled as of v7; `docker restart threadfin` works
+  too). If numbers/blocks changed, run `sync/renumber-xepg.py` (existing
+  XEPG entries keep their old numbers otherwise), then
+  `sync/activate-xepg.py` (new channels arrive inactive), then
+  `{"cmd":"update.xmltv"}` and Jellyfin's "Refresh Guide" task (the
+  sync's post-run trigger fires too early for lineup changes — Threadfin
+  hasn't reloaded yet — so re-trigger it).
 - **Updating containers:** bump the pinned tag in `docker-compose.yml`,
   `docker compose up -d`. Check release notes; never `:latest`.
 - **Backups:** vzdump CT 105 covers only the 32 G rootfs (OS + Docker
@@ -470,14 +515,14 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
       pass runs). Same for the "Series" library (2026-07-06) — genre
       views in both libraries fill in as TMDB metadata converges
       (~240 items/h behind the 10 Mbit tunnel).
-- [ ] **Live lineup v7 pending owner channel selection** (2026-07-08):
-      owner's category exclude list keeps 98 live groups (~10.1k
-      channels); four v6 blocks lost their source category (400s UK TV ←
-      UK| GENERAL, 450s Sky Sports ← UK| SPORT ᴴᴰ ⱽᴵᴾ, 475s TNT ←
-      UK| TNT SPORT ᴴᴰ ⱽᴵᴾ, 600s DE sports ← DE| SPORT HD/4K). A
-      channel-review artifact was sent to the owner (pre-checked with the
-      267 current channels whose groups survive); rebuild the
-      `live_selections` blocks from the returned selection.
+- [ ] Many v7 picks are high-bitrate feeds (Cinema TV "4K" loops, Soccer
+      PPV "8K EXCLUSIVE" slots) — they will buffer behind the ~10 Mbit
+      OpenVPN tunnel until the WireGuard migration happens, or unless the
+      client sets a bitrate limit.
+- [ ] EPG match-rate on the new i.mjh.nz feeds is modest (Pluto 24,
+      Samsung/Plex/Roku 0 on first run — their display names differ from
+      the panel's "GO:"/"PRIME:" naming). `epg_aliases` entries in
+      `config.json` can hand-map high-value channels one by one.
 - [ ] A client on the LAN polls Jellyfin every ~3 s with a stale/invalid
       token (log spam: `Invalid token`). Sign out and back in on the
       Jellyfin apps (Android TV etc.) — sessions were invalidated by the
@@ -522,6 +567,7 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | 2026-07-05 (v5) | Lineup v5 + numbering: channel numbers via `tvg-chno` blocks (100s WI locals … 850s Bundesliga), English groups before German; Wisconsin broadened to all WI markets (33), Chicago Local added (14); CSN (dead brand), TUDN EXTRA, exact-duplicate names excluded → 535 channels, EPG coverage 288/461 unique ids. Threadfin switched to XEPG mode (auto-adopts tvg-chno; 04:25 activation timer for new channels). Prune guard caught provider VOD API returning an empty list — zero movies deleted. Measured VPN ceiling ~10 Mbit/s (buffering on high-bitrate remuxes); scan fanout capped at 2; WireGuard upgrade recommended. Jellyfin empty-PresentationUniqueKey bug fixed (users saw ~1k of 20.7k movies). |
 | 2026-07-06 (v6) | **Lineup v6 + TV series.** Regional block numbering per owner spec (100s WI/Chicago locals, 150s German public/regional HR-first, 200s US news+cable, 300s premium sports incl. Bally WI + DAZN DE, 400s UK TV/news/Sky/TNT, 500s German cable, 600s German sports, 650s Bundesliga) — 366 channels, strictly US/UK/DE, 100% EPG-mapped, verified live in Threadfin XEPG + Jellyfin. TV-series ingestion added to the sync (`series_categories`, .strm + NFO tree, per-show `last_modified` cache, prune guard); "IPTV Series" library created (NFO readers + TMDB/Fanart, savers off — RO mounts). Fixed: series `episodes` list-vs-dict panel quirk (season 0 = specials); empty-200 API answers now retried; live playlist got the same <70% guard as VOD (an empty `get_live_streams` answer would previously have blanked the lineup). |
 | 2026-07-07 | **SMB recordings share.** Samba added inside CT 105: single share `recordings` → `/srv/media-core/media/recordings` (rw, user `tivimate` only, SMB2+, no netbios) so TiviMate records directly onto the server; same folder is Jellyfin's DVR path, so recordings surface in Jellyfin. Verified working from the client. |
+| 2026-07-09 | **Lineup v7 — owner's hand-picked 1,856-channel guide.** Built from the review-artifact CSV (1,599 explicit stream ids + whole Soccer PPV group; ESPN dropped, German general TV kept but moved to 2500s per owner). Compact-hundreds priority order: Locals → News → Cable → Sports → 24/7 → German. Sync gained explicit-`ids` selections, stable slot display names (`slot`), PPV event parsing (`epg_mode: "ppv"`, ~340 slots incl. times parsed as UTC from names), synthesized looping guide for ~1,143 24/7 channels, i.mjh.nz external feeds, and an hourly `media-core-ppv.timer` refresh (change-detected; Threadfin `update.xmltv` via its now-enabled API + Jellyfin guide refresh). Threadfin quirks found: keys channels by name and truncates at apostrophes (names now apostrophe-stripped — VEVO '70S/'80S had collapsed into one channel); tvg-chno only adopted for new channels (renumber-xepg.py handles renumbering). Panel carries every NBA slot twice — deduped to 16. The old "<500 channels" rule was owner-superseded; practical scale limits are guide-refresh time and EPG size, tuner stays 1. |
 | 2026-07-08 | **Exclude-mode VOD/series + library renames.** Owner supplied panel-wide exclude lists (782 live / 24 VOD / 26 series categories, all verified against the panel). Sync switched to exclude-based selection for VOD (66 cats, ~27.7k movies) and series (52 cats, ~7.5k shows); old include keys now only order the dedupe (HD before 4K/Dolby — VPN can't play high-bitrate remuxes — then EN-first). Jellyfin libraries renamed "IPTV Cinema"→**Movies**, "IPTV Series"→**Series** (owner naming). Series backfill confirmed complete (6,124 shows); the pending empty-`PresentationUniqueKey` stamp applied to 28,225 `/media/shows` rows (jellyfin stopped → UPDATE → started). Live lineup unchanged pending owner's channel-level selection from the review artifact (v6 keeps working; 4 blocks flagged as source-less under the new list). |
 
 Historical deep-dives preserved in [`docs/archive/`](docs/archive/):
