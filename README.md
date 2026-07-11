@@ -9,8 +9,8 @@ per-device Swiss VPN tunnel.
 > GitHub. It contains internal addressing but **no secrets** — provider
 > credentials and passwords live only on the server (see [Secrets](#secrets)).
 
-**Status (2026-07-06): fully deployed and verified end-to-end — lineup v6
-(regional block numbering) + TV-series library live.**
+**Status (2026-07-10): fully deployed and verified end-to-end — lineup v8
+(per-city locals, 1,856 channels) + Movies/Series libraries live.**
 Remaining user-side niceties are listed in [Loose ends](#loose-ends).
 
 ---
@@ -159,20 +159,27 @@ jellyfin/{config,cache}  # jellyfin state — note: excluded from vzdump with th
 media/{movies,shows,recordings}
 ```
 
-### Channel map v7 — the guide numbering protocol (2026-07-09)
+### Channel map v8 — the guide numbering protocol (2026-07-10)
 
-Owner spec (v7, replaces v6): guide priority order **Locals → News →
+Owner spec (v8, replaces v7): guide priority order **Locals → News →
 Cable → Sports → 24/7 → German**, compact-hundreds numbering, built from
 the owner's hand-picked channel list (review-artifact CSV export,
 `refined-live-channels-no-espn.csv` — 1,599 explicit stream ids + the
-whole `US| SOCCER PPV` panel group; ESPN dropped by owner choice). Live
-and verified in Threadfin XEPG + Jellyfin (1,856/1,856 in the lineup):
+whole `US| SOCCER PPV` panel group; ESPN dropped by owner choice). v8
+(2026-07-10) reorganized the locals into **per-city groups**, network
+order ABC → NBC → FOX → CBS → PBS within each city; everything from US
+News (200) onward is unchanged from v7. Live and verified in Threadfin
+XEPG + Jellyfin (1,856/1,856 in the lineup):
 
 | Block | Range in use | # | Content (group label in clients) |
 |---|---|---|---|
-| 100–139 | 100–115 | 16 | **Wisconsin Locals** — Milwaukee → Madison → Green Bay (main + DirecTV CITY backup feeds, PBS WPNE) |
-| 140–149 | 140–144 | 5 | **Chicago Locals** — WLS, WMAQ, WBBM, WFLD, WTTW |
-| 150–199 | 150–164 | 15 | **NY/LA/Denver Locals** — ABC/NBC/CBS/FOX + PBS per city |
+| 100–104 | 100–103 | 4 | **Madison Locals** — ABC 27, NBC 15 (WMTV), FOX 47 (WMSN), CBS 3 (WISC) |
+| 105–114 | 105–112 | 8 | **Green Bay Locals** — ABC WBAY, NBC WGBA, FOX WLUK, CBS WFRV (main + DirecTV CITY backup feeds), PBS WPNE |
+| 115–119 | 115–118 | 4 | **Milwaukee Locals** — ABC 12 (WISN), NBC 4 (WTMJ), FOX 6 (WITI), CBS 58 (WDJT) |
+| 120–124 | 120–124 | 5 | **New York Locals** — ABC, NBC (WNBC), FOX 5 (WNYW), CBS 2 (WCBS), PBS WNJN |
+| 125–129 | 125–129 | 5 | **Chicago Locals** — ABC 7 (WLS), NBC 5 (WMAQ), FOX 32 (WFLD), CBS 2 (WBBM), PBS WTTW |
+| 130–134 | 130–134 | 5 | **Denver Locals** — ABC 7 (KMGH), NBC 9 (KUSA), FOX 31 (KDVR), CBS 4 (KCNC), PBS KBDI |
+| 135–199 | 135–139 | 5 | **Los Angeles Locals** — ABC 7 (KABC), NBC 4 (KNBC), FOX 11 (KTTV), CBS 2 (KCBS), PBS KQIN |
 | 200–299 | 200–256 | 57 | **US News** — majors first (CNN, MSNBC, FOX News, ABC/CBS News, …), rest A–Z |
 | 300–489 | 300–479 | 180 | **US Cable** — A–Z (A&E … USA Network, incl. Big Brother feeds) |
 | 490–519 | 490–507 | 18 | **HBO Max** originals channels |
@@ -216,7 +223,7 @@ writes the numbers into `playlist.m3u`. Threadfin (XEPG mode) adopts
 the guide by. **To change the lineup you edit `config.json` and re-run
 the sync — never renumber by hand in the UIs.**
 
-**EPG layers (v7).** In order of preference per channel: (1) provider
+**EPG layers (v7; unchanged in v8).** In order of preference per channel: (1) provider
 XMLTV (~178 channels); (2) external free XMLTV — epgshare01
 US_LOCALS1/US2/US_SPORTS1/UK1/DE1 plus i.mjh.nz PlutoTV/SamsungTVPlus/
 Plex/Roku (FAST-channel mirrors; ~155 channels), matched by call sign /
@@ -567,8 +574,9 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | 2026-07-05 (v5) | Lineup v5 + numbering: channel numbers via `tvg-chno` blocks (100s WI locals … 850s Bundesliga), English groups before German; Wisconsin broadened to all WI markets (33), Chicago Local added (14); CSN (dead brand), TUDN EXTRA, exact-duplicate names excluded → 535 channels, EPG coverage 288/461 unique ids. Threadfin switched to XEPG mode (auto-adopts tvg-chno; 04:25 activation timer for new channels). Prune guard caught provider VOD API returning an empty list — zero movies deleted. Measured VPN ceiling ~10 Mbit/s (buffering on high-bitrate remuxes); scan fanout capped at 2; WireGuard upgrade recommended. Jellyfin empty-PresentationUniqueKey bug fixed (users saw ~1k of 20.7k movies). |
 | 2026-07-06 (v6) | **Lineup v6 + TV series.** Regional block numbering per owner spec (100s WI/Chicago locals, 150s German public/regional HR-first, 200s US news+cable, 300s premium sports incl. Bally WI + DAZN DE, 400s UK TV/news/Sky/TNT, 500s German cable, 600s German sports, 650s Bundesliga) — 366 channels, strictly US/UK/DE, 100% EPG-mapped, verified live in Threadfin XEPG + Jellyfin. TV-series ingestion added to the sync (`series_categories`, .strm + NFO tree, per-show `last_modified` cache, prune guard); "IPTV Series" library created (NFO readers + TMDB/Fanart, savers off — RO mounts). Fixed: series `episodes` list-vs-dict panel quirk (season 0 = specials); empty-200 API answers now retried; live playlist got the same <70% guard as VOD (an empty `get_live_streams` answer would previously have blanked the lineup). |
 | 2026-07-07 | **SMB recordings share.** Samba added inside CT 105: single share `recordings` → `/srv/media-core/media/recordings` (rw, user `tivimate` only, SMB2+, no netbios) so TiviMate records directly onto the server; same folder is Jellyfin's DVR path, so recordings surface in Jellyfin. Verified working from the client. |
-| 2026-07-09 | **Lineup v7 — owner's hand-picked 1,856-channel guide.** Built from the review-artifact CSV (1,599 explicit stream ids + whole Soccer PPV group; ESPN dropped, German general TV kept but moved to 2500s per owner). Compact-hundreds priority order: Locals → News → Cable → Sports → 24/7 → German. Sync gained explicit-`ids` selections, stable slot display names (`slot`), PPV event parsing (`epg_mode: "ppv"`, ~340 slots incl. times parsed as UTC from names), synthesized looping guide for ~1,143 24/7 channels, i.mjh.nz external feeds, and an hourly `media-core-ppv.timer` refresh (change-detected; Threadfin `update.xmltv` via its now-enabled API + Jellyfin guide refresh). Threadfin quirks found: keys channels by name and truncates at apostrophes (names now apostrophe-stripped — VEVO '70S/'80S had collapsed into one channel); tvg-chno only adopted for new channels (renumber-xepg.py handles renumbering). Panel carries every NBA slot twice — deduped to 16. The old "<500 channels" rule was owner-superseded; practical scale limits are guide-refresh time and EPG size, tuner stays 1. |
 | 2026-07-08 | **Exclude-mode VOD/series + library renames.** Owner supplied panel-wide exclude lists (782 live / 24 VOD / 26 series categories, all verified against the panel). Sync switched to exclude-based selection for VOD (66 cats, ~27.7k movies) and series (52 cats, ~7.5k shows); old include keys now only order the dedupe (HD before 4K/Dolby — VPN can't play high-bitrate remuxes — then EN-first). Jellyfin libraries renamed "IPTV Cinema"→**Movies**, "IPTV Series"→**Series** (owner naming). Series backfill confirmed complete (6,124 shows); the pending empty-`PresentationUniqueKey` stamp applied to 28,225 `/media/shows` rows (jellyfin stopped → UPDATE → started). Live lineup unchanged pending owner's channel-level selection from the review artifact (v6 keeps working; 4 blocks flagged as source-less under the new list). |
+| 2026-07-09 | **Lineup v7 — owner's hand-picked 1,856-channel guide.** Built from the review-artifact CSV (1,599 explicit stream ids + whole Soccer PPV group; ESPN dropped, German general TV kept but moved to 2500s per owner). Compact-hundreds priority order: Locals → News → Cable → Sports → 24/7 → German. Sync gained explicit-`ids` selections, stable slot display names (`slot`), PPV event parsing (`epg_mode: "ppv"`, ~340 slots incl. times parsed as UTC from names), synthesized looping guide for ~1,143 24/7 channels, i.mjh.nz external feeds, and an hourly `media-core-ppv.timer` refresh (change-detected; Threadfin `update.xmltv` via its now-enabled API + Jellyfin guide refresh). Threadfin quirks found: keys channels by name and truncates at apostrophes (names now apostrophe-stripped — VEVO '70S/'80S had collapsed into one channel); tvg-chno only adopted for new channels (renumber-xepg.py handles renumbering). Panel carries every NBA slot twice — deduped to 16. The old "<500 channels" rule was owner-superseded; practical scale limits are guide-refresh time and EPG size, tuner stays 1. |
+| 2026-07-10 | **Lineup v8 — per-city locals.** The locals blocks reorganized from state/region buckets into per-city groups, network order ABC → NBC → FOX → CBS → PBS within each city: Madison 100, Green Bay 105 (incl. DirecTV CITY backup feeds), Milwaukee 115, New York 120, Chicago 125, Denver 130, Los Angeles 135. Everything from US News (200) onward unchanged from v7 — still 1,856 channels, verified 1,856/1,856 active in Threadfin XEPG. Config-only change (`live_selections` reordered); rollback copies `*.v7` sit next to the files in `sync/`. |
 
 Historical deep-dives preserved in [`docs/archive/`](docs/archive/):
 the original Media-Core manifest (imported verbatim) and the network

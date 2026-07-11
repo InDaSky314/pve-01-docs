@@ -24,7 +24,7 @@ The media stack lives in `/srv/media-core/` inside CT 105; drive it with
   `/srv/media-core/.env` (600) and generated files inside CT 105. Never in
   commits, logs, or chat pastes.
 - **Threadfin tuner stays at 1** (1-connection IPTV account). The
-  playlist is ~1,856 channels as of lineup v7 (owner's explicit picks —
+  playlist is ~1,856 channels as of lineup v8 (owner's explicit picks —
   the old "<500 channels" cap is superseded); don't grow it further
   without checking Jellyfin guide-refresh time.
 - **MAC `BC:24:11:59:1F:60` belongs to CT 105 only** — it carries the
