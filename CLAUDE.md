@@ -38,7 +38,9 @@ The media stack lives in `/srv/media-core/` inside CT 105; drive it with
 - No internet inside CT 105 = Swiss tunnel down on the router (kill switch
   working). Check the router first, not the CT.
 - Keep commits on a branch and PR to `main`; update the README in the same
-  commit as the work it describes. The apt enterprise repo throws 401 —
+  commit as the work it describes. Work isn't done until the PR is merged
+  to `main` — agents (Claude Code, Antigravity, or others) resume from
+  `main`, so an unmerged branch is invisible to the next session. The apt enterprise repo throws 401 —
   disable it before host `apt` work
   (`mv /etc/apt/sources.list.d/pve-enterprise.sources{,.disabled}`).
 - Wired networking is Proxmox ifupdown2, not NetworkManager. Never re-IP
