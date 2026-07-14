@@ -499,6 +499,18 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
   `player_api.php?...&action=get_live_categories`). Tuner errors in
   Jellyfin → `docker logs threadfin` (look for `Buffer: true [ffmpeg]` and
   `Tuner: 1/1` = a second stream was correctly refused).
+- **Guide empty / Threadfin unreachable on 34400 (ephemeral-port bug):**
+  a rapid `docker stop` → `docker start` of Threadfin makes it come up on
+  a random ephemeral port instead of 34400 (`curl
+  http://192.168.9.50:34400/web/` refuses; `docker logs threadfin` shows
+  `Web Interface: http://172.18.0.2:/web/` with an **empty port**, even
+  though `-port=34400` is on the process cmdline and `settings.json` is
+  correct). Fix: `docker stop threadfin && sleep 5 && docker start
+  threadfin`, verify `/web/` answers 200, then trigger Jellyfin's Refresh
+  Guide (the hourly PPV run at :07 also does this). Both nightly scripts
+  that cycle Threadfin (`activate-xepg.py`, `renumber-xepg.py`) sleep 5 s
+  before the start for this reason — keep that in any new script that
+  restarts the container.
 - **Panel anti-abuse (learned 2026-07-06):** hammering the Xtream API
   (the first series backfill ran at ~10 req/s) gets the account/IP
   temp-banned — the panel then answers **HTTP 403 to everything,
@@ -579,6 +591,7 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | 2026-07-10 | **Lineup v8 — per-city locals.** The locals blocks reorganized from state/region buckets into per-city groups, network order ABC → NBC → FOX → CBS → PBS within each city: Madison 100, Green Bay 105 (incl. DirecTV CITY backup feeds), Milwaukee 115, New York 120, Chicago 125, Denver 130, Los Angeles 135. Everything from US News (200) onward unchanged from v7 — still 1,856 channels, verified 1,856/1,856 active in Threadfin XEPG. Config-only change (`live_selections` reordered); rollback copies `*.v7` sit next to the files in `sync/`. |
 | 2026-07-11 | **Threadfin ephemeral-port bug fix.** Diagnosed an issue where Threadfin failed to bind to port 34400 and gracefully fell back to an ephemeral port (causing Jellyfin guide refreshes to fail with Connection Reset). Confirmed this was triggered by a CT 105 system reboot at 13:48 local time (11:48 UTC) which left `settings.json` intact (v8 scripts do not touch it; Threadfin correctly uses a string `"port": "34400"`). A clean `docker stop` and `docker start` of Threadfin cleared the socket state and fully restored the 34400 listener and Jellyfin guide sync. |
 | 2026-07-13 | **Threadfin ephemeral-port permanent fix.** The 04:25 `media-core-xepg.timer` (`activate-xepg.py`) triggered the exact same Threadfin ephemeral-port bug (fallback to random port) because it ran `docker stop` followed immediately by `docker start`, hitting a socket race condition. Added a `time.sleep(5)` before the start command in `sync/activate-xepg.py` to give Docker enough breathing room to fully release the `34400` port. Triggered Jellyfin's guide refresh manually via API to re-populate the empty guide. |
+| 2026-07-14 | **Threadfin ephemeral-port bug, third occurrence — `renumber-xepg.py` patched.** Guide dead again this morning: Threadfin up but refusing 34400 (empty port in the `Web Interface:` log line, listener on a random ephemeral port). Root cause: the 07-13 "permanent fix" only patched `activate-xepg.py`, but `media-core-xepg.service` runs a **second** `ExecStart` — `sync/renumber-xepg.py` — which did its own un-throttled `docker stop`/`start` at 04:26 and hit the same socket race. Added the identical `time.sleep(5)` before `docker start` there; recovered with a clean stop → 5 s → start, then the 07:07 PPV run re-triggered Threadfin `update.xmltv` + Jellyfin Refresh Guide. Also documented the failure signature + recovery in Operations → troubleshooting. |
 | 2026-07-13 | **Local Channel explicit naming.** Modified `sync/xtream-sync.py` to support dictionary mapping in the `ids` array of `config.json`, allowing explicit display names per stream ID. Updated `config.json` to map all 36 local network channels to beautiful, UI-friendly names (e.g. `Madison: ABC 27 (WKOW)`) so the city name is always visible on-screen. Preserved the W/K call signs in parentheses so the external EPG matcher automatically finds the correct guide data without manual `epg_aliases`. |
 
 Historical deep-dives preserved in [`docs/archive/`](docs/archive/):
