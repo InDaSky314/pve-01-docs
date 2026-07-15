@@ -63,8 +63,9 @@ Internet
    │
 Flint 2 (GL-MT6000, fw 4.9.0) ─ 192.168.9.1 ─ DHCP .100–.249, DNS, Wi-Fi "Big-GL"
    │        ├─ OpenVPN "Primary Tunnel" (Surfshark US)  — other devices as assigned
-   │        └─ OpenVPN "VM103-Swiss"    (Surfshark CH, TCP 1443, kill switch ON)
-   │                                     └─ bound to MAC BC:24:11:59:1F:60 ONLY
+   │        └─ WireGuard `wgclient1`    (Surfshark CH Zurich `peer_1501`, kill switch ON)
+   │                                     └─ bound to MAC BC:24:11:59:1F:60 (CT 105)
+   │                                        + 1c:53:f9:26:34:e9 (Chromecast, .203)
    ├── GL-BE3600 + UAP-AC-Lite (access points, same L2)
    └── pve-01  enp2s0 → vmbr0 → 192.168.9.11 (host, static)
           ├── CT 105 media-core → 192.168.9.50 (static DHCP lease by MAC)
@@ -72,16 +73,37 @@ Flint 2 (GL-MT6000, fw 4.9.0) ─ 192.168.9.1 ─ DHCP .100–.249, DNS, Wi-Fi "
           └── vmbr1–vmbr3 (unplugged spare NICs), vmbr4 (internal-only)
 ```
 
-- **Split tunnel (verified 2026-07-05):** CT 105 egresses via Zurich
-  (`146.70.134.252`, Surfshark CH — exit IP rotates within Surfshark's CH
-  pool); the host and everything else do **not**. No DNS leak (CT DNS
-  resolves through the tunnel).
-- **Kill switch:** if the Swiss tunnel drops, CT 105 loses WAN entirely but
-  keeps LAN (Jellyfin still serves recorded/local content). *No internet in
+- **Swiss tunnel is WireGuard as of 2026-07-14** (was OpenVPN-over-TCP,
+  which capped at ~10 Mbit/s). Measured through-tunnel throughput
+  **102 Mbit/s at 22% router CPU** — the MT7986 was never the bottleneck,
+  the TCP-in-TCP OpenVPN transport was. The old Swiss OpenVPN profile is
+  kept disabled as one-click rollback; the US OpenVPN tunnel is untouched.
+- **⚠️ Firmware gotcha — wrong-peer binding:** when the Surfshark WG
+  profile was loaded, the GL.iNet firmware bound `wgclient1` to
+  `peer_7124`, a **Chicago (US)** endpoint — IPTV egressed via the US
+  until it was re-bound (`uci set network.wgclient1.config='peer_1501'`,
+  commit, `ifdown`/`ifup wgclient1`). **After any VPN change on the
+  router, always verify egress country** (the Quick-reference VPN check
+  must say Switzerland). Config backups from before the change:
+  `/root/router-backups/*.bak.20260714` on pve-01 (kept out of this repo —
+  they contain credentials).
+- **Split tunnel (re-verified 2026-07-14):** CT 105 egresses via Zurich
+  (exit IP rotates within Surfshark's CH pool, `89.37.173.x` /
+  `138.199.6.x` seen); the host and everything else do **not**. No DNS
+  leak (CT DNS resolves through the tunnel).
+- **Kill switch (re-verified 2026-07-14 on WireGuard):** with `wgclient1`
+  downed, CT 105's WAN egress times out entirely (curl exit 28, zero
+  bytes — no fallback to the US tunnel or raw WAN) but keeps LAN
+  (Jellyfin still serves recorded/local content). *No internet in
   the CT ⇒ check the tunnel on the router first, not the CT.*
 - **The MAC is the linchpin:** `BC:24:11:59:1F:60` (inherited from the
   destroyed VM 103) carries both the `.50` lease and the VPN binding.
-  **Never assign it to another guest.**
+  **Never assign it to another guest.** The same router policy rule
+  (`media-core(ch)`) also binds the Chromecast (`1c:53:f9:26:34:e9`,
+  192.168.9.203) to the Swiss tunnel with the same kill switch.
+- **Router SSH:** pve-01's root key is installed on the Flint 2 —
+  `ssh root@192.168.9.1` works non-interactively (set up 2026-07-14 for
+  the WireGuard migration; used for all `uci` work).
 - The Flint 2 also runs an IoT subnet (`192.168.10.1/24`) and a guest
   network; the server belongs on the main LAN only.
 - The old AXT1800 router (`192.168.8.1` LAN, migrated away 2026-07-05) is
@@ -449,15 +471,15 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
   guide entries only when an event changed, then Threadfin
   `update.xmltv` + Jellyfin Refresh Guide. No-op runs log
   `no event changes, guide untouched`.
-- **Streaming bandwidth ceiling:** the Swiss OpenVPN tunnel tops out
-  around **10–20 Mbit/s** (1.3 MB/s measured 2026-07-05 daytime;
-  2.25 MB/s sustained 2026-07-06 ~01:00 — varies with exit-server
-  load). 1080p web-rips play fine; Blu-ray/4K remuxes (15–80 Mbit)
-  **will buffer** — pick the non-4K copy or set a client bitrate limit
-  (~8 Mbit). The initial metadata scan competes for the same tunnel
-  (posters via TMDB); `LibraryScanFanoutConcurrency=2` set to keep it
-  polite. Real fix: switch the router tunnel to **WireGuard** — see the
-  migration plan in [Loose ends](#7-loose-ends). Manual sync:
+- **Streaming bandwidth ceiling — lifted 2026-07-14:** the Swiss tunnel
+  now runs WireGuard at a measured **102 Mbit/s** (22% router CPU, held
+  steady even with a TiviMate stream running). The old OpenVPN-over-TCP
+  transport capped at ~10–20 Mbit/s and made Blu-ray/4K remuxes
+  (15–80 Mbit) buffer; those should now direct-play. Follow-ups still
+  pending (see Loose ends): raise `LibraryScanFanoutConcurrency` 2 → 4
+  and remove any client bitrate caps set during the OpenVPN era. The
+  next ceiling, if any, is the router's WiFi-client uplink — untested.
+  Manual sync:
   `pct exec 105 -- python3 /srv/media-core/sync/xtream-sync.py` then
   restart threadfin or wait for its scheduled update.
 - **Sync reliability guards (v4, extended 2026-07-06):** provider API
@@ -494,7 +516,9 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 - **Watch the thin pool** (`lvs -a` on the host) as recordings accumulate;
   1 TB is promised from the ~1.7 TB pool.
 - **Troubleshooting order:** no WAN in CT → router VPN dashboard
-  (`VM103-Swiss` tunnel; kill switch working as intended). Streams dead but
+  (`wgclient1` WireGuard tunnel; kill switch working as intended — and
+  check the egress **country**, not just that the tunnel is up: the
+  firmware once bound the wrong peer, see Network). Streams dead but
   WAN fine → provider/panel (test
   `player_api.php?...&action=get_live_categories`). Tuner errors in
   Jellyfin → `docker logs threadfin` (look for `Buffer: true [ffmpeg]` and
@@ -533,11 +557,12 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
       library (stale pre-rename entries disappear when the scan's cleanup
       pass runs). Same for the "Series" library (2026-07-06) — genre
       views in both libraries fill in as TMDB metadata converges
-      (~240 items/h behind the 10 Mbit tunnel).
-- [ ] Many v7 picks are high-bitrate feeds (Cinema TV "4K" loops, Soccer
-      PPV "8K EXCLUSIVE" slots) — they will buffer behind the ~10 Mbit
-      OpenVPN tunnel until the WireGuard migration happens, or unless the
-      client sets a bitrate limit.
+      (~240 items/h measured behind the old 10 Mbit tunnel; should be
+      much faster since the 2026-07-14 WireGuard migration).
+- [x] Many v7 picks are high-bitrate feeds (Cinema TV "4K" loops, Soccer
+      PPV "8K EXCLUSIVE" slots) that buffered behind the ~10 Mbit OpenVPN
+      tunnel — resolved by the 2026-07-14 WireGuard migration (~102 Mbit
+      now). If a client still buffers, remove its OpenVPN-era bitrate cap.
 - [ ] EPG match-rate on the new i.mjh.nz feeds is modest (Pluto 24,
       Samsung/Plex/Roku 0 on first run — their display names differ from
       the panel's "GO:"/"PRIME:" naming). `epg_aliases` entries in
@@ -552,26 +577,44 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
       but **close it before scheduled recordings** (1-connection account).
 - [ ] Host housekeeping (pre-existing): disable enterprise apt repo, delete
       VM 102's `unused0` disk, consider off-host backups.
-- [ ] **Proposed — OpenVPN → WireGuard on the Flint 2** (owner action,
-      needs ~20 min + a no-recording window; approved in principle
-      2026-07-05, plan below):
-      1. In the Surfshark dashboard: *VPN → Manual setup → Router →
-         WireGuard* → generate a key pair, download a **Switzerland
-         (Zurich)** `.conf`.
-      2. Flint 2 UI → *VPN → WireGuard Client → Add profile → upload the
-         .conf* (name it `VM103-Swiss-WG`).
-      3. *VPN Dashboard → Proxy mode "Based on the target device"*: move
-         the MAC `BC:24:11:59:1F:60` binding from the OpenVPN profile to
-         the WireGuard profile; re-tick **Block non-VPN traffic** (kill
-         switch) for that device.
-      4. Verify from pve-01: `pct exec 105 -- wget -qO-
-         https://am.i.mullvad.net/json` → still Switzerland; re-run the
-         speed test (expect ~5–10× — the MT7986 does WireGuard in
-         hardware, several hundred Mbit vs ~20 for OpenVPN-TCP).
-      5. Keep the OpenVPN profile disabled-but-saved as rollback; if the
-         panel ever blocks the WG exit IP range, switch back in one click.
-      Afterwards: raise `LibraryScanFanoutConcurrency` 2 → 4 and drop the
-      client bitrate caps — remux buffering should be gone.
+- [x] **OpenVPN → WireGuard on the Flint 2 — done 2026-07-14.** Surfshark
+      WG profile loaded, `wgclient1` bound to the Zurich `peer_1501`
+      (after the firmware's wrong-peer surprise — see Network), IPTV
+      policy + kill switch re-verified leak-proof, 102 Mbit/s measured.
+      Old Swiss OpenVPN profile kept disabled as rollback; US tunnel
+      untouched. Pre-change config backups:
+      `/root/router-backups/*.bak.20260714` on pve-01.
+- [ ] **Post-WireGuard follow-ups:** raise `LibraryScanFanoutConcurrency`
+      2 → 4 in Jellyfin and remove OpenVPN-era client bitrate caps
+      (~8 Mbit) — remux buffering should be gone. Optionally test whether
+      the router's WiFi-client uplink is the new throughput ceiling.
+- [ ] **Jellyfin live-TV playback issue (2026-07-14):** owner reports
+      live streams play in TiviMate but were not working in Jellyfin;
+      deliberately not troubleshot yet (game was on). Recordings/local
+      content unaffected. Start with `docker logs threadfin` +
+      `docker logs jellyfin` during a tune attempt.
+- [ ] **Router hardening (from the 2026-07-14 security review** — fundamentals
+      solid: WAN input DROP on both uplinks, no port forwards, no UPnP/DMZ,
+      guest/IoT isolated, VPN zones DROP inbound**):**
+      1. Disable SSH root **password** login (key auth from pve-01 works;
+         web panel remains the fallback).
+      2. Disable **GoodCloud** remote admin (router keeps an outbound
+         session to `gslb-eu.goodcloud.xyz`, account-bound since May 2024)
+         if it's not actually used — unnecessary external control path.
+      3. Panel serves plain HTTP on :80 alongside HTTPS (LAN-only; low
+         risk) — consider HTTPS-only.
+      4. Informational: VPN creds are plaintext in router config (normal);
+         `netifyd` DPI/analytics daemon runs localhost-only (can be turned
+         off under privacy settings); firmware 4.9.0 on an aging OpenWrt
+         21.02 base — check for updates occasionally.
+- [ ] **Saved plan — Immich + Oracle-Cloud free-tier front door** (photo
+      backup reachable off-LAN without a VPN app on the phone; approved in
+      principle, **not yet executed** — owner will say when):
+      [`docs/plans/immich-oci-front-door.md`](docs/plans/immich-oci-front-door.md).
+      Blocking user actions when it starts: buy a domain, add an OCI API
+      key. Uptime Kuma / Home Assistant / Vaultwarden / Forgejo were also
+      discussed as good fits for the box's spare RAM (CPU is the scarce
+      resource — nothing that transcodes or runs ML constantly).
 
 ## 8. History
 
@@ -594,6 +637,7 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | 2026-07-14 | **Threadfin ephemeral-port bug, third occurrence — `renumber-xepg.py` patched.** Guide dead again this morning: Threadfin up but refusing 34400 (empty port in the `Web Interface:` log line, listener on a random ephemeral port). Root cause: the 07-13 "permanent fix" only patched `activate-xepg.py`, but `media-core-xepg.service` runs a **second** `ExecStart` — `sync/renumber-xepg.py` — which did its own un-throttled `docker stop`/`start` at 04:26 and hit the same socket race. Added the identical `time.sleep(5)` before `docker start` there; recovered with a clean stop → 5 s → start, then the 07:07 PPV run re-triggered Threadfin `update.xmltv` + Jellyfin Refresh Guide. Also documented the failure signature + recovery in Operations → troubleshooting. |
 | 2026-07-14 | **Local channels lost names + guide data — 07-13 naming config was corrupt.** Owner reported locals showing raw stream ids ("429409") with blank guide rows. The 07-13 explicit-naming edit's *code* works (`ids` dict value → display name verbatim), but the committed `config.json` mapped every id **to itself** (`"430234": "430234"`), so the 04:00 sync wrote numeric `tvg-name`s, the call-sign EPG matcher had nothing to match (locals fell to `mc…` ids, external coverage dropped to 124), and Threadfin treated all 36 "renamed" locals as new channels (the 04:25 activation of 36). Fixed: rebuilt all 36 names from the panel's raw names per the documented `City: NETWORK ## (CALLSIGN)` convention (Green Bay CITY backup feeds suffixed ` Alt` — identical display names in one group are dropped as duplicates by the sync), broken config saved as `config.json.bad-naming-20260714`. Re-ran sync (external coverage 124 → 153, every local now carries real programmes), then update.m3u → renumber → activate → update.xmltv, cleared Jellyfin's `/cache/xmltv`, refreshed the guide. Verified lineup 100–139 shows proper names, 0 numeric ghosts. Lesson: after editing `config.json`, verify the *written playlist* (`grep tvg-chno=\"10 playlist.m3u`), not just the changelog. |
 | 2026-07-13 | **Local Channel explicit naming.** Modified `sync/xtream-sync.py` to support dictionary mapping in the `ids` array of `config.json`, allowing explicit display names per stream ID. Updated `config.json` to map all 36 local network channels to beautiful, UI-friendly names (e.g. `Madison: ABC 27 (WKOW)`) so the city name is always visible on-screen. Preserved the W/K call signs in parentheses so the external EPG matcher automatically finds the correct guide data without manual `epg_aliases`. |
+| 2026-07-14 (evening) | **Swiss tunnel OpenVPN → WireGuard (10 → 102 Mbit/s).** SSH key access from pve-01 to the Flint 2 established (tmux was breaking the interactive password prompt; owner ran `ssh-copy-id` from a plain shell). CPU-bottleneck theory ruled out (router idle during transfers) — the ceiling was OpenVPN-over-TCP itself. Surfshark WG profile loaded; firmware bound `wgclient1` to a **Chicago** peer (`peer_7124`) so IPTV briefly egressed via the US — re-bound to Zurich `peer_1501` via uci; **lesson: always verify egress country after router VPN changes**. Verified: CT 105 egress Switzerland, 102.3 Mbit/s at 22% router CPU (steady with a live TiviMate stream), kill switch leak-proof both ways (tunnel down ⇒ curl times out, no US-tunnel or raw-WAN fallback). Chromecast (192.168.9.203) confirmed on the same Swiss rule. Router security review: fundamentals solid; hardening items filed in Loose ends. Pre-change config backups: `/root/router-backups/` on pve-01. Also filed: Immich + OCI free-tier front-door plan saved (not executed) at `docs/plans/immich-oci-front-door.md`; open issue — Jellyfin live TV not playing (TiviMate fine), deferred by owner. |
 
 Historical deep-dives preserved in [`docs/archive/`](docs/archive/):
 the original Media-Core manifest (imported verbatim) and the network
