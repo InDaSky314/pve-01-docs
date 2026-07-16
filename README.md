@@ -27,6 +27,7 @@ Remaining user-side niceties are listed in [Loose ends](#loose-ends).
 | Stack home | `/srv/media-core` inside CT 105 |
 | Health check | `curl -so /dev/null -w '%{http_code}' http://192.168.9.50:8096` → 200; same for `:34400/web/` |
 | Sync (playlist/EPG/VOD) | `systemctl status media-core-sync.timer` in CT; manual run: `python3 /srv/media-core/sync/xtream-sync.py` |
+| Threadfin auto-recovery | `systemctl status media-core-healthcheck.timer` (every 5 min) + `media-core-guard.timer` (every 1 min, pre-recording) in CT |
 | VPN check | `pct exec 105 -- wget -qO- https://am.i.mullvad.net/json` → must say Switzerland |
 | Recordings SMB share | `\\192.168.9.50\recordings` — user `tivimate` (password not in this repo) |
 
@@ -184,6 +185,9 @@ docker-compose.yml       # jellyfin + threadfin (pinned versions)
 .env                     # mode 600 — TZ + XTREAM_BASE/USER/PASS  ← SECRETS
 sync/xtream-sync.py      # the generator (root:750); sync/config.json = category selection
 sync/run-series.py       # helper: run only the series step (manual backfill)
+sync/threadfin_ctl.py    # shared: verified Threadfin restart + recording-in-progress guard
+sync/pre-recording-guard.py  # media-core-guard.timer (1 min): clear the tuner before scheduled recordings
+sync/healthcheck.py      # media-core-healthcheck.timer (5 min): auto-recover a wedged Threadfin
 sync/cache/series/       # per-show get_series_info cache (keyed by last_modified)
 threadfin/conf/          # threadfin settings + generated playlist.m3u
 epg/epg.xml              # filtered guide (mounted read-only into jellyfin at /epg)
@@ -533,18 +537,65 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
   `player_api.php?...&action=get_live_categories`). Tuner errors in
   Jellyfin → `docker logs threadfin` (look for `Buffer: true [ffmpeg]` and
   `Tuner: 1/1` = a second stream was correctly refused).
-- **Guide empty / Threadfin unreachable on 34400 (ephemeral-port bug):**
-  a rapid `docker stop` → `docker start` of Threadfin makes it come up on
-  a random ephemeral port instead of 34400 (`curl
-  http://192.168.9.50:34400/web/` refuses; `docker logs threadfin` shows
-  `Web Interface: http://172.18.0.2:/web/` with an **empty port**, even
-  though `-port=34400` is on the process cmdline and `settings.json` is
-  correct). Fix: `docker stop threadfin && sleep 5 && docker start
-  threadfin`, verify `/web/` answers 200, then trigger Jellyfin's Refresh
-  Guide (the hourly PPV run at :07 also does this). Both nightly scripts
-  that cycle Threadfin (`activate-xepg.py`, `renumber-xepg.py`) sleep 5 s
-  before the start for this reason — keep that in any new script that
-  restarts the container.
+- **Guide empty / Threadfin unreachable on 34400 (ephemeral-port bug) —
+  fixed properly 2026-07-16:** a rapid `docker stop` → `docker start` of
+  Threadfin can make it come up on a random ephemeral port instead of
+  34400 (`curl http://192.168.9.50:34400/web/` refuses; `docker logs
+  threadfin` shows `Web Interface: http://172.18.0.2:/web/` with an
+  **empty port**). A fixed `sleep 5` before `docker start` (added
+  2026-07-13) was believed to have fixed this but only reduced the odds
+  — it recurred 07-14 and again 07-16 (this time undetected for **17+
+  hours**: every hourly PPV run from 04:25 to 21:08 logged `threadfin
+  update.xmltv failed: Connection reset by peer` and nobody was
+  watching). Replaced with `sync/threadfin_ctl.py`
+  (`start_threadfin_verified()`): polls `/web/` for up to 20 s after each
+  start attempt and retries the stop/start cycle (bounded, 3 attempts)
+  instead of assuming a fixed delay was enough; `activate-xepg.py` and
+  `renumber-xepg.py` both use it now. A `media-core-healthcheck.timer`
+  (every 5 min) also auto-recovers Threadfin if it's ever found
+  unreachable, so an ephemeral-port relapse gets caught in minutes
+  instead of silently sitting broken — see "DVR recording reliability"
+  below.
+- **DVR recording reliability (diagnosed + fixed 2026-07-16):** two
+  scheduled recordings ("Live: FIFA World Cup 2026", 07-14 and 07-15)
+  both landed as ~20 KB stub files. Root cause, confirmed in
+  `docker logs threadfin`: Threadfin's single-connection tuner slot was
+  left marked busy by an earlier stream that ended abnormally (a
+  "zombie" session — no matching "connection has ended" cleanup log),
+  and refused the DVR's connection at record-start time (`No new
+  connections available. Tuner = 1`). Separately, the nightly cascade
+  restarting Threadfin at 04:15/04:25 unconditionally is a second,
+  related risk for any recording spanning that window (not yet observed
+  to cause a failure, but the fix below removes the risk anyway). Fix:
+  - `sync/threadfin_ctl.py` adds `stop_threadfin_safe()` /
+    `recording_in_progress()` — anything that wants to restart Threadfin
+    now checks Jellyfin's `/emby/LiveTv/Recordings?IsInProgress=true`
+    first and **skips the restart** if a recording is active (fails
+    safe: an API error is treated as "yes, a recording is running").
+    `activate-xepg.py` and `renumber-xepg.py` both go through this now,
+    so the nightly cascade can never kill an in-progress recording.
+  - `sync/pre-recording-guard.py` (new) + `media-core-guard.timer`
+    (every 1 min): for any Jellyfin recording timer starting within the
+    next 4 minutes, force a clean Threadfin restart first, guaranteeing
+    the tuner is free (clears a zombie session, or frees the tuner if a
+    live Jellyfin Live TV viewer is holding it) — the same effect as the
+    "close TiviMate before recording" habit, but automatic and it also
+    catches causes TiviMate-closing wouldn't (a zombie Threadfin
+    session, which is what actually happened both times).
+  - **Not covered:** TiviMate connects straight to the IPTV provider,
+    bypassing Threadfin entirely, so none of the above can free the
+    tuner if TiviMate itself is what's holding the provider's 1-connection
+    cap. Neither confirmed failure was actually caused by TiviMate, but
+    it's a real additional way to hit the same wall. **Future plan, not
+    yet built** (owner-approved in principle): a router-level firewall
+    rule that temporarily blocks TiviMate's device
+    (`192.168.9.203`, MAC `1c:53:f9:26:34:e9` — same VPN-policy binding
+    as the Chromecast) from reaching the provider during the
+    pre-recording guard window, using pve-01's existing root SSH key to
+    the Flint 2 (see Network). Would need to (a) confirm this MAC is
+    reliably TiviMate and not shared with casting use, (b) add/remove
+    the block from `pre-recording-guard.py` alongside the Threadfin
+    restart, (c) decide how long before/after the recording to hold it.
 - **Panel anti-abuse (learned 2026-07-06):** hammering the Xtream API
   (the first series backfill ran at ~10 req/s) gets the account/IP
   temp-banned — the panel then answers **HTTP 403 to everything,
@@ -583,8 +634,19 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
       password change.
 - [ ] Chromecast clients: install Jellyfin app → Add server manually →
       `http://192.168.9.50:8096`.
-- [ ] Optional: TiviMate on the Chromecast for casual channel-surfing —
-      but **close it before scheduled recordings** (1-connection account).
+- [x] Optional: TiviMate on the Chromecast (`192.168.9.203`) for casual
+      channel-surfing — **close it before scheduled recordings**
+      (1-connection account) is now backstopped by
+      `media-core-guard.timer` for the Threadfin-side case (see
+      Operations → DVR recording reliability), but TiviMate itself
+      connects straight to the provider and isn't covered — the manual
+      habit still matters until the router-block plan below is built.
+- [ ] **Router-level TiviMate block during recordings** (see Operations →
+      DVR recording reliability for the diagnosis): extend
+      `pre-recording-guard.py` to also block `192.168.9.203` /
+      `1c:53:f9:26:34:e9` at the Flint 2 for the guard window, closing the
+      one gap the 2026-07-16 fix doesn't cover (TiviMate holding the
+      provider's 1-connection cap directly, bypassing Threadfin).
 - [ ] Host housekeeping (pre-existing): disable enterprise apt repo, delete
       VM 102's `unused0` disk, consider off-host backups.
 - [x] **OpenVPN → WireGuard on the Flint 2 — done 2026-07-14.** Surfshark
@@ -649,6 +711,7 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | 2026-07-13 | **Local Channel explicit naming.** Modified `sync/xtream-sync.py` to support dictionary mapping in the `ids` array of `config.json`, allowing explicit display names per stream ID. Updated `config.json` to map all 36 local network channels to beautiful, UI-friendly names (e.g. `Madison: ABC 27 (WKOW)`) so the city name is always visible on-screen. Preserved the W/K call signs in parentheses so the external EPG matcher automatically finds the correct guide data without manual `epg_aliases`. |
 | 2026-07-15 | **VPN-dashboard card desync fixed.** Owner spotted the `media-core(ch)` card showing "Please select a configuration" after the WG migration; tunnel verified fully working (Zurich egress, fresh handshakes, kill-switch mark rules intact) — display-only desync because the manual `uci` peer re-bind didn't set the panel's `group_id`/`client_id` bookkeeping fields. Added `group_id='5308'` + `client_id='1501'` to the rule (no service restart; runtime untouched, egress re-verified). Backups: `/tmp/route_policy.pre-cardfix` on the router, `/root/router-backups/route_policy.pre-cardfix.20260715` on pve-01. |
 | 2026-07-14 (evening) | **Swiss tunnel OpenVPN → WireGuard (10 → 102 Mbit/s).** SSH key access from pve-01 to the Flint 2 established (tmux was breaking the interactive password prompt; owner ran `ssh-copy-id` from a plain shell). CPU-bottleneck theory ruled out (router idle during transfers) — the ceiling was OpenVPN-over-TCP itself. Surfshark WG profile loaded; firmware bound `wgclient1` to a **Chicago** peer (`peer_7124`) so IPTV briefly egressed via the US — re-bound to Zurich `peer_1501` via uci; **lesson: always verify egress country after router VPN changes**. Verified: CT 105 egress Switzerland, 102.3 Mbit/s at 22% router CPU (steady with a live TiviMate stream), kill switch leak-proof both ways (tunnel down ⇒ curl times out, no US-tunnel or raw-WAN fallback). Chromecast (192.168.9.203) confirmed on the same Swiss rule. Router security review: fundamentals solid; hardening items filed in Loose ends. Pre-change config backups: `/root/router-backups/` on pve-01. Also filed: Immich + OCI free-tier front-door plan saved (not executed) at `docs/plans/immich-oci-front-door.md`; open issue — Jellyfin live TV not playing (TiviMate fine), deferred by owner. |
+| 2026-07-16 | **DVR recording reliability diagnosed + fixed.** Owner reported flaky sports recordings + flaky TiviMate; investigation (Claude Code, granted permanent root via `/etc/sudoers.d/nate-claude` for this and future Proxmox-wide work) found two confirmed, distinct root causes. (1) The ephemeral-port bug recurred a 4th time overnight and sat undetected for **17+ hours** (04:25–21:51) — every hourly PPV run logged `update.xmltv failed: Connection reset by peer` with nobody watching; restored live with the documented manual recovery, then replaced the fixed-`sleep(5)` band-aid with `sync/threadfin_ctl.py`'s port-verified retry loop in `activate-xepg.py`/`renumber-xepg.py`, plus a new `media-core-healthcheck.timer` (5 min) that auto-recovers and leaves `.threadfin_alert` if recovery ever fails. (2) The two failed recordings (07-14, 07-15, both ~20 KB stub files) were confirmed via `docker logs threadfin` to be Threadfin's single-tuner slot stuck busy from an earlier stream that ended abnormally (a zombie session, not proven to be TiviMate — it was Jellyfin's own prior connection both times) — refused with `No new connections available. Tuner = 1` at the exact moment the DVR tried to start. Fixed with a new `sync/pre-recording-guard.py` + `media-core-guard.timer` (1 min): force-clears the Threadfin tuner a few minutes before every scheduled recording, and (via `threadfin_ctl.recording_in_progress()`) any Threadfin restart from any source — nightly cascade included — now skips if a recording is already active rather than risking killing it. Not yet covered: TiviMate connects straight to the provider bypassing Threadfin, so it can still hold the account's 1-connection cap outside any of the above — router-level block on `192.168.9.203` filed as a future plan in Loose ends. All new scripts deployed to CT 105, syntax-checked, and live-tested (the `renumber-xepg.py` run during testing exercised a real verified restart successfully on the first attempt). |
 
 Historical deep-dives preserved in [`docs/archive/`](docs/archive/):
 the original Media-Core manifest (imported verbatim) and the network
