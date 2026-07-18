@@ -205,7 +205,8 @@ whole `US| SOCCER PPV` panel group; ESPN dropped by owner choice). v8
 (2026-07-10) reorganized the locals into **per-city groups**, network
 order ABC → NBC → FOX → CBS → PBS within each city; everything from US
 News (200) onward is unchanged from v7. Live and verified in Threadfin
-XEPG + Jellyfin (1,856/1,856 in the lineup):
+XEPG + Jellyfin (1,856/1,856 in the lineup as of v8; **996/996 as of the
+2026-07-18 guide-speed trim** — see Operations → Guide size trim):
 
 | Block | Range in use | # | Content (group label in clients) |
 |---|---|---|---|
@@ -230,9 +231,9 @@ XEPG + Jellyfin (1,856/1,856 in the lineup):
 | 880–899 | 880–898 | 19 | **BBC Streams** 1–19 (event streams) |
 | 900–999 | 900–933 | 34 | **Bundesliga** — Sky Sport Bundesliga tiers + Mobil feeds |
 | 1000–1299 | 1000–1199 | 200 | **Soccer PPV** — whole panel group, slot names stable ("Soccer PPV 042") |
-| 1300–1499 | 1300–1456 | 157 | **DirecTV Stream** — "GO:" 24/7 streaming channels |
-| 1500–2099 | 1500–2079 | 580 | **Prime 24/7** — PRIME looping channels |
-| 2100–2499 | 2100–2407 | 308 | **Cinema TV** — "CM" Apple TV+/Disney+/Amazon/Netflix 4K loops |
+| 1300–1499 | 1300–14xx | 139 | **DirecTV Stream** — "GO:" 24/7 streaming channels (trimmed 2026-07-18, see below) |
+| 1500–2099 | 1500–15xx | 47 | **Prime 24/7** — PRIME looping channels, sports-only since 2026-07-18 (see below) |
+| 2100–2499 | *(empty)* | 0 | **Cinema TV** — removed entirely 2026-07-18 (see below); block kept as reserved headroom |
 | 2500–2549 | 2500–2536 | 37 | **German Public & Regional** — v6 carryover (HR first), regex-selected |
 | 2550+ | 2550–2586 | 37 | **German Cable & Entertainment** — v6 carryover, regex-selected |
 
@@ -596,6 +597,44 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
     reliably TiviMate and not shared with casting use, (b) add/remove
     the block from `pre-recording-guard.py` alongside the Threadfin
     restart, (c) decide how long before/after the recording to hold it.
+- **Guide size trim (2026-07-18):** owner reported slow guide loading on
+  the Android TV app. Root numbers: 1,856 channels, a 20.7 MB `epg.xml`
+  (29,299 programmes), and the server's own nightly "Refresh Guide" task
+  took ~20 min. Jellyfin has no per-user channel-hiding feature (checked —
+  parental controls are rating-based only), so the only real lever is
+  the lineup itself. Over half the lineup (1,045 of 1,856 channels) was
+  the three "24/7 looping" blocks (Prime 24/7, Cinema TV, DirecTV
+  Stream) — synthesized/looping filler, not appointment viewing, but
+  **two of the three are not sports-free**: DirecTV Stream and Prime
+  24/7 both carry real linear sports channels (ESPN family, NFL/NHL/NBA/
+  MLB Network, regional sports nets, UEFA Champions League, Real Madrid
+  TV, NESN, etc.) mixed in with general entertainment. Cut, after
+  channel-by-channel review (not just keyword matching — an early pass
+  nearly cut UEFA Champions League and Real Madrid TV on a keyword miss):
+  - **Cinema TV** (308 channels): removed entirely — verified sports-free.
+  - **Prime 24/7** (580 → 47): kept every sports channel, cut the rest.
+  - **DirecTV Stream** (157 → 139): cut only 18 channels that were exact
+    duplicates already carried elsewhere in the lineup (incl. NFL Network
+    and NHL Network, which are already at channels 650/741 in the
+    dedicated NFL/NHL blocks) — kept everything else, including
+    Disney/Nickelodeon/Cartoon Network/STARZ Encore/TUDN, which are
+    **not** duplicated anywhere else in the lineup and would have been
+    lost if the whole block had been cut.
+  - Net: **1,856 → 996 channels (46% smaller)**, `epg.xml` 20.7 MB →
+    13.1 MB, no verified loss of sports content.
+  - Rollback: `sync/config.json.pre-20260718-guide-trim` on CT 105 has
+    the pre-trim selection; restore it, re-run the sync, then
+    `renumber-xepg.py` → `activate-xepg.py` → `update.xmltv` → Jellyfin
+    Refresh Guide (same procedure as any lineup change, see "Changing
+    the channel lineup" above).
+  - Gotcha hit during this change: `xtream-sync.py`'s live-playlist
+    prune guard (`PRUNE_GUARD = 0.70`) correctly refused to write a
+    46%-smaller playlist, assuming provider breakage. For this one
+    *intentional* reduction it was overridden in-memory for a single run
+    (`PRUNE_GUARD` patched on an imported copy of the module, never
+    written to the file on disk) rather than edited in place — the
+    permanent guard is untouched and still protects future nightly runs
+    against a real truncated provider response.
 - **Panel anti-abuse (learned 2026-07-06):** hammering the Xtream API
   (the first series backfill ran at ~10 req/s) gets the account/IP
   temp-banned — the panel then answers **HTTP 403 to everything,
@@ -712,6 +751,8 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | 2026-07-15 | **VPN-dashboard card desync fixed.** Owner spotted the `media-core(ch)` card showing "Please select a configuration" after the WG migration; tunnel verified fully working (Zurich egress, fresh handshakes, kill-switch mark rules intact) — display-only desync because the manual `uci` peer re-bind didn't set the panel's `group_id`/`client_id` bookkeeping fields. Added `group_id='5308'` + `client_id='1501'` to the rule (no service restart; runtime untouched, egress re-verified). Backups: `/tmp/route_policy.pre-cardfix` on the router, `/root/router-backups/route_policy.pre-cardfix.20260715` on pve-01. |
 | 2026-07-14 (evening) | **Swiss tunnel OpenVPN → WireGuard (10 → 102 Mbit/s).** SSH key access from pve-01 to the Flint 2 established (tmux was breaking the interactive password prompt; owner ran `ssh-copy-id` from a plain shell). CPU-bottleneck theory ruled out (router idle during transfers) — the ceiling was OpenVPN-over-TCP itself. Surfshark WG profile loaded; firmware bound `wgclient1` to a **Chicago** peer (`peer_7124`) so IPTV briefly egressed via the US — re-bound to Zurich `peer_1501` via uci; **lesson: always verify egress country after router VPN changes**. Verified: CT 105 egress Switzerland, 102.3 Mbit/s at 22% router CPU (steady with a live TiviMate stream), kill switch leak-proof both ways (tunnel down ⇒ curl times out, no US-tunnel or raw-WAN fallback). Chromecast (192.168.9.203) confirmed on the same Swiss rule. Router security review: fundamentals solid; hardening items filed in Loose ends. Pre-change config backups: `/root/router-backups/` on pve-01. Also filed: Immich + OCI free-tier front-door plan saved (not executed) at `docs/plans/immich-oci-front-door.md`; open issue — Jellyfin live TV not playing (TiviMate fine), deferred by owner. |
 | 2026-07-16 | **DVR recording reliability diagnosed + fixed.** Owner reported flaky sports recordings + flaky TiviMate; investigation (Claude Code, granted permanent root via `/etc/sudoers.d/nate-claude` for this and future Proxmox-wide work) found two confirmed, distinct root causes. (1) The ephemeral-port bug recurred a 4th time overnight and sat undetected for **17+ hours** (04:25–21:51) — every hourly PPV run logged `update.xmltv failed: Connection reset by peer` with nobody watching; restored live with the documented manual recovery, then replaced the fixed-`sleep(5)` band-aid with `sync/threadfin_ctl.py`'s port-verified retry loop in `activate-xepg.py`/`renumber-xepg.py`, plus a new `media-core-healthcheck.timer` (5 min) that auto-recovers and leaves `.threadfin_alert` if recovery ever fails. (2) The two failed recordings (07-14, 07-15, both ~20 KB stub files) were confirmed via `docker logs threadfin` to be Threadfin's single-tuner slot stuck busy from an earlier stream that ended abnormally (a zombie session, not proven to be TiviMate — it was Jellyfin's own prior connection both times) — refused with `No new connections available. Tuner = 1` at the exact moment the DVR tried to start. Fixed with a new `sync/pre-recording-guard.py` + `media-core-guard.timer` (1 min): force-clears the Threadfin tuner a few minutes before every scheduled recording, and (via `threadfin_ctl.recording_in_progress()`) any Threadfin restart from any source — nightly cascade included — now skips if a recording is already active rather than risking killing it. Not yet covered: TiviMate connects straight to the provider bypassing Threadfin, so it can still hold the account's 1-connection cap outside any of the above — router-level block on `192.168.9.203` filed as a future plan in Loose ends. All new scripts deployed to CT 105, syntax-checked, and live-tested (the `renumber-xepg.py` run during testing exercised a real verified restart successfully on the first attempt). |
+| 2026-07-17 | **DVR fix verified with a real recording.** Owner scheduled a 1-hour recording ("Surviving Earth") via the Jellyfin web UI (the Android app has no Record option on the guide — web UI is the reliable path) to test the 07-16 fix. `media-core-guard.timer` fired every minute through the window without issue; the recording completed cleanly as a full 1.7 GB `.ts` file (vs. the ~20 KB stubs before the fix); no `.threadfin_alert` since. |
+| 2026-07-18 | **Live TV tile image + guide-size trim.** (1) Built and set a custom image for the Live TV home-screen tile via the Jellyfin API directly (`/Items/{id}/Images/Primary`) — it's a `UserView`, not a normal library folder, so it doesn't appear in the Dashboard's library-image manager. (2) Guide-speed investigation + fix: see Operations → "Guide size trim" for the full writeup — lineup cut from 1,856 to 996 channels (Cinema TV removed, Prime 24/7 and DirecTV Stream trimmed to sports + genuinely-unique content only), `epg.xml` 20.7 MB → 13.1 MB. Also researched (no server-side fix available): Chromecast focus-highlight visibility (no Jellyfin Android TV setting exists; alternative clients Streamyfin/Wholphin suggested) and scoped a VOD-category-by-streaming-service feature (Netflix/Amazon/Apple TV+/Disney+ etc. as separate libraries — the provider categories already support this granularity; design questions on granularity/dedupe scope pending owner decision, not yet built). |
 
 Historical deep-dives preserved in [`docs/archive/`](docs/archive/):
 the original Media-Core manifest (imported verbatim) and the network
