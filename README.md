@@ -191,7 +191,7 @@ docker-compose.yml       # jellyfin + threadfin (pinned versions)
 sync/xtream-sync.py      # the generator (root:750); sync/config.json = category selection
 sync/run-series.py       # helper: run only the series step (manual backfill)
 sync/threadfin_ctl.py    # shared: verified Threadfin restart + recording-in-progress guard
-sync/pre-recording-guard.py  # media-core-guard.timer (1 min): clear the tuner before scheduled recordings
+sync/pre-recording-guard.py  # media-core-guard.timer (1 min): watch new recordings, auto-recover if stuck (detect-then-fix since 2026-07-19)
 sync/healthcheck.py      # media-core-healthcheck.timer (5 min): auto-recover a wedged Threadfin
 sync/cache/series/       # per-show get_series_info cache (keyed by last_modified)
 threadfin/conf/          # threadfin settings + generated playlist.m3u
@@ -597,13 +597,14 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
     `activate-xepg.py` and `renumber-xepg.py` both go through this now,
     so the nightly cascade can never kill an in-progress recording.
   - `sync/pre-recording-guard.py` (new) + `media-core-guard.timer`
-    (every 1 min): for any Jellyfin recording timer starting within the
-    next 4 minutes, force a clean Threadfin restart first, guaranteeing
-    the tuner is free (clears a zombie session, or frees the tuner if a
-    live Jellyfin Live TV viewer is holding it) — the same effect as the
-    "close TiviMate before recording" habit, but automatic and it also
-    catches causes TiviMate-closing wouldn't (a zombie Threadfin
-    session, which is what actually happened both times).
+    (every 1 min): originally, for any Jellyfin recording timer starting
+    within the next 4 minutes, force a clean Threadfin restart first,
+    guaranteeing the tuner is free (clears a zombie session, or frees
+    the tuner if a live Jellyfin Live TV viewer is holding it). **This
+    preemptive design was replaced 2026-07-19** — see Operations →
+    "Recording-start watchdog redesign" — because it restarted Threadfin
+    (and so dropped any live viewer) before *every* recording whether or
+    not anything was actually wrong.
   - **Not covered:** TiviMate connects straight to the IPTV provider,
     bypassing Threadfin entirely, so none of the above can free the
     tuner if TiviMate itself is what's holding the provider's 1-connection
@@ -763,6 +764,44 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
   `PostPaddingSeconds` — this produces a `" - 1.ts"` continuation file,
   not a single seamless recording, so a dropped-and-recovered game is
   two files to watch back to back.
+- **Recording-start watchdog redesign (2026-07-19):** owner reported the
+  Android app pausing/dropping for a few seconds right around every
+  recording's start (and separately, around every recording's stop).
+  Confirmed two distinct causes:
+  - **Start:** `media-core-guard.service` logs lined up exactly —
+    `pre-recording-guard.py`'s original design (2026-07-16) restarted
+    Threadfin ~4 min before *every* recording, unconditionally, to
+    guarantee a clean tuner. That restart drops any live stream
+    currently flowing through Threadfin, including a live viewer's.
+    **Fixed** by rewriting the script from preemptive to
+    **detect-then-fix**: do nothing before a recording starts; once its
+    scheduled start passes, sample the output file's size twice ~15 s
+    apart; if it's genuinely growing (>200 KB and increasing — well
+    above the ~20 KB stub size from a refused stream), leave it alone —
+    the common case now has **zero** live-viewing disruption. Only if
+    it isn't growing does it intervene, and the intervention mirrors the
+    manual recovery from the same night's earlier incident: `DELETE`
+    the dead timer, a guarded Threadfin restart, `POST` a fresh timer
+    from `/emby/LiveTv/Timers/Defaults?programId=<id>` with the original
+    padding preserved. Trades ~1-2 min of detection lag in the rare
+    stuck case for no disruption in the common one. Verified with 4
+    synthetic scenarios (healthy/growing, stuck/stalled, outside the
+    check window, already-resolved) plus a live no-op run confirming
+    Threadfin's container never restarts when nothing is due. State file
+    format changed (`guard-watch-state.json`, keyed by timer id, replaces
+    `guard-handled-timers.json`) — old file preserved as `.pre-20260719-guard-redesign`.
+  - **Stop:** this one isn't ours to fix. Jellyfin shares one underlying
+    live stream between a live viewer and a same-channel recording
+    (`AllowStreamSharing: true` — intentional, it's why watching and
+    recording together doesn't need a second tuner slot). Confirmed via
+    a clean natural-end data point (no manual intervention): at the
+    recording's `EndDate`, Jellyfin logs `Live stream consumer count is
+    now 0` then `Closing live stream` — tearing down the *shared* stream
+    object, which forces a still-watching client to silently reconnect.
+    This is Jellyfin's own live-stream lifecycle management; turning off
+    stream sharing would make things worse (a channel already recording
+    would flatly refuse a live viewer, tuner=1). Documented as an
+    accepted, minor, unavoidable side effect rather than "fixed."
 - **Panel anti-abuse (learned 2026-07-06):** hammering the Xtream API
   (the first series backfill ran at ~10 req/s) gets the account/IP
   temp-banned — the panel then answers **HTTP 403 to everything,
@@ -902,6 +941,7 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | 2026-07-16 | **DVR recording reliability diagnosed + fixed.** Owner reported flaky sports recordings + flaky TiviMate; investigation (Claude Code, granted permanent root via `/etc/sudoers.d/nate-claude` for this and future Proxmox-wide work) found two confirmed, distinct root causes. (1) The ephemeral-port bug recurred a 4th time overnight and sat undetected for **17+ hours** (04:25–21:51) — every hourly PPV run logged `update.xmltv failed: Connection reset by peer` with nobody watching; restored live with the documented manual recovery, then replaced the fixed-`sleep(5)` band-aid with `sync/threadfin_ctl.py`'s port-verified retry loop in `activate-xepg.py`/`renumber-xepg.py`, plus a new `media-core-healthcheck.timer` (5 min) that auto-recovers and leaves `.threadfin_alert` if recovery ever fails. (2) The two failed recordings (07-14, 07-15, both ~20 KB stub files) were confirmed via `docker logs threadfin` to be Threadfin's single-tuner slot stuck busy from an earlier stream that ended abnormally (a zombie session, not proven to be TiviMate — it was Jellyfin's own prior connection both times) — refused with `No new connections available. Tuner = 1` at the exact moment the DVR tried to start. Fixed with a new `sync/pre-recording-guard.py` + `media-core-guard.timer` (1 min): force-clears the Threadfin tuner a few minutes before every scheduled recording, and (via `threadfin_ctl.recording_in_progress()`) any Threadfin restart from any source — nightly cascade included — now skips if a recording is already active rather than risking killing it. Not yet covered: TiviMate connects straight to the provider bypassing Threadfin, so it can still hold the account's 1-connection cap outside any of the above — router-level block on `192.168.9.203` filed as a future plan in Loose ends. All new scripts deployed to CT 105, syntax-checked, and live-tested (the `renumber-xepg.py` run during testing exercised a real verified restart successfully on the first attempt). |
 | 2026-07-17 | **DVR fix verified with a real recording.** Owner scheduled a 1-hour recording ("Surviving Earth") via the Jellyfin web UI (the Android app has no Record option on the guide — web UI is the reliable path) to test the 07-16 fix. `media-core-guard.timer` fired every minute through the window without issue; the recording completed cleanly as a full 1.7 GB `.ts` file (vs. the ~20 KB stubs before the fix); no `.threadfin_alert` since. |
 | 2026-07-19 | **Live World Cup recording dropped mid-game — root-caused and fixed.** Owner watching + recording (Bronze Final, France v England) reported it "stopped working" partway through; owner explicitly confirmed no channel change and TiviMate untouched, correcting an initial wrong guess. Investigation found `docker logs threadfin`: FFMPEG EC 1204 at the 95-minute mark, everything local ruled out (container never restarted, no OOM, our own automation correctly no-opped, no client transcode running). Root cause: `ffmpeg.options` had no `-reconnect` flags, so the provider dropping the stream once killed the recording for good instead of it reconnecting. Recovered live: hard-linked the 95-min partial (3.65 GB) to `_recovery/` for safety, cleared Threadfin's zombie tuner state, started a fresh timer on the same still-live program with extra post-padding — new segment picked back up within ~8 minutes and ran cleanly to the owner's "match is done" signal (982 MB). Fix applied immediately after (nothing recording): added the reconnect flags to `settings.json`, verified via a direct pull from the real per-channel URL (`/lineup.json`, not a guessed path). See Operations for the full writeup and the recovery procedure for next time. Recording is now two files (a pre-drop and a post-recovery segment), not one continuous one — known limitation of this recovery path. |
+| 2026-07-19 (later) | **Fixed the Android app pausing at every recording start/stop.** Owner reported a consistent multi-second stream pause/drop right around recording boundaries, correctly pushing back on an initial wrong guess (not a channel change, not TiviMate). Two distinct causes, one fixed: `media-core-guard.service`'s original preemptive design (07-16) restarted Threadfin ~4 min before *every* recording unconditionally, dropping any live viewer's stream along with everything else — confirmed by exact log-timestamp correlation with two prior playback complaints. Rewrote `pre-recording-guard.py` from preemptive to detect-then-fix: watch a new recording for real growth after it starts, only intervene (mirroring the prior incident's manual recovery) if it's actually stuck — zero disruption in the common healthy case. Verified with 4 synthetic scenarios plus a live no-op confirming Threadfin doesn't restart when nothing's due. The stop-side pause is a separate, unrelated cause — Jellyfin's own live-stream-sharing teardown when a recording's consumer count drops to 0 — confirmed via a clean natural-end log (`consumer count is now 0` → `Closing live stream`) and documented as an accepted side effect rather than fixed (disabling stream sharing would make live-viewing-while-recording refuse outright instead). See Operations for the full writeup. |
 | 2026-07-18 (reboot) | **QSV encode verified end-to-end.** Host rebooted on owner go-ahead (session self-terminated — Claude Code runs on pve-01; post-reboot checklist pre-staged in agent memory + README). After boot: HuC RUNNING, all services healthy on first try (incl. Threadfin on :34400 — no ephemeral-port relapse), low-power encoders enabled, `h264_qsv` proven on a real World Cup recording downscale at 8.39x realtime (3.1× faster than libx264, at far lower CPU). Interrupted library scan retriggered. First `.strm`-based verification attempt was a false test (direct-stream remux, no encode) — documented in Loose ends. |
 | 2026-07-18 (hardening) | **DVR padding, scan fanout, config backups, QSV.** Owner-approved improvement batch: (1) global DVR padding 2 min pre / 60 min post (sports overtime). (2) `LibraryScanFanoutConcurrency` 2→4; server/user bitrate limits verified already unlimited (remaining caps are client-app side). (3) Nightly host-side config backup (`media-core-config-backup.timer`, 03:30 → `/mnt/pve/SSD/media-core-backups/`, keep 7) closing the mp0-not-in-vzdump gap — first design **livelocked**: `sqlite3 .backup` restarts whenever another process writes the db, and the running library scan writes constantly (99% CPU for 89 min, snapshot never converged); rewritten as `VACUUM INTO` on a read-only WAL connection, which snapshots consistently under load. (4) QSV: `renderD128` passed into CT 105 (`dev0`, gid 992) + jellyfin compose `devices`/`group_add`, CT restarted in a safe window, iHD driver verified via vainfo, Jellyfin accel=qsv (hw decode h264/hevc10/vp9/mpeg2). Encode still libx264 until the staged `i915 enable_guc=2` host reboot (Jasper Lake = low-power-only encode, needs HuC; enabling Jellyfin's LP options before HuC would hard-fail sessions). Items 5 (per-user accounts) and 6 (recordings retention) deferred by owner. |
 | 2026-07-18 (wave 2) | **12 more branded libraries + icons everywhere.** Owner asked about HBO and other premium studios: no English HBO VOD/series category exists on this panel (live-only), but Paramount+/Peacock/Showtime/Sky/Discovery+/Crunchyroll/Nickelodeon (series), Discovery+ (movies) and the film studios Paramount Pictures/Universal/Marvel/DreamWorks/James Bond do — all split into their own libraries (14 new; 25 total). Custom flat brand-inspired tile icons generated + uploaded for all 22 service/studio libraries (clapperboard = Movies, episode-card stack = Series, per-brand palette + flourish: Peacock feather fan, Paramount mountain, 007 gun-barrel rings, DreamWorks crescent, Universal ringed planet, Discovery+ globe, …). Found: panel gives each VOD stream one primary category, so the James Bond collection library got 1 title (rest live in general EN categories). See Operations → per-service libraries. |
