@@ -193,6 +193,8 @@ threadfin/conf/          # threadfin settings + generated playlist.m3u
 epg/epg.xml              # filtered guide (mounted read-only into jellyfin at /epg)
 jellyfin/{config,cache}  # jellyfin state — note: excluded from vzdump with the rest of mp0
 media/{movies,shows,recordings}
+media/movies-{netflix,amazon,appletv,disney}   # per-service branded VOD libraries (2026-07-18)
+media/shows-{netflix,amazon,appletv,disney}    # per-service branded series libraries (2026-07-18)
 ```
 
 ### Channel map v8 — the guide numbering protocol (2026-07-10)
@@ -635,6 +637,51 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
     written to the file on disk) rather than edited in place — the
     permanent guard is untouched and still protects future nightly runs
     against a real truncated provider response.
+- **Per-service VOD/series libraries (2026-07-18):** the sync now splits
+  service-branded provider categories out of the general Movies/Series
+  pool into their own Jellyfin libraries: **Netflix / Amazon / Apple TV+
+  / Disney+ × Movies / Series** (8 new libraries; dirs
+  `media/movies-<svc>` and `media/shows-<svc>`, mounted read-only into
+  the Jellyfin container — the compose file lists each mount explicitly,
+  so **a new service needs a new mount line + container recreate**).
+  Mechanics, all in `xtream-sync.py`:
+  - `SERVICE_PATTERNS` (category-name prefix regexes: `^NETFLIX`,
+    `^AMAZON`, `^APPLE\+`, `^DISNEY\+`) decide the bucket; anything
+    unmatched stays in the general pool. To add a service: extend
+    `SERVICE_PATTERNS`/`SERVICE_SLUG`, add the compose mount, create the
+    Jellyfin library (clone LibraryOptions from an existing one via
+    `/Library/VirtualFolders` — metadata savers OFF, NFO readers on).
+  - **Dedupe is per-library** (owner's choice): a title on both Netflix
+    and Amazon appears in both libraries; within each library the same
+    HD-before-4K/Dolby + EN-first priority picks the best print. The
+    same title may also still exist in the general pool if a general
+    category carries it — that's intended ("appear everywhere it's
+    actually available").
+  - `SERIES_CACHE` is shared across buckets (keyed by `series_id`), so a
+    show in two libraries is still fetched from the panel only once.
+  - The prune guards run per-library.
+  - First split (2026-07-18): 24,521 movies (general 19,024 / Netflix
+    4,289 / Amazon 629 / Disney+ 462 / Apple TV+ 117) and 7,307 shows
+    (general 4,216 / Netflix 1,960 / Disney+ 385 / Apple TV+ 384 /
+    Amazon 362). The one-time redistribution pruned 3,171 titles out of
+    the general movies pool (they moved to their service library), which
+    required a one-run in-memory `PRUNE_GUARD` override — same
+    technique, and same reasoning, as the guide trim above.
+  - ⚠️ After the first scan of the new libraries, check the
+    empty-`PresentationUniqueKey` gotcha (above) against the new
+    `/media/movies-%` and `/media/shows-%` paths — same bulk-.strm-import
+    mechanics as when the main libraries were built.
+- **TiviMate recording guard (2026-07-18):**
+  `threadfin_ctl.recording_in_progress()` now also returns True when a
+  `.ts` file under TiviMate's write folders (`media/recordings/Tivimate/`,
+  `media/recordings/Sports/`) was modified in the last 60 s — TiviMate
+  records straight to the SMB share, so an actively-growing file is the
+  only signal it exists (it bypasses Threadfin/Jellyfin entirely, no API
+  to ask). Result: no Threadfin restart from any script interrupts an
+  in-progress TiviMate recording. Still not covered: guaranteeing the
+  provider connection is *free* when a TiviMate recording starts (its
+  schedule is unknowable from the server) — that's the router-block plan
+  in Loose ends.
 - **Panel anti-abuse (learned 2026-07-06):** hammering the Xtream API
   (the first series backfill ran at ~10 req/s) gets the account/IP
   temp-banned — the panel then answers **HTTP 403 to everything,
@@ -752,6 +799,7 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | 2026-07-14 (evening) | **Swiss tunnel OpenVPN → WireGuard (10 → 102 Mbit/s).** SSH key access from pve-01 to the Flint 2 established (tmux was breaking the interactive password prompt; owner ran `ssh-copy-id` from a plain shell). CPU-bottleneck theory ruled out (router idle during transfers) — the ceiling was OpenVPN-over-TCP itself. Surfshark WG profile loaded; firmware bound `wgclient1` to a **Chicago** peer (`peer_7124`) so IPTV briefly egressed via the US — re-bound to Zurich `peer_1501` via uci; **lesson: always verify egress country after router VPN changes**. Verified: CT 105 egress Switzerland, 102.3 Mbit/s at 22% router CPU (steady with a live TiviMate stream), kill switch leak-proof both ways (tunnel down ⇒ curl times out, no US-tunnel or raw-WAN fallback). Chromecast (192.168.9.203) confirmed on the same Swiss rule. Router security review: fundamentals solid; hardening items filed in Loose ends. Pre-change config backups: `/root/router-backups/` on pve-01. Also filed: Immich + OCI free-tier front-door plan saved (not executed) at `docs/plans/immich-oci-front-door.md`; open issue — Jellyfin live TV not playing (TiviMate fine), deferred by owner. |
 | 2026-07-16 | **DVR recording reliability diagnosed + fixed.** Owner reported flaky sports recordings + flaky TiviMate; investigation (Claude Code, granted permanent root via `/etc/sudoers.d/nate-claude` for this and future Proxmox-wide work) found two confirmed, distinct root causes. (1) The ephemeral-port bug recurred a 4th time overnight and sat undetected for **17+ hours** (04:25–21:51) — every hourly PPV run logged `update.xmltv failed: Connection reset by peer` with nobody watching; restored live with the documented manual recovery, then replaced the fixed-`sleep(5)` band-aid with `sync/threadfin_ctl.py`'s port-verified retry loop in `activate-xepg.py`/`renumber-xepg.py`, plus a new `media-core-healthcheck.timer` (5 min) that auto-recovers and leaves `.threadfin_alert` if recovery ever fails. (2) The two failed recordings (07-14, 07-15, both ~20 KB stub files) were confirmed via `docker logs threadfin` to be Threadfin's single-tuner slot stuck busy from an earlier stream that ended abnormally (a zombie session, not proven to be TiviMate — it was Jellyfin's own prior connection both times) — refused with `No new connections available. Tuner = 1` at the exact moment the DVR tried to start. Fixed with a new `sync/pre-recording-guard.py` + `media-core-guard.timer` (1 min): force-clears the Threadfin tuner a few minutes before every scheduled recording, and (via `threadfin_ctl.recording_in_progress()`) any Threadfin restart from any source — nightly cascade included — now skips if a recording is already active rather than risking killing it. Not yet covered: TiviMate connects straight to the provider bypassing Threadfin, so it can still hold the account's 1-connection cap outside any of the above — router-level block on `192.168.9.203` filed as a future plan in Loose ends. All new scripts deployed to CT 105, syntax-checked, and live-tested (the `renumber-xepg.py` run during testing exercised a real verified restart successfully on the first attempt). |
 | 2026-07-17 | **DVR fix verified with a real recording.** Owner scheduled a 1-hour recording ("Surviving Earth") via the Jellyfin web UI (the Android app has no Record option on the guide — web UI is the reliable path) to test the 07-16 fix. `media-core-guard.timer` fired every minute through the window without issue; the recording completed cleanly as a full 1.7 GB `.ts` file (vs. the ~20 KB stubs before the fix); no `.threadfin_alert` since. |
+| 2026-07-18 (later) | **Per-service VOD libraries + TiviMate guard.** (1) VOD/series split by streaming service per owner spec (top-level service granularity; cross-service titles appear in every library that carries them, best print per library): `xtream-sync.py` gained `SERVICE_PATTERNS`-based bucketing with per-library dedupe/prune, 8 new read-only mounts added to `docker-compose.yml` (jellyfin container recreated in a verified no-recording window), 8 new Jellyfin libraries created via API with LibraryOptions cloned from the existing Movies/Series (savers off, NFO readers, TMDB/Fanart). First run: 24.5k movies / 7.3k shows across 10 libraries, logic pre-verified against synthetic fixtures before deploy. (2) `threadfin_ctl.recording_in_progress()` extended to detect in-progress TiviMate recordings by watching for actively-growing `.ts` files in its SMB write folders — no Threadfin restart can interrupt one anymore. See Operations for both. |
 | 2026-07-18 | **Live TV tile image + guide-size trim.** (1) Built and set a custom image for the Live TV home-screen tile via the Jellyfin API directly (`/Items/{id}/Images/Primary`) — it's a `UserView`, not a normal library folder, so it doesn't appear in the Dashboard's library-image manager. (2) Guide-speed investigation + fix: see Operations → "Guide size trim" for the full writeup — lineup cut from 1,856 to 996 channels (Cinema TV removed, Prime 24/7 and DirecTV Stream trimmed to sports + genuinely-unique content only), `epg.xml` 20.7 MB → 13.1 MB. Also researched (no server-side fix available): Chromecast focus-highlight visibility (no Jellyfin Android TV setting exists; alternative clients Streamyfin/Wholphin suggested) and scoped a VOD-category-by-streaming-service feature (Netflix/Amazon/Apple TV+/Disney+ etc. as separate libraries — the provider categories already support this granularity; design questions on granularity/dedupe scope pending owner decision, not yet built). |
 
 Historical deep-dives preserved in [`docs/archive/`](docs/archive/):
