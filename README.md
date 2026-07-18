@@ -727,6 +727,12 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
       Operations → DVR recording reliability), but TiviMate itself
       connects straight to the provider and isn't covered — the manual
       habit still matters until the router-block plan below is built.
+- [ ] **New-content notification:** provider catalog changes are ingested
+      automatically (exclude-based selection + nightly sync + scan
+      triggers) and surface in each library's "Latest" row, but nothing
+      *notifies* the owner. Follow-up: have the nightly sync diff counts
+      night-over-night and emit a "▲ N new movies (X Netflix, …), M new
+      shows" summary — destination TBD (email / visible file / push).
 - [ ] **Router-level TiviMate block during recordings** (see Operations →
       DVR recording reliability for the diagnosis): extend
       `pre-recording-guard.py` to also block `192.168.9.203` /
