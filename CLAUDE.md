@@ -30,9 +30,10 @@ The media stack lives in `/srv/media-core/` inside CT 105; drive it with
   Jellyfin guide-refresh time.
 - **MAC `BC:24:11:59:1F:60` belongs to CT 105 only** — it carries the
   `.50` lease and the Swiss-VPN binding on the router.
-- **No `/dev/dri` into Jellyfin** (iGPU drives the host's KDE desktop);
-  escalation path is a render-node bind mount into the LXC, documented in
-  the README.
+- **`/dev/dri/renderD128` is shared into CT 105 for Jellyfin QSV since
+  2026-07-18** (`dev0` in the LXC config, gid 992; compose `devices` +
+  `group_add`). The iGPU still drives the host KDE desktop — the render
+  node is shared, don't move to full GPU passthrough.
 - **`mp0` keeps `backup=0`**; note this also excludes app config from
   vzdump (see Operations in README).
 - **Pinned image tags only** — never `:latest`.
