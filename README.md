@@ -38,10 +38,15 @@ Remaining user-side niceties are listed in [Loose ends](#loose-ends).
 - **Unusual:** a full KDE Plasma 6.3 desktop (`task-kde-desktop`, SDDM,
   user `nate`) runs directly on the hypervisor, so the box doubles as a
   workstation. Consequences:
-  - The N5105 iGPU belongs to the desktop → **no `/dev/dri` for Jellyfin**
-    (H.264 IPTV direct-plays; DVR recording is a remux, no transcode). If HW
-    transcoding is ever needed, bind-mount `/dev/dri/renderD128` into CT 105
-    (LXC shares the render node; the desktop keeps working).
+  - The N5105 iGPU drives the desktop **and, since 2026-07-18, Jellyfin
+    QSV transcoding**: `renderD128` is passed into CT 105 (`dev0:
+    /dev/dri/renderD128,gid=992` in the LXC config) and into the
+    jellyfin container (compose `devices` + `group_add: 992`) — the
+    render node is shared, the desktop keeps working. Enabled because
+    real `libx264` CPU transcodes were found in the logs (720p downscales
+    of DVR recordings) crushing the weak 4-core Celeron. Jellyfin accel:
+    QSV, hw decode h264/hevc(10-bit)/vp9/mpeg2 (Jasper Lake has no AV1),
+    hw encode on, HEVC encode + tonemapping off.
   - NetworkManager exists but only holds old Wi-Fi profiles; **wired
     networking is Proxmox ifupdown2** (`/etc/network/interfaces` + `ifreload -a`).
   - Host users: `root` (PVE), `nate` (KDE login).
@@ -530,9 +535,20 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
   `docker compose up -d`. Check release notes; never `:latest`.
 - **Backups:** vzdump CT 105 covers only the 32 G rootfs (OS + Docker
   engine). The 1 TB `mp0` is `backup=0` **by design** (recordings), which
-  also means **Jellyfin/Threadfin config is not in vzdump** — after a
-  restore, re-run the sync and restore `/srv/media-core` configs from this
-  repo's documentation (or tar the small config dirs manually first).
+  also means **Jellyfin/Threadfin config is not in vzdump**. That gap is
+  now closed by `media-core-config-backup.timer` **on the host** (03:30
+  nightly, before the 04:00 sync): `/root/bin/media-core-config-backup.sh`
+  streams a tar out of the CT to `/mnt/pve/SSD/media-core-backups/`
+  (separate physical disk from the CT's NVMe thin pool; newest 7 kept,
+  ~1.5 GB each). Captured: `jellyfin/config` **minus the ~105 GB
+  regenerable `metadata/` artwork cache**, a consistent
+  `sqlite3 .backup` snapshot of `jellyfin.db` (safe while Jellyfin
+  runs), `threadfin/conf` (minus its own backup zips), `sync/` (minus
+  the regenerable series cache), `docker-compose.yml`, and `.env`
+  (secrets — archives are mode 0600). Restore: untar over
+  `/srv/media-core`, rename `jellyfin.db.snapshot` back to
+  `data/jellyfin.db`, `docker compose up -d`, let the next scan rebuild
+  artwork.
 - **Watch the thin pool** (`lvs -a` on the host) as recordings accumulate;
   1 TB is promised from the ~1.7 TB pool.
 - **Troubleshooting order:** no WAN in CT → router VPN dashboard
@@ -602,6 +618,21 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
     reliably TiviMate and not shared with casting use, (b) add/remove
     the block from `pre-recording-guard.py` alongside the Threadfin
     restart, (c) decide how long before/after the recording to hold it.
+- **DVR defaults (2026-07-18):** global recording padding is **2 min
+  pre / 60 min post** (`livetv` config `PrePaddingSeconds=120` /
+  `PostPaddingSeconds=3600`) — sports run long; stub-free endings beat
+  disk space. Set per owner spec; individual timers can still override.
+- **QSV hardware transcoding (2026-07-18):** see Hardware & host for the
+  passthrough chain. **Two-stage enablement:** hw *decode* works
+  immediately; hw *encode* on Jasper Lake is low-power (VDEnc) only,
+  which needs HuC firmware — `options i915 enable_guc=2` is staged in
+  `/etc/modprobe.d/i915-guc.conf` (initramfs rebuilt) and takes effect
+  at the **next host reboot**, after which enable Jellyfin's
+  `EnableIntelLowPowerH264HwEncoder` (+Hevc) encoding options and verify
+  a transcode log shows `h264_qsv`. ⚠️ Do **not** enable the low-power
+  encoder options while `huc_info` still says disabled — sessions would
+  fail outright instead of falling back to libx264. Check:
+  `cat /sys/kernel/debug/dri/0000:00:02.0/gt0/uc/huc_info`.
 - **Guide size trim (2026-07-18):** owner reported slow guide loading on
   the Android TV app. Root numbers: 1,856 channels, a 20.7 MB `epg.xml`
   (29,299 programmes), and the server's own nightly "Refresh Guide" task
@@ -771,10 +802,19 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
       Old Swiss OpenVPN profile kept disabled as rollback; US tunnel
       untouched. Pre-change config backups:
       `/root/router-backups/*.bak.20260714` on pve-01.
-- [ ] **Post-WireGuard follow-ups:** raise `LibraryScanFanoutConcurrency`
-      2 → 4 in Jellyfin and remove OpenVPN-era client bitrate caps
-      (~8 Mbit) — remux buffering should be gone. Optionally test whether
-      the router's WiFi-client uplink is the new throughput ceiling.
+- [x] **Post-WireGuard follow-ups — done 2026-07-18:**
+      `LibraryScanFanoutConcurrency` raised 2 → 4; server-side and
+      user-policy bitrate limits verified already unlimited — any
+      remaining ~8 Mbit caps are **client-app settings on the devices**
+      (each app: Settings → Playback quality), owner to check.
+- [ ] **Host reboot pending for QSV low-power encode:** `i915
+      enable_guc=2` staged (see Operations → QSV); after the next host
+      reboot, enable Jellyfin's low-power encoder options and verify
+      `h264_qsv` appears in a transcode log. Until then hw decode is
+      active, encode falls back to libx264.
+- [ ] Deferred by owner (2026-07-18): per-person Jellyfin users (also
+      fixes the stale-token client spam) and a recordings retention
+      policy (`/media/recordings` grows unbounded; watch `lvs`).
 - [ ] **Jellyfin live-TV playback issue (2026-07-14):** owner reports
       live streams play in TiviMate but were not working in Jellyfin;
       deliberately not troubleshot yet (game was on). Recordings/local
@@ -828,6 +868,7 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | 2026-07-14 (evening) | **Swiss tunnel OpenVPN → WireGuard (10 → 102 Mbit/s).** SSH key access from pve-01 to the Flint 2 established (tmux was breaking the interactive password prompt; owner ran `ssh-copy-id` from a plain shell). CPU-bottleneck theory ruled out (router idle during transfers) — the ceiling was OpenVPN-over-TCP itself. Surfshark WG profile loaded; firmware bound `wgclient1` to a **Chicago** peer (`peer_7124`) so IPTV briefly egressed via the US — re-bound to Zurich `peer_1501` via uci; **lesson: always verify egress country after router VPN changes**. Verified: CT 105 egress Switzerland, 102.3 Mbit/s at 22% router CPU (steady with a live TiviMate stream), kill switch leak-proof both ways (tunnel down ⇒ curl times out, no US-tunnel or raw-WAN fallback). Chromecast (192.168.9.203) confirmed on the same Swiss rule. Router security review: fundamentals solid; hardening items filed in Loose ends. Pre-change config backups: `/root/router-backups/` on pve-01. Also filed: Immich + OCI free-tier front-door plan saved (not executed) at `docs/plans/immich-oci-front-door.md`; open issue — Jellyfin live TV not playing (TiviMate fine), deferred by owner. |
 | 2026-07-16 | **DVR recording reliability diagnosed + fixed.** Owner reported flaky sports recordings + flaky TiviMate; investigation (Claude Code, granted permanent root via `/etc/sudoers.d/nate-claude` for this and future Proxmox-wide work) found two confirmed, distinct root causes. (1) The ephemeral-port bug recurred a 4th time overnight and sat undetected for **17+ hours** (04:25–21:51) — every hourly PPV run logged `update.xmltv failed: Connection reset by peer` with nobody watching; restored live with the documented manual recovery, then replaced the fixed-`sleep(5)` band-aid with `sync/threadfin_ctl.py`'s port-verified retry loop in `activate-xepg.py`/`renumber-xepg.py`, plus a new `media-core-healthcheck.timer` (5 min) that auto-recovers and leaves `.threadfin_alert` if recovery ever fails. (2) The two failed recordings (07-14, 07-15, both ~20 KB stub files) were confirmed via `docker logs threadfin` to be Threadfin's single-tuner slot stuck busy from an earlier stream that ended abnormally (a zombie session, not proven to be TiviMate — it was Jellyfin's own prior connection both times) — refused with `No new connections available. Tuner = 1` at the exact moment the DVR tried to start. Fixed with a new `sync/pre-recording-guard.py` + `media-core-guard.timer` (1 min): force-clears the Threadfin tuner a few minutes before every scheduled recording, and (via `threadfin_ctl.recording_in_progress()`) any Threadfin restart from any source — nightly cascade included — now skips if a recording is already active rather than risking killing it. Not yet covered: TiviMate connects straight to the provider bypassing Threadfin, so it can still hold the account's 1-connection cap outside any of the above — router-level block on `192.168.9.203` filed as a future plan in Loose ends. All new scripts deployed to CT 105, syntax-checked, and live-tested (the `renumber-xepg.py` run during testing exercised a real verified restart successfully on the first attempt). |
 | 2026-07-17 | **DVR fix verified with a real recording.** Owner scheduled a 1-hour recording ("Surviving Earth") via the Jellyfin web UI (the Android app has no Record option on the guide — web UI is the reliable path) to test the 07-16 fix. `media-core-guard.timer` fired every minute through the window without issue; the recording completed cleanly as a full 1.7 GB `.ts` file (vs. the ~20 KB stubs before the fix); no `.threadfin_alert` since. |
+| 2026-07-18 (hardening) | **DVR padding, scan fanout, config backups, QSV.** Owner-approved improvement batch: (1) global DVR padding 2 min pre / 60 min post (sports overtime). (2) `LibraryScanFanoutConcurrency` 2→4; server/user bitrate limits verified already unlimited (remaining caps are client-app side). (3) Nightly host-side config backup (`media-core-config-backup.timer`, 03:30 → `/mnt/pve/SSD/media-core-backups/`, keep 7) closing the mp0-not-in-vzdump gap — first design **livelocked**: `sqlite3 .backup` restarts whenever another process writes the db, and the running library scan writes constantly (99% CPU for 89 min, snapshot never converged); rewritten as `VACUUM INTO` on a read-only WAL connection, which snapshots consistently under load. (4) QSV: `renderD128` passed into CT 105 (`dev0`, gid 992) + jellyfin compose `devices`/`group_add`, CT restarted in a safe window, iHD driver verified via vainfo, Jellyfin accel=qsv (hw decode h264/hevc10/vp9/mpeg2). Encode still libx264 until the staged `i915 enable_guc=2` host reboot (Jasper Lake = low-power-only encode, needs HuC; enabling Jellyfin's LP options before HuC would hard-fail sessions). Items 5 (per-user accounts) and 6 (recordings retention) deferred by owner. |
 | 2026-07-18 (wave 2) | **12 more branded libraries + icons everywhere.** Owner asked about HBO and other premium studios: no English HBO VOD/series category exists on this panel (live-only), but Paramount+/Peacock/Showtime/Sky/Discovery+/Crunchyroll/Nickelodeon (series), Discovery+ (movies) and the film studios Paramount Pictures/Universal/Marvel/DreamWorks/James Bond do — all split into their own libraries (14 new; 25 total). Custom flat brand-inspired tile icons generated + uploaded for all 22 service/studio libraries (clapperboard = Movies, episode-card stack = Series, per-brand palette + flourish: Peacock feather fan, Paramount mountain, 007 gun-barrel rings, DreamWorks crescent, Universal ringed planet, Discovery+ globe, …). Found: panel gives each VOD stream one primary category, so the James Bond collection library got 1 title (rest live in general EN categories). See Operations → per-service libraries. |
 | 2026-07-18 (later) | **Per-service VOD libraries + TiviMate guard.** (1) VOD/series split by streaming service per owner spec (top-level service granularity; cross-service titles appear in every library that carries them, best print per library): `xtream-sync.py` gained `SERVICE_PATTERNS`-based bucketing with per-library dedupe/prune, 8 new read-only mounts added to `docker-compose.yml` (jellyfin container recreated in a verified no-recording window), 8 new Jellyfin libraries created via API with LibraryOptions cloned from the existing Movies/Series (savers off, NFO readers, TMDB/Fanart). First run: 24.5k movies / 7.3k shows across 10 libraries, logic pre-verified against synthetic fixtures before deploy. (2) `threadfin_ctl.recording_in_progress()` extended to detect in-progress TiviMate recordings by watching for actively-growing `.ts` files in its SMB write folders — no Threadfin restart can interrupt one anymore. See Operations for both. |
 | 2026-07-18 | **Live TV tile image + guide-size trim.** (1) Built and set a custom image for the Live TV home-screen tile via the Jellyfin API directly (`/Items/{id}/Images/Primary`) — it's a `UserView`, not a normal library folder, so it doesn't appear in the Dashboard's library-image manager. (2) Guide-speed investigation + fix: see Operations → "Guide size trim" for the full writeup — lineup cut from 1,856 to 996 channels (Cinema TV removed, Prime 24/7 and DirecTV Stream trimmed to sports + genuinely-unique content only), `epg.xml` 20.7 MB → 13.1 MB. Also researched (no server-side fix available): Chromecast focus-highlight visibility (no Jellyfin Android TV setting exists; alternative clients Streamyfin/Wholphin suggested) and scoped a VOD-category-by-streaming-service feature (Netflix/Amazon/Apple TV+/Disney+ etc. as separate libraries — the provider categories already support this granularity; design questions on granularity/dedupe scope pending owner decision, not yet built). |
