@@ -45,5 +45,13 @@ The media stack lives in `/srv/media-core/` inside CT 105; drive it with
   `main`, so an unmerged branch is invisible to the next session. The apt enterprise repo throws 401 —
   disable it before host `apt` work
   (`mv /etc/apt/sources.list.d/pve-enterprise.sources{,.disabled}`).
+- **`origin` push goes to two GitHub repos** (set up 2026-07-18):
+  `InDaSky314/pve-01-docs` (primary, HTTPS via `gh`; PRs live here) and a
+  mirror `nk-sys-ops/pve-01-docs` (SSH `github-mirror` alias in
+  `/root/.ssh/config`, deploy key `/root/.ssh/id_ed25519_pve01docs_mirror`,
+  write-enabled). `git push origin <ref>` hits both. **`gh pr merge`
+  updates only the primary server-side**, so after a merge run
+  `git -C /root/pve-01-docs checkout main && git pull && git push origin main`
+  to propagate the merge to the mirror (PRs themselves don't mirror).
 - Wired networking is Proxmox ifupdown2, not NetworkManager. Never re-IP
   the host over SSH — use the local KDE console.
