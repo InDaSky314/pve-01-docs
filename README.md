@@ -120,6 +120,11 @@ Flint 2 (GL-MT6000, fw 4.9.0) ─ 192.168.9.1 ─ DHCP .100–.249, DNS, Wi-Fi "
 - **Router SSH:** pve-01's root key is installed on the Flint 2 —
   `ssh root@192.168.9.1` works non-interactively (set up 2026-07-14 for
   the WireGuard migration; used for all `uci` work).
+- **Router syslog forwarding (2026-07-19):** `log_ip`/`log_port`/
+  `log_proto` in `uci show system` point at CT 107 (`192.168.9.164:514`
+  udp) — the router's own local log buffer is tiny (~64 KB), this gives
+  it durable history. See §7 Observability for the full setup and how
+  to revert.
 - The Flint 2 also runs an IoT subnet (`192.168.10.1/24`) and a guest
   network; the server belongs on the main LAN only.
 - The old AXT1800 router (`192.168.8.1` LAN, migrated away 2026-07-05) is
@@ -130,6 +135,7 @@ Flint 2 (GL-MT6000, fw 4.9.0) ─ 192.168.9.1 ─ DHCP .100–.249, DNS, Wi-Fi "
 | ID | Name | Type | Resources | Notes |
 |---|---|---|---|---|
 | **105** | **media-core** | LXC, Debian 13, unprivileged | 2 vCPU / 8 GB / 512 M swap | The whole point of the box. `onboot=1`, `nesting=1,keyctl=1` (Docker inside). Rootfs 32 G + `mp0` 1 TB at `/srv/media-core` with **`backup=0`**, both on `local-lvm`. No SSH (use `pct exec`). |
+| **107** | **log-server** | LXC, Debian 13, unprivileged | 2 vCPU / 4 GB / 512 M swap | Loki + Grafana + Alloy (2026-07-19) — see §9. `onboot=1`, `nesting=1,keyctl=1`. Rootfs 32 G on `local-lvm`, DHCP networking (no special MAC binding needed, unlike 105). No SSH (use `pct exec`). |
 | 102 | WIN11 | VM, Win 11 (UEFI+vTPM) | 4 vCPU / 8 GB | Desktop VM, qcow2 on `SSD`. Has a reclaimable `unused0` disk. |
 | 104 | SRV-STD-2022 | VM, Server 2022 Eval | 2 vCPU / 8 GB | Lab VM, qcow2 on `SSD`. Install ISOs still attached. |
 
@@ -814,7 +820,133 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
   map `/dev/dri` into Jellyfin, or start recordings you expect to keep
   while messing with the Swiss tunnel.
 
-## 7. Loose ends
+## 7. Observability (CT 107, "log-server") — built 2026-07-19
+
+Built after the channel-117 diagnosis exposed a real blind spot: the
+router's own log buffer is tiny (~64 KB, minutes of history) and
+`wg show` only reports current tunnel state — "was the VPN actually
+stalled" was structurally unanswerable after the fact. This closes
+that gap and gives every log source on the network a durable home.
+
+**Stack:** Grafana Loki + Grafana + Grafana Alloy, docker-compose at
+`/srv/log-server/docker-compose.yml` inside CT 107. Chosen over
+ELK/Graylog specifically for homelab resource constraints — Loki
+indexes only labels, not full text, so it's a fraction of
+Elasticsearch's footprint. Chosen Alloy over Promtail because Promtail
+is EOL as of 2026-03-02; Alloy is the maintained successor and also
+does metrics/traces, so it's not a log-only dead end if this grows
+into fuller observability later.
+
+- **Access:** Grafana at `http://192.168.9.164:3000` (admin / password
+  in `/root/.grafana_admin_password` on pve-01, 600, root-only — not
+  pasted in chat or committed anywhere, same handling as every other
+  credential on this box). Loki API at `http://192.168.9.164:3100`.
+- **Image tags (pinned, never `:latest`):** `grafana/loki:3.7.3`,
+  `grafana/grafana:11.6.16`, `grafana/alloy:v1.17.1`.
+- **Sources feeding it, all verified live:**
+  - **Router syslog** — `uci set system.@system[0].log_ip=192.168.9.164`
+    (+ `log_port=514`, `log_proto=udp`) on the Flint 2 forwards its
+    live log stream. BusyBox syslogd isn't strictly RFC-compliant, so
+    Alloy doesn't receive it directly — `/root/router-log-receiver.py`
+    (plain UDP listener, systemd service `router-log-receiver.service`,
+    **runs inside CT 107**, only accepts datagrams from `192.168.9.1`)
+    normalizes it to `/root/network-logs/flint2-syslog.log`, which
+    Alloy tails (`job="router-syslog"`). Revert: `uci delete
+    system.@system[0].log_ip` on the router (+ `log_port`/`log_proto`,
+    `uci commit system`, `/etc/init.d/log restart`).
+  - **WireGuard tunnel health** — `/root/bin/wg-snapshot.sh` +
+    `wg-snapshot.timer` (every 2 min) **run on the host** (pve-01,
+    needs the host's existing non-interactive root SSH key to the
+    router — that key isn't in CT 107) — polls `wg show wgclient1
+    dump` and pushes straight to Loki's HTTP push API
+    (`job="wg-snapshot"`). No file, no Alloy involved for this source.
+  - **Chromecast/Google TV logcat** — `/root/bin/chromecast-logcat.sh`
+    + `chromecast-logcat.service` (**runs on the host**, `adb` paired
+    2026-07-19). Streams `logcat` filtered to network/media-relevant
+    tags plus all errors, pushes to Loki (`job="chromecast-logcat"`).
+    ⚠️ **The Wireless Debugging connect port is not stable** — it can
+    change after the device reboots or is re-paired (unlike the
+    one-time pairing port, Android doesn't guarantee this one stays
+    put either, in practice). If this service starts failing to
+    connect, check Settings → System → Developer options → Wireless
+    debugging on the TV for the current `IP address & Port` and update
+    `CHROMECAST_ADDR=` in `/etc/systemd/system/chromecast-logcat.service`,
+    then `systemctl daemon-reload && systemctl restart
+    chromecast-logcat.service`.
+  - **CT 107's own container logs** (self-observability of this stack)
+    — Alloy's `loki.source.docker` component, via the bind-mounted
+    Docker socket, labeled by `container` (not `job`).
+  - **Not yet wired up:** CT 105's jellyfin/threadfin container logs.
+    Deliberately deferred — the plan is Docker's native Loki logging
+    driver (`docker plugin install grafana/loki-docker-driver`, then
+    `logging: driver: loki` in CT 105's compose pointing at
+    `http://192.168.9.164:3100/loki/api/v1/push`), which needs a
+    container recreate on the *production* stack, so it goes through
+    the same recording-safety check as everything else that touches
+    CT 105 (`threadfin_ctl.recording_in_progress()`) rather than being
+    done opportunistically.
+- **Retention:** ~30 days via Loki's compactor, filesystem storage
+  under `/srv/log-server/loki-data` (bind-mounted, survives container
+  recreates).
+- **Built primarily by agy** (see §8) in `build` mode — it hit and
+  self-corrected two real issues (an unsupported Loki config property
+  causing a crash-loop; an Alloy label rule causing scraped lines not
+  to land) before reporting success, then Claude Code independently
+  re-verified every claim (fresh curl to `/ready` and `/api/health`,
+  fresh Loki queries per source, confirmed CT 105 untouched) rather
+  than trusting the report as-is.
+
+## 8. Claude Code ↔ agy — division of labor
+
+Two AI agents work this box: **Claude Code** (this file's primary
+audience) and **agy** (`/root/.local/bin/agy`, a separate CLI on its
+own Gemini/Cloud-Code-Assist quota — genuinely separate billing from
+Claude's, which is *why* offloading to it saves cost, not just a
+manner of speaking). Built 2026-07-19 after a multi-log-source
+diagnosis (the channel-117 incident) took a large chunk of a Claude
+Code session to investigate manually.
+
+**Split:**
+- **agy**: read-heavy investigation (correlating logs across
+  Threadfin/Jellyfin/systemd/router), and — as of 2026-07-19,
+  owner-approved — well-scoped **build** work, especially anything
+  isolated to a new/standalone container where a mistake is cheap to
+  undo. The whole log-server stack in §7 was built this way.
+- **Claude Code**: synthesis, verification (spot-check agy's claims
+  against raw evidence directly — re-run a handful of the exact
+  commands it says it ran, don't just re-read its report), and
+  anything touching the *live* media-core stack's running state,
+  secrets, or git/PR history. Never delegated: CT 105 container
+  recreates, config.json/docker-compose.yml changes to the production
+  stack, anything that could interrupt a recording.
+- **Trust boundary is the owner's call, revisit as needed** — currently
+  "simple tasks, or whatever Claude Code is comfortable with the plan
+  for." Isolated/new-container work: agy may apply directly. Anything
+  touching CT 105's running state: proposed, not applied, without
+  explicit sign-off.
+
+**Mechanism:** `/root/bin/agy-task.sh <slug> <diagnose|plan|build|raw>
+"<prompt>"` (or `@/path/to/file` for the prompt — multi-line prompts
+nested through `sudo -> bash -c -> heredoc` break in ways not worth
+debugging twice; use a file). Injects mode-appropriate guardrails
+automatically (`diagnose` = read-only, `plan` = investigate + propose
+only, `build` = may write/deploy but told explicitly never to touch
+CT 105 unless the prompt says otherwise). Writes to
+`/root/agy-reports/<UTC-timestamp>-<slug>.md` — read *that*, not
+agy's own verbose internal CLI logs
+(`~/.gemini/antigravity-cli/log/`), which cost real tokens to page
+through and mostly aren't useful once a task completes cleanly.
+Defaults to model "Gemini 3.1 Pro (High)" (proven quality on both the
+channel-117 diagnosis and the log-server build); override per-call
+with `AGY_MODEL=` for cheaper/faster trivial lookups.
+
+**Dispatch pattern:** launch via `run_in_background`, then `Monitor`
+watching the agy PID for exit (`while kill -0 <pid>; do sleep 5; done`)
+— **not** repeated manual polling with scheduled wakeups, which burns
+turns for no signal (learned the expensive way on the first diagnostic
+run of the night before switching approaches).
+
+## 9. Loose ends
 
 - [x] Create the first Threadfin web-UI user (done by owner, 2026-07-05).
 - [x] Change the Jellyfin `root` password (done by owner, 2026-07-05).
@@ -915,7 +1047,7 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
       discussed as good fits for the box's spare RAM (CPU is the scarce
       resource — nothing that transcodes or runs ML constantly).
 
-## 8. History
+## 10. History
 
 | Date | Event |
 |---|---|
@@ -942,6 +1074,7 @@ Threadfin web passwords are user-managed (Threadfin UI auth enabled
 | 2026-07-17 | **DVR fix verified with a real recording.** Owner scheduled a 1-hour recording ("Surviving Earth") via the Jellyfin web UI (the Android app has no Record option on the guide — web UI is the reliable path) to test the 07-16 fix. `media-core-guard.timer` fired every minute through the window without issue; the recording completed cleanly as a full 1.7 GB `.ts` file (vs. the ~20 KB stubs before the fix); no `.threadfin_alert` since. |
 | 2026-07-19 | **Live World Cup recording dropped mid-game — root-caused and fixed.** Owner watching + recording (Bronze Final, France v England) reported it "stopped working" partway through; owner explicitly confirmed no channel change and TiviMate untouched, correcting an initial wrong guess. Investigation found `docker logs threadfin`: FFMPEG EC 1204 at the 95-minute mark, everything local ruled out (container never restarted, no OOM, our own automation correctly no-opped, no client transcode running). Root cause: `ffmpeg.options` had no `-reconnect` flags, so the provider dropping the stream once killed the recording for good instead of it reconnecting. Recovered live: hard-linked the 95-min partial (3.65 GB) to `_recovery/` for safety, cleared Threadfin's zombie tuner state, started a fresh timer on the same still-live program with extra post-padding — new segment picked back up within ~8 minutes and ran cleanly to the owner's "match is done" signal (982 MB). Fix applied immediately after (nothing recording): added the reconnect flags to `settings.json`, verified via a direct pull from the real per-channel URL (`/lineup.json`, not a guessed path). See Operations for the full writeup and the recovery procedure for next time. Recording is now two files (a pre-drop and a post-recovery segment), not one continuous one — known limitation of this recovery path. |
 | 2026-07-19 (later) | **Fixed the Android app pausing at every recording start/stop.** Owner reported a consistent multi-second stream pause/drop right around recording boundaries, correctly pushing back on an initial wrong guess (not a channel change, not TiviMate). Two distinct causes, one fixed: `media-core-guard.service`'s original preemptive design (07-16) restarted Threadfin ~4 min before *every* recording unconditionally, dropping any live viewer's stream along with everything else — confirmed by exact log-timestamp correlation with two prior playback complaints. Rewrote `pre-recording-guard.py` from preemptive to detect-then-fix: watch a new recording for real growth after it starts, only intervene (mirroring the prior incident's manual recovery) if it's actually stuck — zero disruption in the common healthy case. Verified with 4 synthetic scenarios plus a live no-op confirming Threadfin doesn't restart when nothing's due. The stop-side pause is a separate, unrelated cause — Jellyfin's own live-stream-sharing teardown when a recording's consumer count drops to 0 — confirmed via a clean natural-end log (`consumer count is now 0` → `Closing live stream`) and documented as an accepted side effect rather than fixed (disabling stream sharing would make live-viewing-while-recording refuse outright instead). See Operations for the full writeup. |
+| 2026-07-19 (agy + observability) | **Channel-117 diagnosis delegated to agy; log-server (CT 107) built, mostly by agy.** Owner asked to save Claude tokens by delegating troubleshooting to agy where it fits — first real test was diagnosing the morning's channel-117 drop: agy pinpointed the exact failure (`EC: 1204` at 09:45:38, a reconnect attempt reaching "buffering" before dying again, ambiguous between TiviMate contention and a VPN blip — the same two candidates as Saturday's incident), Claude independently re-verified every timestamped claim against raw logs before reporting it (all confirmed). That worked well enough to formalize: `/root/bin/agy-task.sh` wrapper + a documented division of labor (§8). Same day, owner asked whether a proper log server made sense given the "VPN blip, unresolvable" gap that keeps recurring — researched current best practice (Loki over ELK for homelab resource constraints; Alloy over Promtail, which is EOL 2026-03-02), then had agy build the actual stack (§7) in a new isolated container (CT 107) end-to-end: docker-compose, Loki/Grafana/Alloy configs, image-tag pinning. agy hit and fixed two real bugs itself (Loki config crash-loop, an Alloy relabel issue) before reporting done; Claude Code re-verified independently (fresh curl to every health endpoint, fresh Loki queries per source, confirmed CT 105 untouched) rather than trusting the report. Also wired up two sources Claude built directly: WireGuard tunnel snapshots (`wg show` has no history — this closes that gap) and Chromecast/Google TV `logcat` via ADB (owner enabled Wireless Debugging + paired live during the session). Router reconfigured to forward syslog (its own buffer is ~64 KB, minutes of history). All four sources verified flowing with real data before calling it done. |
 | 2026-07-18 (reboot) | **QSV encode verified end-to-end.** Host rebooted on owner go-ahead (session self-terminated — Claude Code runs on pve-01; post-reboot checklist pre-staged in agent memory + README). After boot: HuC RUNNING, all services healthy on first try (incl. Threadfin on :34400 — no ephemeral-port relapse), low-power encoders enabled, `h264_qsv` proven on a real World Cup recording downscale at 8.39x realtime (3.1× faster than libx264, at far lower CPU). Interrupted library scan retriggered. First `.strm`-based verification attempt was a false test (direct-stream remux, no encode) — documented in Loose ends. |
 | 2026-07-18 (hardening) | **DVR padding, scan fanout, config backups, QSV.** Owner-approved improvement batch: (1) global DVR padding 2 min pre / 60 min post (sports overtime). (2) `LibraryScanFanoutConcurrency` 2→4; server/user bitrate limits verified already unlimited (remaining caps are client-app side). (3) Nightly host-side config backup (`media-core-config-backup.timer`, 03:30 → `/mnt/pve/SSD/media-core-backups/`, keep 7) closing the mp0-not-in-vzdump gap — first design **livelocked**: `sqlite3 .backup` restarts whenever another process writes the db, and the running library scan writes constantly (99% CPU for 89 min, snapshot never converged); rewritten as `VACUUM INTO` on a read-only WAL connection, which snapshots consistently under load. (4) QSV: `renderD128` passed into CT 105 (`dev0`, gid 992) + jellyfin compose `devices`/`group_add`, CT restarted in a safe window, iHD driver verified via vainfo, Jellyfin accel=qsv (hw decode h264/hevc10/vp9/mpeg2). Encode still libx264 until the staged `i915 enable_guc=2` host reboot (Jasper Lake = low-power-only encode, needs HuC; enabling Jellyfin's LP options before HuC would hard-fail sessions). Items 5 (per-user accounts) and 6 (recordings retention) deferred by owner. |
 | 2026-07-18 (wave 2) | **12 more branded libraries + icons everywhere.** Owner asked about HBO and other premium studios: no English HBO VOD/series category exists on this panel (live-only), but Paramount+/Peacock/Showtime/Sky/Discovery+/Crunchyroll/Nickelodeon (series), Discovery+ (movies) and the film studios Paramount Pictures/Universal/Marvel/DreamWorks/James Bond do — all split into their own libraries (14 new; 25 total). Custom flat brand-inspired tile icons generated + uploaded for all 22 service/studio libraries (clapperboard = Movies, episode-card stack = Series, per-brand palette + flourish: Peacock feather fan, Paramount mountain, 007 gun-barrel rings, DreamWorks crescent, Universal ringed planet, Discovery+ globe, …). Found: panel gives each VOD stream one primary category, so the James Bond collection library got 1 title (rest live in general EN categories). See Operations → per-service libraries. |
