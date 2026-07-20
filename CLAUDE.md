@@ -53,5 +53,17 @@ The media stack lives in `/srv/media-core/` inside CT 105; drive it with
   updates only the primary server-side**, so after a merge run
   `git -C /root/pve-01-docs checkout main && git pull && git push origin main`
   to propagate the merge to the mirror (PRs themselves don't mirror).
+- **Overnight maintenance window (added 2026-07-20): 01:00-06:00 local
+  (Europe/Berlin), see `sync/maintenance_window.py`.** An automated agent
+  (Claude Code, agy) may use the IPTV provider's single tuner connection
+  for troubleshooting/verification/scraper-testing during this window
+  WITHOUT asking the owner first — check `maintenance_window.is_open()`
+  (or run the script directly, exit 0 = open) before any such tuner use.
+  The window auto-tightens around any scheduled Jellyfin recording (incl.
+  padding) and reopens once it ends. Outside this window, tuner-touching
+  troubleshooting still needs an explicit go-ahead each time — this does
+  not relax that. Learned the hard way 2026-07-20: live-testing EPG swaps
+  against the tuner during evening viewing hours caused real playback
+  failures for the household.
 - Wired networking is Proxmox ifupdown2, not NetworkManager. Never re-IP
   the host over SSH — use the local KDE console.
