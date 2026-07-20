@@ -53,7 +53,7 @@ The media stack lives in `/srv/media-core/` inside CT 105; drive it with
   updates only the primary server-side**, so after a merge run
   `git -C /root/pve-01-docs checkout main && git pull && git push origin main`
   to propagate the merge to the mirror (PRs themselves don't mirror).
-- **Overnight maintenance window (added 2026-07-20): 01:00-06:00 local
+- **Overnight maintenance window (added 2026-07-20): 01:00-05:00 local
   (Europe/Berlin), see `sync/maintenance_window.py`.** An automated agent
   (Claude Code, agy) may use the IPTV provider's single tuner connection
   for troubleshooting/verification/scraper-testing during this window
