@@ -922,12 +922,17 @@ into fuller observability later.
   a structured per-run summary to `job="epg-sync"`
   (`real=`/`synth=`/`ppv=`/`total_channels=` plus each external source's
   `matched=`/`pending=`), and `main()` pushes `event=sync_complete` on
-  success or an alert on any unhandled exception. Three alert rules live
-  in the Grafana folder **Media-Core** (provisioned via the API, not
-  files — no `provisioning/alerting/` directory on disk): any
-  `media-core-alerts` line in 15 min; no `epg-sync` `sync_complete` in
-  25h (nightly timer silently dead); real-channel coverage under 380 in
-  25h (regression — baseline 421/996 as of 2026-07-21). Notification:
+  success or an alert on any unhandled exception. Five alert rules live
+  in the Grafana folder **Media-Core**: the original three (provisioned
+  via the API) — any `media-core-alerts` line in 15 min; no `epg-sync`
+  `sync_complete` in 25h (nightly timer silently dead); real-channel
+  coverage under 380 in 25h (regression — baseline 421/996 as of
+  2026-07-21) — plus two new Prometheus-based network rules (provisioned
+  via file, `provisioning/alerting/network-alerts.yaml` on CT 107,
+  added 2026-07-23): NIC carrier-down events on `enp2s0` (any link flap
+  within 5 min) and sustained link-down (>30s). The Prometheus
+  datasource is likewise file-provisioned
+  (`provisioning/datasources/prometheus.yaml`). Notification:
   Grafana → email, sent from a dedicated `kopr.notify@gmail.com` (App
   Password in `/srv/log-server/.env`, 600, `env_file:` in compose — never
   in the compose YAML or committed) to the owner's own address.
@@ -935,7 +940,13 @@ into fuller observability later.
   `:465` (implicit TLS) instead**, confirmed via a direct `/dev/tcp`
   probe (587 timed out, 465 connected instantly); this is a router/ISP
   policy, not a Grafana or Gmail issue, so it'll bite again if anyone
-  ever "fixes" the port back to 587. Deliberately no per-external-source
+  ever "fixes" the port back to 587. The host's own postfix (for system
+  emails — cron failures, security notices) also relays through the same
+  `kopr.notify@gmail.com` account via port 465 (configured 2026-07-23;
+  SASL credentials in `/etc/postfix/sasl_passwd`, 600); before this fix,
+  host postfix tried direct MX delivery on port 25 which was blocked by
+  the OpenVPN tunnel, silently dropping all system email for days.
+  Deliberately no per-external-source
   zero-match rule — several sources are structurally always near-zero
   for this lineup, so a blanket threshold there would just be noise.
 - **Alert-rule format bug fixed (2026-07-22):** the "nightly EPG sync did
@@ -1104,26 +1115,43 @@ Code session to investigate manually.
   the household — this exists so that never has to happen again to learn
   the same lesson.
 
-**Mechanism:** `/root/bin/agy-task.sh <slug> <diagnose|plan|build|raw>
-"<prompt>"` (or `@/path/to/file` for the prompt — multi-line prompts
-nested through `sudo -> bash -c -> heredoc` break in ways not worth
-debugging twice; use a file). Injects mode-appropriate guardrails
-automatically (`diagnose` = read-only, `plan` = investigate + propose
-only, `build` = may write/deploy but told explicitly never to touch
-CT 105 unless the prompt says otherwise). Writes to
-`/root/agy-reports/<UTC-timestamp>-<slug>.md` — read *that*, not
-agy's own verbose internal CLI logs
-(`~/.gemini/antigravity-cli/log/`), which cost real tokens to page
-through and mostly aren't useful once a task completes cleanly.
-Defaults to model "Gemini 3.1 Pro (High)" (proven quality on both the
-channel-117 diagnosis and the log-server build); override per-call
-with `AGY_MODEL=` for cheaper/faster trivial lookups.
+**Mechanism:** `/root/bin/agy-task.sh` (rewritten 2026-07-23 for
+reliability). Subcommands:
 
-**Dispatch pattern:** launch via `run_in_background`, then `Monitor`
-watching the agy PID for exit (`while kill -0 <pid>; do sleep 5; done`)
-— **not** repeated manual polling with scheduled wakeups, which burns
-turns for no signal (learned the expensive way on the first diagnostic
-run of the night before switching approaches).
+```
+agy-task.sh run   <slug> <mode> "<prompt>"|@file [options]
+agy-task.sh chain <slug> <mode1,mode2,...> "<prompt>"|@file [options]
+agy-task.sh status [slug]
+agy-task.sh list   [--since <N>d|h]
+agy-task.sh read   <slug|report-file>
+agy-task.sh cancel <slug>
+```
+
+Modes: `diagnose` (read-only, 10m timeout), `plan` (investigate +
+propose, 15m), `build` (scoped writes, 20m), `raw` (no guardrails,
+20m). Each mode injects appropriate guardrails automatically.
+`@/path/to/file` for the prompt avoids heredoc-through-sudo breakage.
+
+Options: `--timeout <seconds>`, `--context <file>` (feed a previous
+report as input), `--bg` (background with PID tracking), `--retry <N>`,
+`--model <name>`, `--effort <level>`. Default model:
+`gemini-3.5-flash-high`.
+
+`chain` pipelines multiple modes sequentially (`diagnose,plan,build`),
+feeding each step's report as `--context` to the next — useful for
+full diagnose→plan→build workflows in one call.
+
+State tracking lives in `/root/agy-reports/.state/<slug>/`
+(status/mode/started/finished/exit_code/summary). Reports write to
+`/root/agy-reports/<UTC-timestamp>-<slug>.md`. Backward-compatible:
+bare `agy-task.sh <slug> <mode> "<prompt>"` still works (treated as
+`run`).
+
+**Dispatch pattern:** launch with `--bg`, then `Monitor` watching the
+agy PID for exit (`while kill -0 <pid>; do sleep 5; done`) — **not**
+repeated manual polling with scheduled wakeups, which burns turns for
+no signal. Use `agy-task.sh status <slug>` to check state without
+re-reading the full report.
 
 ## 9. Loose ends
 
@@ -1339,6 +1367,7 @@ run of the night before switching approaches).
 | 2026-07-22 (afternoon) | **Grafana alert-rule format bug found and fixed on all 3 Media-Core rules; confirmed the underlying "nightly sync failed" alarm was a false positive.** Owner got paged with a `DatasourceError` on the "nightly EPG sync did not complete" rule (built the day before, §7 Alerting) whose annotation said "no successful nightly EPG sync seen in 25 hours," but the actual Grafana error was a plumbing failure, not the real condition: "invalid format of evaluation results for the alert definition C: looks like time series data, only reduced data can be alerted on." Checked the real thing the alert claims to monitor before touching Grafana at all: `journalctl -u media-core-sync.service` on CT 105 showed the 04:00 run had completed cleanly at 04:10:25 with `sync complete` logged — the sync itself was never broken. Traced the actual Grafana bug to CT 107 (`docker exec grafana`, port 3000, `/srv/log-server` compose stack): all three alert rules built 2026-07-21 have the same structural flaw, not just the one that fired — query A was a Loki **range** query (`intervalMs: 1000` over a 25h window) piped directly into a **threshold** condition C that expects a single already-reduced number, and since the LogQL itself already aggregates the whole window (`count_over_time(...[25h])`, `min_over_time(...[25h])`), the range query was returning thousands of points where C wanted exactly one. Fixed by flipping query A to Grafana's **instant** query type on all three rules (no separate Reduce step needed — the LogQL already does the reduction); verified the fix against Grafana's ad-hoc `/api/v1/eval` endpoint before touching anything live, then applied it via `PUT /api/v1/provisioning/alert-rules/{uid}` and confirmed all three show `health: ok` / `lastError: None` in production. Hit one real obstacle along the way: the Grafana admin password wasn't recoverable from anywhere on either host — not in `docker-compose.yml`, `.env`, or shell history on the pve-01 host or CT 107, and no provisioning-as-code file for the alert rules existed either (they were built via one-off API calls the night before, confirmed by `git show` on the commit that built them) — so, with the owner's explicit go-ahead, reset it via `grafana-cli admin reset-admin-password` inside the container rather than guessing at it or trying to bypass auth another way; owner has the new value out-of-band. Separately confirmed lineup/channel-count questions the owner raised mid-session: current lineup is **v9** (built 2026-07-21 night — Wisconsin Sports front-load + Green Bay dedupe + Overflow Locals relocation), not v8; the ~996-channel count (v8's 1,856 was cut in the 2026-07-18 guide-speed trim) is correct and expected, not a regression. |
 | 2026-07-22 (later afternoon) | **Built 3 Grafana dashboards + a real Prometheus/node_exporter/pve-exporter metrics stack; instrumented sync duration and VOD/series counts; upgraded WireGuard health logging.** Owner asked for "good looking and informative dashboards" plus recommended metrics worth tracking, and to install/configure whatever was needed rather than working around gaps. Built three dashboards in the Media-Core Grafana folder — EPG Sync & Coverage, Streaming & Reliability, Host & Proxmox Resources — with every panel query tested directly against Loki or Prometheus before being put in a panel, not just trusted because the dashboard JSON saved without error (same verification discipline used on the alert-rule fix earlier the same day). That discipline caught a real bug before it shipped: an `unwrap` query with a bare `| logfmt` (no field list) promotes every parsed key to a label, so the real/synth/ppv coverage-trend queries were silently returning two near-duplicate series whenever `total_channels` ticked between two nightly runs inside the same 1-day window — fixed by scoping logfmt to only the field being unwrapped, the same underlying mistake as the morning's alerting bug, just surfacing in a graph instead of a condition. Added new instrumentation to feed the dashboards: `xtream-sync.py`'s `main()` now pushes `duration_s=` alongside the existing `sync_complete` event; `build_vod()`/`build_series()` now push `event=vod_summary`/`event=series_summary` Loki lines with write/duplicate/pruned and fetched/failed/written counts. Verified this end-to-end without waiting for or forcing a live sync run — the project's own maintenance-window discipline says a full `main()` run mid-afternoon would restart Threadfin and trigger a Jellyfin guide refresh outside the 01:00–05:00 window for zero reason — by calling `loki_alert.push()` directly with the exact new message shapes and confirming the lines landed in Loki; real values populate naturally at tonight's 04:00 run. `wg-snapshot.sh` (host, pushes `wg show wgclient1 dump` to Loki every ~1s via its existing timer) now also derives and pushes a clean `event=wg_health handshake_age_s=<n>` line each tick, parsed from the same dump it was already capturing, rather than leaving tunnel staleness buried in an unparsed multi-line blob nothing could graph — verified live within seconds of deploying. For host/guest resource metrics, which Loki structurally can't produce, built a real Prometheus stack: Prometheus itself joins the existing Grafana/Loki docker-compose file in CT 107 (30-day retention); `prometheus-node-exporter` (Debian package, native systemd) installed on the host and all 3 CTs (105/107/108) for OS-level CPU/memory/load/filesystem/network; `prometheus-pve-exporter` (installed via `pipx` on the host) for Proxmox-API-level per-guest and per-storage stats. Created a dedicated, purpose-built Proxmox user (`pve-exporter@pve`) holding only the built-in read-only **PVEAuditor** role — deliberately not reusing any existing credential or granting anything beyond read access — with its own API token for the exporter to authenticate with. Confirmed all 5 Prometheus scrape targets reported `health: up` before building any panel on top of them. Backups: `xtream-sync.py.pre-20260722-metrics-instrumentation`, `wg-snapshot.sh.pre-20260722-health-metric` (host), `docker-compose.yml.pre-20260722-prometheus` (CT 107). |
 | 2026-07-22 (evening) | **Router metrics + 4th Grafana dashboard ("Network: Router & Tunnels"); found the Chromecast log pipeline silently dead.** Owner asked whether there were good router metrics worth tracking (three VPN tunnels, throughput, clients, connections, top talkers) and whether Chromecast metrics were worth adding too, having just built the Proxmox/host metrics stack. Confirmed the Flint 2 actually runs three tunnels — `wgclient1` (WireGuard), `ovpnclient1`, `ovpnclient2` (two separate OpenVPN clients) — via `ubus call network.interface dump`, not just the two documented in the router's own memory notes. Installed `prometheus-node-exporter-lua` from GL.iNet's own firmware repo (matches the actual `mediatek/mt7986` build) with `wifi_stations`/`netstat`/`openwrt`/`nat_traffic`/`textfile`/`uci_dhcp_host` collectors, plus `nlbwmon` for the router's own historical accounting view. Hit and fixed a real bug getting it network-reachable: setting `listen_interface` to the correct logical name (`lan`, confirmed via ubus) still left the exporter bound to `127.0.0.1` after a uci commit + service restart — the init script's `config_load prometheus-node-exporter-lua.main` doesn't resolve a named interface correctly on this build; used the script's explicit `listen_interface='*'` wildcard case instead, which the script handles as a direct `bind=0.0.0.0` and sidesteps the broken lookup entirely, rather than spending more time root-causing an OpenWrt init-script quirk on someone else's package. Added the router as a new Prometheus scrape target, confirmed `health: up`. Discovered the `nat_traffic` collector's `node_nat_traffic{src,dest}` metric already carries real per-flow byte counts by IP — a genuine top-talkers signal for free, so the originally-planned custom nlbwmon-to-textfile-exporter glue turned out to be unnecessary; nlbwmon stayed installed regardless; as its own independent local view, not as a dependency of the dashboard. Built and verified the new dashboard: tunnel throughput for all three tunnels (confirmed real non-zero rates, not just configured-but-idle — WireGuard alone was moving ~715 KB/s at verification time), WiFi client count + per-station signal/rate table (2 clients on the `Big-GL` SSID), conntrack table usage as the connections metric, top source/destination IPs by traffic, and router CPU/memory/load/uptime. Separately investigated the Chromecast question and found something already broken rather than something to build fresh: `chromecast-logcat.service` (built 2026-07-19, ADB-streams filtered Google TV logcat to Loki) has been silently disconnected since 2026-07-20 22:19 — `adb devices` empty, stuck in a reconnect loop against a stale address. An mDNS scan for the device's wireless-debugging advertisement (installed `avahi-utils` fresh to check) found nothing either, meaning the TV's IP/port most likely changed or wireless debugging got toggled off — not something fixable without physically checking the TV's own Settings screen. Owner deferred reconnecting it for this session; documented as a known-broken item rather than silently left for someone to eventually notice the gap in Loki. |
+| 2026-07-23 | **Router reboot root-caused as 0630 network dropout; Threadfin stuck-tuner fix; network alert rules added; host postfix email relay fixed; agy wrapper rewritten for reliability.** Owner reported network dropout at ~0630, broken Jellyfin streaming, and missing email alerts. **(1) Network dropout:** kernel logs showed two NIC link-down flaps on `enp2s0` (the `vmbr0` bridge port) at 06:30:01 and 06:30:21; router syslog in Loki revealed the root cause — the Flint 2 rebooted at ~06:30 (kernel uptime `[70]` seconds at 06:31:31 post-boot, previous uptime `[86291]` = ~24 hours — a scheduled daily reboot). Not a cable or driver issue; the router's LAN port going down caused the client-side NIC to report link-down. **(2) Jellyfin streaming:** Threadfin's internal tuner counter was stuck at 1/1 ("No new connections available") with zero active ffmpeg processes and an empty stream-tracking directory — stale state from a previous unclean stream disconnect. Fixed by restarting Threadfin (no recording in progress, verified via `threadfin_ctl.recording_in_progress()`). **(3) No email alert:** two issues — no Grafana alert rule existed for network health (all 3 existing rules cover EPG sync only), and the host's postfix was completely broken (empty `relayhost`, trying direct SMTP on port 25 which the OpenVPN tunnel blocks — a 4-day-old email stuck in the queue since Jul 19). Fixed both: added 2 Prometheus-based alert rules via file provisioning (`provisioning/alerting/network-alerts.yaml` on CT 107) — NIC carrier-down flap detection (`increase(node_network_carrier_down_changes_total[5m]) > 0`) and sustained link-down (`node_network_carrier < 1` for 30s); also provisioned the Prometheus datasource via file (`provisioning/datasources/prometheus.yaml`). All 5 rules confirmed evaluating. Tested Grafana email delivery end-to-end via the receiver-test API — `status: ok`, owner confirmed email received. Fixed host postfix: configured relay through `[smtp.gmail.com]:465` using the same `kopr.notify@gmail.com` App Password as Grafana (SASL auth via `/etc/postfix/sasl_passwd`, 600); rebuilt `/etc/aliases.db`; test email delivered successfully (`dsn=2.0.0, status=sent`). **(4) Agy wrapper rewrite:** replaced `agy-task.sh` with a comprehensive orchestration tool: subcommands (`run`, `chain`, `status`, `list`, `read`, `cancel`), per-mode timeouts (10m diagnose / 15m plan / 20m build), background execution with PID tracking, retry logic, context chaining (feed previous report into next task), state tracking per slug (status/mode/started/finished/exit\_code/summary), and backward compatibility with the original 3-argument invocation. Default model updated to `gemini-3.5-flash-high`. Old wrapper backed up as `agy-task.sh.pre-20260723-rewrite`. |
 Historical deep-dives preserved in [`docs/archive/`](docs/archive/):
 the original Media-Core manifest (imported verbatim) and the network
 cutover runbook (step-by-step with rollback, now fully executed).
