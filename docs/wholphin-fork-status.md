@@ -98,6 +98,109 @@ Verify by listing the directory rather than assuming.
   *Settings → System → Developer options*, and the connect port is not
   stable. Expect to re-pair.
 
+
+## ⭐ Strongest lead: Wholphin direct-streams MPEG-TS, the web client uses HLS
+
+Discovered 2026-07-25 and it reframes the whole problem. Two owner
+observations narrowed it decisively:
+
+- **The Jellyfin *web* client plays the affected channels WITH audio** —
+  and the web client is served HLS.
+- **Setting "Use FFmpeg decoder module" to always-FFmpeg did NOT fix it**,
+  which rules out an HE-AAC / device-decoder cause.
+
+Together those prove the audio **is present in Jellyfin's output** — so
+this is not a server-side stripping problem, and it is not audio decoding.
+It is the **transport path**.
+
+Confirmed from Jellyfin's own logs for Wholphin sessions:
+
+```
+"SupportsDirectPlay":   false
+"SupportsDirectStream": true
+"TranscodingSubProtocol": "http"
+GET .../LiveTv/LiveStreamFiles/<id>/stream.ts        <-- raw MPEG-TS
+```
+
+No `master.m3u8` / `live.m3u8` request from Wholphin at all. So:
+
+| Client | Path | Demuxed by | Audio |
+|---|---|---|---|
+| Jellyfin web | HLS (`master.m3u8`) | **Jellyfin's ffmpeg** | ✅ works |
+| Wholphin | direct `stream.ts` | **ExoPlayer TsExtractor** | ❌ silent |
+
+The provider's MPEG-TS evidently carries audio signalling that ExoPlayer's
+`TsExtractor` mishandles while ffmpeg handles it fine. Forcing Wholphin
+down the HLS path moves demuxing to the component we can *prove* works.
+
+### How to force HLS — where the decision is made
+
+Jellyfin chooses Direct Stream vs HLS from the **DeviceProfile** the client
+sends with `POST /Items/{id}/PlaybackInfo`. If no `DirectPlayProfile`
+matches the container, it falls back to a transcoding profile (HLS).
+Verified empirically: sending a profile with `DirectPlayProfiles: []` and
+an HLS transcoding profile makes Jellyfin return a
+`/videos/.../master.m3u8` TranscodingUrl and launch an HLS ffmpeg.
+
+In the fork, the relevant code is:
+
+- `app/src/main/java/com/github/damontecres/wholphin/util/profile/DeviceProfileUtils.kt`
+  — the **video** `directPlayProfile` container list (~line 200-213)
+  includes `Codec.Container.TS`. That is what advertises "I can
+  direct-play MPEG-TS".
+- `createDeviceProfile(...)` (~line 64) already takes boolean gate flags
+  in exactly this style: `assDirectPlay`, `pgsDirectPlay`,
+  `dolbyVisionELDirectPlay`, `decodeAv1`, `preferAc3ForSurround`.
+- `services/DeviceProfileService.kt` (~line 55-68) wires those from
+  preferences.
+
+So the idiomatic change is a new gate — e.g. `tsDirectPlay: Boolean = true`
+— that omits `Codec.Container.TS` from the video direct-play containers
+when disabled, surfaced as an Experimental preference exactly like the
+existing **IPTV Audio Track Recovery** toggle. The plumbing pattern is
+already proven in this codebase by that commit.
+
+**Tradeoff to be explicit about:** the DeviceProfile is global, not
+per-item. Disabling TS direct-play affects *all* TS content, including DVR
+recordings (Threadfin/Jellyfin DVR writes `.ts`), which would then
+transcode as well — real CPU cost on CT 105's 2 vCPU. Acceptable as a
+diagnostic toggle; if it proves to be the fix, consider scoping it to Live
+TV items only.
+
+**Assessment of the existing three commits in light of this.** The
+`onTracksChanged` audio-fallback listener is well-aimed at a genuine
+ExoPlayer MPEG-TS failure mode and worth keeping. The two `TsExtractor`
+flags (`FLAG_ALLOW_NON_IDR_KEYFRAMES`, `FLAG_DETECT_ACCESS_UNITS`) are
+**video**-oriented — H.264 access-unit detection and non-IDR start — so
+their effect on *audio* track registration is indirect at best. Switching
+transport to HLS is a stronger, better-evidenced fix than tuning the TS
+extractor, because it bypasses the failing component entirely.
+
+## Build environment notes (pve-01)
+
+- The project ships `org.gradle.jvmargs=-Xmx2048m`. That **OOMs the Kotlin
+  compiler during IR lowering** when several product flavours compile in
+  parallel (`Backend Internal error ... root cause java.lang.OutOfMemoryError`,
+  surfacing on an arbitrary file such as `FilterByButton.kt` — the file
+  named is incidental, not the problem). RAM is not scarce on this box
+  (~17-20 GB free); the cap was.
+- Fixed at **user level** in `/root/.gradle/gradle.properties`
+  (`-Xmx6g`, `kotlin.daemon.jvmargs=-Xmx4g`, `org.gradle.workers.max=3`)
+  deliberately rather than editing the project's `gradle.properties`, so
+  the fork stays clean of machine-specific tuning. Run `./gradlew --stop`
+  after changing these — daemons are long-lived and will not pick up new
+  JVM args.
+- **Build only the flavour you need:** `./gradlew assembleDefaultDebug`,
+  not `assembleDebug` (which builds appstore + default + firetv).
+- **pve-01 is a poor build host.** Intel Celeron N5105, 4 cores @ 2.0 GHz
+  (~10 W). Load hit ~10.8 during dexing — roughly 2.7x oversubscribed —
+  while Jellyfin was also running a Guide refresh. No swap thrashing, so
+  it completes, but a modern 8-16 core machine would plausibly be 3-5x
+  faster. Nothing requires building here: ADB reaches the Chromecast at
+  `192.168.9.203:5555` from any LAN or tailnet host, so building on a
+  laptop and installing from there is the better standing arrangement.
+  Heavy builds otherwise belong in the 01:00-05:00 maintenance window.
+
 ## Next steps
 
 1. Confirm the build produced APKs; identify the `default`-flavor path.
@@ -108,6 +211,54 @@ Verify by listing the directory rather than assuming.
    See the affected-channel log in the history table.
 5. If audio works, that confirms the client-side root cause; then decide
    whether to revisit NextPVR at all.
+
+
+## Build + install: DONE (2026-07-25)
+
+`BUILD SUCCESSFUL in 17m 14s` after two fixes: the `iptvRecovery`
+use-before-declaration, and raising the Gradle/Kotlin heap (see build
+environment notes). Built with `assembleDefaultDebug`.
+
+Output in `app/build/outputs/apk/default/debug/`:
+
+| APK | Size |
+|---|---|
+| `Wholphin-default-debug-1.0.3-25-gec562b4e-54.apk` (universal) | 53.5 MB |
+| `...-54-arm64-v8a.apk` | 41.7 MB |
+| `...-54-armeabi-v7a.apk` | 40.3 MB |
+
+**Use `armeabi-v7a` — NOT arm64.** The Chromecast with Google TV
+("sabrina") reports `ro.product.cpu.abi = armeabi-v7a` and an abilist of
+`armeabi-v7a,armeabi` only: it runs a **32-bit** Android userspace despite
+64-bit-capable hardware. Installing the arm64 APK would fail or misbehave.
+Check the device rather than assuming:
+
+```bash
+adb -s 192.168.9.203:5555 shell getprop ro.product.cpu.abilist
+```
+
+Installed and verified on the Chromecast:
+
+```
+versionName = 1.0.3-25-gec562b4e     versionCode = 54
+package     = com.github.damontecres.wholphin.debug
+activity    = com.github.damontecres.wholphin.MainActivity
+```
+
+**Note the package name has a `.debug` suffix** (debug builds carry an
+`applicationIdSuffix`), so it installs alongside rather than over a release
+build — and `dumpsys package com.github.damontecres.wholphin` returns
+nothing. Use the `.debug` id for adb/dumpsys/logcat filters.
+
+### Still to do — on-device verification (needs the TV)
+
+1. Launch Wholphin, sign in to Jellyfin.
+2. Confirm **Settings → Experimental Settings → IPTV Audio Track
+   Recovery** is present and **ON** by default.
+3. Test the known-bad channels **133, 134, 313** (and 100/102).
+4. If still silent, go to the **HLS transport experiment** above — it has
+   better evidence behind it than the extractor flags, since the web client
+   demonstrably plays these channels with audio over HLS.
 
 ## Deferred, explicitly not forgotten
 
