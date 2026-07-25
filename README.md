@@ -119,7 +119,15 @@ Flint 2 (GL-MT6000, fw 4.9.0) ─ 192.168.9.1 ─ DHCP .100–.249, DNS, Wi-Fi "
   192.168.9.203) to the Swiss tunnel with the same kill switch.
 - **Router SSH:** pve-01's root key is installed on the Flint 2 —
   `ssh root@192.168.9.1` works non-interactively (set up 2026-07-14 for
-  the WireGuard migration; used for all `uci` work).
+  the WireGuard migration; used for all `uci` work). Also reachable over
+  Tailscale as `big-gl` / **`100.82.52.36`** from any tailnet device
+  (pve-01 is on the tailnet as `pve-01` / `100.125.154.95`, so the same
+  key works over that path) — useful as a second route if LAN-side
+  access breaks, and for off-site admin. It does **not** survive a
+  factory reset: the node identity in `/etc/tailscale/tailscaled.state`
+  is wiped, so a rebuild still starts from the LAN-side bootstrap in the
+  runbook. That state file is now included in router backups, so a
+  *restore* rejoins the tailnet without re-authenticating.
 - **Router syslog forwarding (2026-07-19):** `log_ip`/`log_port`/
   `log_proto` in `uci show system` point at CT 107 (`192.168.9.164:514`
   udp) — the router's own local log buffer is tiny (~64 KB), this gives

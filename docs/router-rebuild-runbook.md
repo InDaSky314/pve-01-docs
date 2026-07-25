@@ -30,6 +30,29 @@ repo. Never commit them.
 
 ---
 
+## Access paths
+
+| Path | Address | Notes |
+|---|---|---|
+| LAN | `192.168.9.1` | Normal path; pve-01's root SSH key is installed |
+| Tailscale | `100.82.52.36` (`big-gl`) | Works from any tailnet device, incl. off-site. pve-01 is on the tailnet too (`100.125.154.95`, `pve-01`), so `ssh root@100.82.52.36` works from the host with the same key. |
+
+Tailscale is a genuinely useful **second path** if LAN-side access
+breaks (bad firewall/policy-routing change, LAN renumbering), and for
+remote admin.
+
+⚠️ **It does not rescue you from a factory reset.** The node identity
+lives in `/etc/tailscale/tailscaled.state`, which a reset wipes — the
+router drops off the tailnet entirely and you're back to the LAN-side
+bootstrap below. It only helps *before* things are wiped, or *after* a
+config restore.
+
+Because that state file is not part of the stock `sysupgrade -b` file
+list, `/etc/sysupgrade.conf` was extended (2026-07-25) to include it —
+**and to include itself**, otherwise a restore reverts to the stock list
+and subsequent backups would silently drop it again. With that in place,
+a restore rejoins the tailnet with no re-authentication.
+
 ## Step 1 — re-establish initial access (the part that bites)
 
 After a factory reset the router is **not** where you left it:
