@@ -117,6 +117,38 @@ elsewhere and installing over ADB to `192.168.9.203:5555`.
    `/root/wholphin` so the work is not single-copy.
 
 
+
+## ✅ RESOLVED 2026-07-25: the fork IS now on GitHub
+
+`nk-sys-ops/wholphin` (private) created by the owner, with a dedicated
+**deploy key** (`/root/.ssh/id_ed25519_wholphin`, 600) granted write
+access — the same per-repo pattern already used for the `pve-01-docs`
+mirror, so a leak of that key cannot reach any other repository.
+
+Access is via an SSH host alias, because plain `git@github.com` cannot
+authenticate for this repo on this box:
+
+```
+Host github-wholphin
+    HostName github.com
+    User git
+    IdentityFile /root/.ssh/id_ed25519_wholphin
+    IdentitiesOnly yes
+```
+
+- `/srv/media-core/wholphin` → remote **`github`** = `git@github-wholphin:nk-sys-ops/wholphin.git`
+- `/root/wholphin` → `origin` **corrected** to the same alias (it previously
+  pointed at `git@github.com:...`, which silently failed auth — the reason
+  the commits had never actually been pushed)
+
+Pushed `main` (1549 commits) and **verified all four custom commits are
+ancestors of `github/main`**: `a5e605fe`, `96b2f41b`, `ec562b4e`,
+`08decc3e`. The work is no longer single-copy on one disk.
+
+Licence note: upstream Wholphin is GPL. The fork is private, which is
+fine; if it is ever made public, leave the upstream `LICENSE` and
+copyright headers intact.
+
 ## Build + install: DONE (2026-07-25)
 
 `BUILD SUCCESSFUL in 17m 14s` after two fixes: the `iptvRecovery`
