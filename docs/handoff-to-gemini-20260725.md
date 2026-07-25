@@ -236,6 +236,74 @@ reason the instrumentation was added.
   Plain `git@github.com` does **not** authenticate for this repo — the
   `github-wholphin` SSH alias and its deploy key do.
 
+
+## 🔴 ACTUAL ERROR FOUND — `NoCompatibleStream` (2026-07-25, final)
+
+The instrumented build is installed and working. Verified, not assumed:
+
+- Installed `versionName=1.0.3-26-g08decc3e`; the app's own `ClientInfo`
+  reports the same, so it IS the diagnostics build.
+- `WHOLPHIN_DIAG` **is** compiled in — 3 matches in the decompressed DEX
+  (`unzip -p <apk> 'classes*.dex' | grep -c WHOLPHIN_DIAG`). Note a plain
+  `grep` on the `.apk` returns 0 because an APK is a compressed ZIP — that
+  is a false negative, do not be misled by it.
+- The enclosing code block executes (its pre-existing `extensions=` log
+  appears 6x), backend is ExoPlayer, no crashes/ANRs.
+
+**Yet `onPlayerError` and `onTracksChanged` never fired — and that absence
+is the finding.** The real error, once the app's own process log was
+filtered, is:
+
+```
+E PlaybackViewModel$changeStreams: Error in PostedPlaybackInfo: NoCompatibleStream
+```
+
+One occurrence per tune attempt. Jellyfin is **refusing to produce a stream
+at all**: the DeviceProfile Wholphin sends advertises nothing Jellyfin can
+satisfy for these Live TV channels. So there is no media source, no tracks,
+and no `PlaybackException` — the Player.Listener was correctly attached and
+simply had nothing to report.
+
+Full log preserved at `/root/wholphin-nocompatiblestream-20260725.log`.
+
+### Why this matters
+
+`NoCompatibleStream` is a **DeviceProfile negotiation failure**, which is
+precisely the area the HLS hypothesis points at. This is now the leading
+explanation and it is *not* the TsExtractor flags:
+
+- Flags were made opt-in and default OFF in `8f45372a`, so they were not
+  active during these attempts. They are **not** the cause of the current
+  failure. (They may still have caused the earlier total breakage when the
+  inverted guard forced them on — that remains plausible but is now moot.)
+- The `NoCompatibleStream` failure happens *before* any demuxing, so it is
+  upstream of everything the three original commits touch.
+
+### Do this first
+
+Get the exact profile Jellyfin rejected. Both sides are available:
+
+```bash
+# Jellyfin's view of the decision
+pct exec 105 -- docker logs jellyfin --since 30m 2>&1 \
+  | grep -iE 'StreamBuilder|NoCompatibleStream|PlayMethod|TranscodeReason'
+
+# The app's own request/response
+grep -E 'PlaybackInfo|NoCompatibleStream|changeStreams' \
+  /root/wholphin-nocompatiblestream-20260725.log
+```
+
+`StreamBuilder.BuildVideoItem(...)` lines log the profile name and the
+resulting `PlayMethod` / `TranscodeReason`, which should show exactly which
+condition failed. Then adjust the DeviceProfile accordingly — most likely by
+allowing the HLS transcoding path (see the HLS experiment section), since the
+Jellyfin **web** client plays these same channels with audio over HLS.
+
+**Caution:** the fork's DeviceProfile may have been left in a state where it
+advertises neither a usable direct-play profile nor a usable transcoding
+profile for `ts`. Check `util/profile/DeviceProfileUtils.kt` against a clean
+upstream checkout before assuming the HLS change alone is sufficient.
+
 ## Your next steps
 
 1. Confirm the build succeeded and locate the **`default`**-flavour APK.
