@@ -180,6 +180,38 @@ media-core(ch) 96.7 Mbps / 33 ms · Primary 84.0 / 92 ms · Tunnel 1
 
 ---
 
+## Reboot-survival checklist (proven 2026-07-25)
+
+The whole configuration was deliberately reboot-tested after the rebuild.
+Every item below was verified *after* a real reboot, not assumed. Re-run
+this after any rebuild or significant change.
+
+| Check | Command | Expected |
+|---|---|---|
+| ipsets repopulated **from config** | `for s in $(ipset -n list \| grep src_mac); do printf '%s=' $s; ipset list $s \| grep -c '^[0-9A-F][0-9A-F]:'; done` | non-zero per tunnel with MACs (3 / 2 / 1 here) |
+| No VPN leak | egress IP per endpoint vs bare-WAN reference | all differ from bare WAN |
+| WireGuard up | `wg show all latest-handshakes` | recent timestamp per iface |
+| OpenVPN up | `ps \| grep -c '[o]penvpn'` | ≥ 1 |
+| Syslog → Loki | `logger -t test 'x'` then grep CT 107's `flint2-syslog.log` | line arrives |
+| Exporter | `curl -s -o /dev/null -w '%{http_code}' http://192.168.9.1:9100/metrics` | `200`, Prometheus target `up` |
+| Tailscale metrics | `test -f /var/prometheus/tailscale.prom` | exists — **`/var` is tmpfs, so cron must recreate it** (~1 min after boot) |
+| Client names | `uci show gl-client \| grep alias` | all aliases present |
+| WiFi | `uci show wireless \| grep ssid` | expected SSID |
+| No Lua errors | `grep -c 'lua entry thread aborted' /var/log/nginx/error.log` | no *new* entries after boot |
+
+Two traps found while running this:
+
+- **`/var/log/nginx/error.log` survives reboots** and nginx timestamps in
+  **UTC** while `date` reports local time. A raw error count looks alarming
+  until you compare timestamps against boot time — all 165 entries here
+  predated the fix.
+- Counting `grep -c ipairs` overcounts badly, because Lua stack-trace
+  continuation lines also contain the word. Match
+  `'lua entry thread aborted'` instead, which appears once per real error.
+
+Confirmed by the owner after this reboot: the *"Unknown error occurred"*
+popup on the Clients page is **gone**.
+
 ## Gotchas, learned the hard way
 
 **`from_mac` must be a UCI `list`, never an `option`.** Assigning a
