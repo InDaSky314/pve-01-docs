@@ -279,6 +279,51 @@ explanation and it is *not* the TsExtractor flags:
 - The `NoCompatibleStream` failure happens *before* any demuxing, so it is
   upstream of everything the three original commits touch.
 
+
+### CRITICAL REFINEMENT: it fails for EVERY channel, including previously-working ones
+
+Owner confirmed: **no channel plays at all** in the forked build — including
+channels that played fine (video, silent audio) before. Combined with
+`NoCompatibleStream` on every attempt, this is **not** channel-specific and
+**not** codec-specific. The DeviceProfile negotiation is failing wholesale.
+
+That makes it a **regression in the fork**, not the original audio bug. The
+original bug was "video plays, some channels silent". The current state is
+strictly worse and is blocking all Live TV in this app.
+
+Hypotheses, in order, with what has already been eliminated:
+
+1. **DeviceProfile is malformed / advertises nothing usable.** Most likely.
+   Note the `.debug` build has a **separate package id and therefore a
+   separate DataStore** — all preferences are at defaults, so the profile is
+   being built from default values that the release install never used.
+   `maxBitrate` was checked and does have a serializer default
+   (`AppPreferencesSerializer.kt:44` → `AppPreference.DEFAULT_BITRATE`), so
+   a zero-bitrate profile is **less likely** than first assumed — but the
+   rest of the default-derived profile has not been audited.
+2. **Something in the fork's own changes broke profile construction.** The
+   three original commits touch `PlayerFactory.kt`, not
+   `DeviceProfileUtils.kt` — so this needs verifying by diff against clean
+   upstream rather than assumed.
+3. Server-side change during today's session. Considered unlikely: the
+   Jellyfin **web** client still plays these channels fine, so Jellyfin can
+   produce streams — it is rejecting *this client's* profile specifically.
+
+**Do this first, it is cheap and decisive:** capture the actual
+PlaybackInfo request body and Jellyfin's rejection reason. logcat only logs
+the URL, not the body, so use Jellyfin's side — raise its log level or query
+the API directly with the same profile — and compare against a profile from
+a clean upstream Wholphin build. `StreamBuilder.BuildVideoItem(...)` in
+Jellyfin's log gives the profile name plus `PlayMethod` /
+`TranscodeReason`, which names the failing condition.
+
+**Pragmatic option for the owner meanwhile:** installing a clean upstream
+Wholphin (or the official Jellyfin Android TV client) restores Live TV in a
+Jellyfin client while this is debugged. The fork installs under
+`com.github.damontecres.wholphin.debug`, so a release build can sit
+alongside it without conflict. TiviMate is unaffected throughout — it goes
+direct to the provider and never touches Jellyfin.
+
 ### Do this first
 
 Get the exact profile Jellyfin rejected. Both sides are available:
