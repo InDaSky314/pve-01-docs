@@ -99,6 +99,143 @@ level in `/root/.gradle/gradle.properties` (6g/4g, workers.max=3) — run
 only. pve-01 (4-core N5105) is a weak build host; prefer building
 elsewhere and installing over ADB to `192.168.9.203:5555`.
 
+
+## LATEST STATE — 2026-07-25, end of Claude's shift (read this first)
+
+### Where we actually are
+
+APK built and installed on the Chromecast. **Awaiting one on-device test
+result** (owner to tune channel 133 with all experimental toggles OFF).
+A cleared `adb logcat` capture is running to `/root/wholphin-playback.log`
+on pve-01, so that test will be captured.
+
+`git log` on the fork (`/srv/media-core/wholphin`, branch `main`, all
+pushed to `github` = `nk-sys-ops/wholphin`):
+
+| Commit | What |
+|---|---|
+| `8f45372a` | **Latest.** IPTV recovery made opt-in; always-on playback diagnostics |
+| `08decc3e` | Build fix — `iptvRecovery` use-before-declaration |
+| `ec562b4e` | Default IPTV Audio Recovery ON (**superseded by `8f45372a`**) |
+| `96b2f41b` | IPTV Audio Track Recovery toggle in Experimental Settings |
+| `a5e605fe` | TiviMate TsExtractor flags + audio fallback listener |
+
+### The two most recent commits, in detail
+
+**`08decc3e` — build fix.** `patch_pf_pref.py` anchored the `iptvRecovery`
+declaration to the `tunneling` read (~line 137) but it is consumed at
+~line 105. Kotlin requires a local `val` before use, so all three flavours
+failed with `Unresolved reference 'iptvRecovery'`. Declaration relocated
+beside `decodeAv1` (~line 92). Original kept as
+`PlayerFactory.kt.pre-20260725-declfix`.
+
+**`8f45372a` — two changes, both important:**
+
+1. **Fixed an inverted default that is the suspected cause of playback
+   breaking entirely.** The guard read:
+   ```kotlin
+   if (experimentalPreferences.enabled) experimentalPreferences.iptvAudioRecoveryEnabled else true
+   ```
+   `enabled` is the experimental **master switch**. On a fresh install
+   proto3 bools default to `false`, so the master read false → the `else
+   true` branch → **the TsExtractor flags were forced ON for every
+   channel** while all three toggles in the UI read OFF. The owner
+   confirmed seeing exactly that: everything off, nothing playing. Those
+   are *video*-path flags (`FLAG_ALLOW_NON_IDR_KEYFRAMES`,
+   `FLAG_DETECT_ACCESS_UNITS`), so forcing them on plausibly broke video,
+   not just audio. Now reads the preference directly — **opt-in, defaults
+   off**, upstream behaviour until deliberately enabled.
+   **This supersedes `ec562b4e`'s intent.** Do not "restore" that default
+   without understanding the above.
+
+2. **Added always-on playback diagnostics**, deliberately *not* gated on
+   any toggle. There was **no `onPlayerError` handler at all** — the reason
+   failures surfaced as "not sure what the error is" with nothing in
+   logcat. Now logs, all tagged **`WHOLPHIN_DIAG`**:
+   - `onPlayerError`: ExoPlayer `errorCode`, `errorCodeName`, message,
+     cause chain
+   - `onTracksChanged`: every track's mime, codec, channel count, sample
+     rate, language, **and selected state** (or `NO_TRACKS_AT_ALL`)
+
+### How to read the diagnostics — this is the decision table
+
+```bash
+grep WHOLPHIN_DIAG /root/wholphin-playback.log
+# or live:
+adb -s 192.168.9.203:5555 logcat -v threadtime | grep WHOLPHIN_DIAG
+```
+
+| Observation | Meaning | Correct next move |
+|---|---|---|
+| `playback_error code=… codeName=…` | A real, nameable failure | Act on that specific ExoPlayer error code |
+| Audio track listed, `selected=false` | Track exists, not chosen | The fallback listener is the right fix — enable the toggle deliberately and retest |
+| No audio track / `NO_TRACKS_AT_ALL` | ExoPlayer cannot see audio in the raw TS | **Do the HLS transport experiment** (below). ffmpeg *does* find it — the web client proves that |
+
+Three distinct outcomes, three different fixes. **Do not start changing
+player code until you have looked at this output** — that is the whole
+reason the instrumentation was added.
+
+### Still queued, in priority order
+
+1. **Read the diagnostics from the owner's channel-133 test.** Decide via
+   the table above. Everything else waits on this.
+2. **If no audio track appears: the HLS transport experiment.** Full
+   rationale in `docs/wholphin-fork-status.md`. Short version: Wholphin
+   direct-streams raw MPEG-TS (`SupportsDirectStream: true`, fetches
+   `LiveTv/LiveStreamFiles/<id>/stream.ts`) and demuxes with ExoPlayer's
+   TsExtractor, while the Jellyfin **web** client gets HLS demuxed by
+   **ffmpeg** and plays these channels **with audio**. Fix: drop
+   `Codec.Container.TS` from the video `directPlayProfile` in
+   `util/profile/DeviceProfileUtils.kt` (~line 200-213), behind a
+   `tsDirectPlay` gate on `createDeviceProfile(...)` (~line 64), wired from
+   an Experimental preference in `services/DeviceProfileService.kt`
+   (~line 55-68) — same pattern as the existing IPTV toggle. Tradeoff:
+   DeviceProfile is global, so DVR `.ts` recordings would transcode too
+   (real CPU cost on CT 105's 2 vCPU).
+3. **Debug-only settings API.** Owner explicitly approved accepting some
+   security risk *while debugging*, on condition it is tightened later.
+   An exported `BroadcastReceiver` gated on `BuildConfig.DEBUG` that
+   reads/sets experimental preferences, so an assistant can flip settings
+   over ADB instead of asking the owner to navigate menus:
+   ```bash
+   adb shell am broadcast -a com.github.damontecres.wholphin.debug.SET_PREF \
+     --es key iptv_audio_recovery --ez value false
+   ```
+   **Must** be `BuildConfig.DEBUG`-gated and never reach a release variant.
+   Flag the tightening explicitly when the audio issue is resolved — do not
+   leave it as a silent loose end.
+
+### Build & install facts you will need
+
+- `cd /srv/media-core/wholphin && ./gradlew assembleDefaultDebug`
+  (**not** `assembleDebug` — that builds appstore+default+firetv)
+- Heap is already fixed at user level in `/root/.gradle/gradle.properties`
+  (`-Xmx6g`, `kotlin.daemon.jvmargs=-Xmx4g`, `workers.max=3`). The
+  project's own `-Xmx2048m` OOMs the Kotlin compiler during IR lowering.
+  Run `./gradlew --stop` after changing those — daemons cache JVM args.
+- Clean build ~17 min; incremental ~6 min on this box (4-core N5105).
+- Install the **`armeabi-v7a`** APK. The Chromecast reports
+  `ro.product.cpu.abilist = armeabi-v7a,armeabi` — **32-bit userspace**
+  despite 64-bit hardware. The arm64 APK is wrong.
+  ```bash
+  adb -s 192.168.9.203:5555 install -r \
+    app/build/outputs/apk/default/debug/*armeabi-v7a.apk
+  ```
+- Installed package id is **`com.github.damontecres.wholphin.debug`**
+  (debug `applicationIdSuffix`). `dumpsys package com.github.damontecres.wholphin`
+  returns nothing — use the `.debug` id.
+- Wireless debugging **does not survive a Chromecast reboot** and the port
+  is not stable; it must be re-enabled by hand in Settings → System →
+  Developer options.
+- Push work to **all three** places so it is never single-copy:
+  ```bash
+  git push github main                      # nk-sys-ops/wholphin (via github-wholphin alias)
+  git push origin HEAD:refs/heads/iptv-audio-fix --force   # /root/wholphin
+  git bundle create /root/wholphin-backups/wholphin-$(date -u +%Y%m%dT%H%M%SZ).bundle cf3c00a1..HEAD
+  ```
+  Plain `git@github.com` does **not** authenticate for this repo — the
+  `github-wholphin` SSH alias and its deploy key do.
+
 ## Your next steps
 
 1. Confirm the build succeeded and locate the **`default`**-flavour APK.
@@ -238,9 +375,60 @@ The owner wants these done later, not forgotten:
    intended. It also means the ~104 Mbps "direct WAN" baseline was
    measured through the repeater.
 
-## When your tokens run low
+## How to hand back to Claude — required format
 
-Push all documentation and status to the server and both GitHub remotes,
-then produce a handoff prompt for Claude in the same shape as this one:
-what you did, what you verified vs assumed, exact stopping point, next
-steps, and anything deferred.
+The owner alternates between Claude and Gemini to spread token usage, and
+feeds each side's handoff to the other. **Before you run low on tokens**,
+do both of these:
+
+**1. Push everything.** Commit code, push the fork to all three locations
+(above), and commit doc updates to `/root/pve-01-docs` — branch, PR, merge,
+then `git checkout main && git pull && git push origin main` to propagate to
+the mirror. Nothing should exist only in your session context or only on one
+disk.
+
+**2. Write a handoff to `docs/handoff-to-claude-<YYYYMMDD>.md`** and commit
+it, covering these sections explicitly:
+
+- **Exact stopping point.** Not "working on X" — the precise state. Which
+  command was mid-flight, which file half-edited, what was about to be
+  tested.
+- **Verified vs assumed.** Mark each claim. This matters more than anything
+  else here: this project has repeatedly lost time to documentation that
+  claimed things which were never true (the fork was documented as "on
+  GitHub, fully up to date" when the commits had never been pushed; the
+  documented APK path did not exist). If you did not personally observe it,
+  say so.
+- **What you changed**, with commit hashes and *why* — the reasoning, not
+  just the diff.
+- **What you tried that did NOT work**, and how you know. Negative results
+  are as valuable as positive ones here; the NextPVR test and the
+  always-FFmpeg test both eliminated whole hypotheses.
+- **Next steps**, in priority order, with the reasoning for the ordering.
+- **Deferred items** — carry forward the list below verbatim if still open.
+  The owner has said explicitly he does not want these dropped.
+- **Anything you broke or left in a non-default state**, including debug
+  hacks, relaxed security, or temporary credentials that need tightening.
+
+Then tell the owner, in your final message, that the handoff is committed
+and give him a short prompt he can paste to Claude.
+
+### Working rules worth repeating
+
+- **Verify, don't assume.** Several documented claims in this project turned
+  out to be false. Test and report what you actually observed.
+- **Confirm before touching shared infra.** CT 105 runs the live media stack
+  the household uses. Check `/root/bin/check-iptv-stream.sh` before
+  restarting Threadfin/Jellyfin.
+- **Never commit secrets.** Provider credentials live only in
+  `/srv/media-core/.env` (600). `/root/router-backups/` snapshots contain
+  WireGuard private keys — 600, never committed.
+- **`AGENTS.md` is a symlink to `CLAUDE.md`** — edit `CLAUDE.md` only.
+- **Heavy builds** belong in the 01:00-05:00 maintenance window, or better,
+  on a machine other than pve-01 (a 4-core N5105 is a poor build host; ADB
+  reaches the Chromecast from any LAN/tailnet host).
+- **On the router:** `route_policy` `from_mac` must be a UCI **`list`**
+  (`uci add_list`), never a scalar `option` — a scalar crashes the Lua
+  backend *and* leaves the firewall ipset empty, which **fails open** and
+  silently leaks traffic outside the VPN. Apply with
+  `/usr/bin/rtp2.sh apply`; `network reload` does not repopulate ipsets.

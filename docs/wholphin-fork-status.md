@@ -292,6 +292,30 @@ nothing. Use the `.debug` id for adb/dumpsys/logcat filters.
    better evidence behind it than the extractor flags, since the web client
    demonstrably plays these channels with audio over HLS.
 
+
+## Playback diagnostics (commit `8f45372a`)
+
+An always-on `Player.Listener` (not gated on any toggle) logs everything
+tagged **`WHOLPHIN_DIAG`**: `onPlayerError` gives ExoPlayer's `errorCode`,
+`errorCodeName`, message and cause chain; `onTracksChanged` enumerates each
+track's mime, codec, channels, sample rate, language and **selected state**.
+There was previously no error handler at all, which is why failures were
+invisible.
+
+```bash
+adb -s 192.168.9.203:5555 logcat -v threadtime | grep WHOLPHIN_DIAG
+```
+
+Decision table: a `playback_error` code → act on that code; an audio track
+present but `selected=false` → the fallback listener is correct, enable it;
+no audio track at all → do the HLS transport experiment, since ffmpeg finds
+the audio (the web client proves it).
+
+Same commit also made IPTV recovery **opt-in, default off**, fixing an
+inverted guard that forced the TsExtractor flags on for every channel
+whenever the experimental master switch was off (i.e. on any fresh install)
+— superseding `ec562b4e`.
+
 ## Deferred, explicitly not forgotten
 
 - **Prune stale Tailscale nodes + add ACLs** (MEDIUM-HIGH). 16 of 21
