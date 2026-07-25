@@ -70,5 +70,5 @@ The media stack lives in `/srv/media-core/` inside CT 105; drive it with
 
 ## Wholphin Android TV Custom Fork (Updated 2026-07-25)
 - **Private Repo Location:** (/srv/media-core/wholphin) (remote origin: git@github.com:nk-sys-ops/wholphin.git)
-- **TiviMate Player Fix (Commit a5e605f):** Custom PlayerFactory.kt with TiviMate-grade TsExtractor flags (FLAG_ALLOW_NON_IDR_KEYFRAMES + FLAG_DETECT_ACCESS_UNITS) and automatic ExoPlayeronTracksChanged audio fallback listener that forces audio track binding when AudioTrack defaults to NONE.
+- **TiviMate Player Fix (Commits a5e605f & 96b2f41 (UI switch under Settings -> Experimental Settings)):** Custom PlayerFactory.kt with TiviMate-grade TsExtractor flags (FLAG_ALLOW_NON_IDR_KEYFRAMES + FLAG_DETECT_ACCESS_UNITS) and automatic ExoPlayeronTracksChanged audio fallback listener that forces audio track binding when AudioTrack defaults to NONE.
 - **Build & Deploy:** ./gradlew assembleDebug in /srv/media-core/wholphin, push to Chromecast via ADB (/root/bin/chromecast-logcat.sh).
