@@ -1338,7 +1338,7 @@ Three modes: bare (human-readable status), `--json`, `--restart-ok`
       guest/IoT isolated, VPN zones DROP inbound**):**
       1. Disable SSH root **password** login (key auth from pve-01 works;
          web panel remains the fallback).
-      2. Disable **GoodCloud** remote admin (router keeps an outbound
+      2. Disabled **GoodCloud** remote admin (router keeps an outbound
          session to `gslb-eu.goodcloud.xyz`, account-bound since May 2024)
          if it's not actually used — unnecessary external control path.
       3. Panel serves plain HTTP on :80 alongside HTTPS (LAN-only; low
