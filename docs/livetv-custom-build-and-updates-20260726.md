@@ -369,3 +369,59 @@ Archived: `/root/wholphin-backups/Wholphin-Custom-1.0.3-34-g693c0e3c-armeabi-v7a
 play ch100/102 to confirm. Then optionally upstream the fixes — the
 Wholphin `mediaSourceId` bug is the highest-value one, since it breaks Live
 TV for every user with a tuner.
+
+---
+
+## 11. Where things stand at end of 2026-07-26
+
+**Both bugs fixed, shipped, and running on the TV.**
+
+| Repo | State |
+|---|---|
+| `nk-sys-ops/wholphin` | **public**, history sanitised, `main` and `fix/jellyfin-live-tv-ts-transcode` both at `693c0e3c` (identical — no merge needed) |
+| branch `pr/livetv-mediasourceid` | the upstream PR candidate, cherry-picked onto upstream `f16a7bb6`, compiles clean |
+| release `v1.0.3-34-g693c0e3c` | asset `Wholphin-debug-armeabi-v7a.apk`, verified reachable unauthenticated |
+
+**On the Chromecast**
+
+- `com.github.damontecres.wholphin.custom` — **Wholphin Custom**
+  `1.0.3-34-g693c0e3c`, both fixes on by default
+- `com.github.damontecres.wholphin` — upstream v1.0.3, MPV fallback
+
+**Infrastructure left as found:** Threadfin stock (`buffer: -`, `-c copy`),
+Jellyfin untouched, exported debug receiver removed, verbose profile dump
+quietened.
+
+### Open items, priority order
+
+1. **Sign in to Wholphin Custom and play ch100/102.** New package means
+   fresh app data. Expected to work — same code as the build that was
+   confirmed, plus hardening — but unverified since the rename.
+2. **Capture `hls_codecs_patched`** (see the upstreaming doc). Turns the
+   audio fix from strong inference into a direct sighting, and unblocks the
+   media3 report.
+3. **Upstream the findings** — see `livetv-upstreaming-20260726.md`. The
+   Wholphin PR is drafted and ready; the Jellyfin issue is the highest
+   value; the media3 issue is blocked on item 2.
+4. **Dedicated signing keystore** before relying on auto-update. Current
+   builds are debug-signed with root's keystore on pve-01, so all future
+   builds must happen on that box or upgrades will refuse to install.
+5. **Optional cleanup** — the `tsDirectPlay` toggle and unconditional `ts`
+   injection target a non-cause and can be reverted. Keep the
+   `WHOLPHIN_DIAG` track logging; it is what made this class of bug
+   diagnosable.
+
+### Rebuild-and-release loop
+
+```bash
+cd /srv/media-core/wholphin
+sudo ./gradlew assembleDefaultDebug
+# name the asset exactly Wholphin-debug-armeabi-v7a.apk
+# name the release exactly like 1.0.3-<n>-g<hash>  (must parse as a Version)
+sudo sh -c 'export GH_TOKEN=$(cat /root/.wholphin-release-token); \
+  gh release create <tag> --repo nk-sys-ops/wholphin --target main \
+  --title "<version>" /path/to/Wholphin-debug-armeabi-v7a.apk'
+```
+
+Both names are load-bearing — get either wrong and the updater silently
+does nothing. Details and the reasoning are in §9.
