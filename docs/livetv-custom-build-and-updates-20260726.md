@@ -223,3 +223,32 @@ the Chromecast (`192.168.9.203`) directly.
    credential with write access to `nk-sys-ops`. APK archived at
    `/root/wholphin-backups/Wholphin-MediaCore-1.0.3-32-gf248c314-armeabi-v7a.apk`.
 3. Dedicated signing keystore before relying on auto-update.
+
+### Why `gh` cannot cut the release (diagnosed 2026-07-26)
+
+Not a scope problem — an identity one:
+
+```
+gh authenticated as : InDaSky314   (scopes: gist, read:org, repo)
+orgs visible        : Wiesbaden-Cyber, velocit-ee
+nk-sys-ops          : type "User"  <- a separate personal account, not an org
+repos/nk-sys-ops/wholphin -> 404
+```
+
+`InDaSky314` is simply not a collaborator on that repo. GitHub returns 404
+rather than 403 for private repos you cannot see, which is why it looked
+like the repo did not exist. The `github-wholphin` deploy key can push
+because it is an SSH key scoped to the repo; deploy keys have no REST API
+access, so they can never create releases.
+
+Fix, any one of:
+
+- **A** — add `InDaSky314` as a collaborator with Write from the
+  `nk-sys-ops` account. Everything on pve-01 then works unchanged.
+- **B** — `sudo gh auth login --hostname github.com --web` as
+  `nk-sys-ops`. Both accounts coexist via `gh auth switch`.
+- **C (best for automation)** — fine-grained PAT from `nk-sys-ops`, scoped
+  to only `nk-sys-ops/wholphin` with **Contents: Read and write**, stored
+  at `/root/.wholphin-release-token` (mode 600) and used as
+  `GH_TOKEN=$(cat /root/.wholphin-release-token) gh release create …`.
+  Smallest blast radius if it leaks, and works unattended.
