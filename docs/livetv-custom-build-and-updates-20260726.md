@@ -252,3 +252,56 @@ Fix, any one of:
   at `/root/.wholphin-release-token` (mode 600) and used as
   `GH_TOKEN=$(cat /root/.wholphin-release-token) gh release create …`.
   Smallest blast radius if it leaks, and works unattended.
+
+---
+
+## 9. Self-update is blocked: the fork is private (2026-07-26 evening)
+
+The first release is published and correctly formed:
+
+- tag `v1.0.3-33-g2114dcd8`, name **`1.0.3-33-g2114dcd8`**
+- asset **`Wholphin-debug-armeabi-v7a.apk`**
+
+Both names matter and were verified against the code:
+
+- `UpdateChecker.getRelease` parses the release **name** with
+  `Version.tryFromString`, which uses `matchEntire` on
+  `v?(\d+)\.(\d+)\.(\d+)(-(\d+)-g([a-zA-Z0-9]+))?`. A descriptive title
+  such as "v1.0.3 - Live TV fixes" does **not** parse and the update is
+  silently never offered. The name must be exactly a version string.
+- `getDownloadUrl(assets, BuildConfig.DEBUG)` picks assets by preference:
+  for a debug build `Wholphin-debug-<abi>.apk`, then `Wholphin-debug.apk`.
+  Plain **`Wholphin.apk` is only matched for non-debug builds** — an
+  earlier plan to name it that would never have matched.
+- Ordering works on `major.minor.patch` then `numCommits`, so
+  `1.0.3-33-…` > installed `1.0.3-32-…`.
+
+**But it cannot work as configured.** `nk-sys-ops/wholphin` is private and
+`UpdateChecker` issues a plain unauthenticated OkHttp request:
+
+```
+GET https://api.github.com/repos/nk-sys-ops/wholphin/releases/latest -> 404
+```
+
+Embedding a token in the APK is not an option. Upstream's design assumes a
+public repo. Consequences today: the check fails every 12 h, logs
+"Update check failed 404", and is otherwise harmless — no user-visible
+breakage and no wrong build installed.
+
+### Options
+
+- **A — make the fork public.** Zero infra, works immediately. It is a
+  fork of an open-source app, so the code is not secret; check commit
+  messages first.
+- **B — self-host the feed on the LAN** (*recommended for privacy*).
+  `updateUrl` is a normal preference, and the parser only needs JSON with
+  `name` plus `assets[]` of `{name, browser_download_url}`. A small nginx
+  container on CT105 serving `latest.json` + the APK would do it, reachable
+  on the LAN and over Tailscale. **No web server exists on the stack yet**
+  — nothing is listening on 80/443/8080 in CT105 — so this needs one
+  standing up.
+- **C — manual installs.** Leave it as is and `adb install -r` new builds.
+  Zero work, no automation.
+
+Nothing else in the plan changes; §4's release procedure is correct and
+proven, it just needs a reachable host.
