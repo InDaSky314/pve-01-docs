@@ -305,3 +305,67 @@ breakage and no wrong build installed.
 
 Nothing else in the plan changes; §4's release procedure is correct and
 proven, it just needs a reachable host.
+
+---
+
+## 10. Repo sanitised, made public, self-update live (2026-07-26 night)
+
+### History rewrite
+All 12 of our commits were authored `root <root@pve-01.jetta.tech>` —
+a real domain plus infra naming, and GitHub shows commit emails publicly.
+Rewritten with `git filter-branch` to
+`nk-sys-ops <nk-sys-ops@users.noreply.github.com>`, which also:
+
+- removed `PlayerFactory.kt.pre-20260725-declfix` (an accidental editor
+  backup) from every commit
+- scrubbed "Media-Core"/"mediacore" from commit messages
+
+Branding renamed **Wholphin Custom**, `applicationIdSuffix = ".custom"`,
+package `com.github.damontecres.wholphin.custom`.
+
+### Old repo deleted, not force-pushed
+Force-pushing leaves the old commits as dangling objects, fetchable by SHA
+until GitHub garbage-collects on no guaranteed schedule. Since the repo was
+standalone (`isFork: false`) it was deleted and recreated instead, so the
+old identity was never published. **Verified** by cloning the public repo
+anonymously and grepping the full working tree and history:
+
+```
+jetta / pve-01 / media-core / mediacore / karras / nathan
+teltv / 192.168 / tail8f3e6 / root@   ->  0 files, 0 commits
+commit authors: nk-sys-ops, plus upstream's own public contributors
+```
+
+The repo is now **public**. `user.name`/`user.email` are pinned in the
+repo's local git config so future commits from pve-01 cannot silently
+reintroduce the old identity.
+
+### Token scoping gotchas (both hit, both fixed)
+Fine-grained tokens grant by repository **ID**, not name. Deleting and
+recreating the repo left the token with "no access to any repositories" —
+it had to be re-pointed at the new repo. Editing the scope keeps the same
+token value; regenerating is unnecessary. Pushing then failed again with
+`refusing to allow a Personal Access Token to create or update workflow`
+because upstream ships `.github/workflows/main.yml`, so the token also
+needs **Workflows: Read and write**.
+
+### Self-update is now live
+Release **`v1.0.3-34-g693c0e3c`**, name `1.0.3-34-g693c0e3c`, asset
+`Wholphin-debug-armeabi-v7a.apk`. Verified against an unauthenticated
+request (exactly what the device makes): reachable, name parses as a
+Version with `numCommits: 34`, asset name matches what a debug build looks
+for. §9's blocker is resolved by the repo being public.
+
+### Device state
+- `com.github.damontecres.wholphin.custom` — **Wholphin Custom**
+  `1.0.3-34-g693c0e3c`, both fixes, enabled by default
+- `com.github.damontecres.wholphin` — upstream v1.0.3, kept as the MPV
+  fallback
+- the old `.mediacore` and `.debug` packages are uninstalled
+
+Archived: `/root/wholphin-backups/Wholphin-Custom-1.0.3-34-g693c0e3c-armeabi-v7a.apk`
+
+**Still to do:** sign in to Wholphin Custom (new package = fresh data) and
+play ch100/102 to confirm. Then optionally upstream the fixes — the
+Wholphin `mediaSourceId` bug is the highest-value one, since it breaks Live
+TV for every user with a tuner.
