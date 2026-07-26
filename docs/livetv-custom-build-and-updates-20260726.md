@@ -176,3 +176,50 @@ Worth automating later as a small script or a GitHub Action; not done yet.
 - Threadfin fully reverted to stock (`buffer: -`, `-c copy`); backup at
   `settings.json.bak-20260726-084846`
 - Jellyfin untouched
+
+---
+
+## 8. Consolidation and hardening (end of 2026-07-26)
+
+### One app, renamed
+The patched build is now **"Wholphin Media-Core"**, package
+`com.github.damontecres.wholphin.mediacore` (was `...wholphin.debug`).
+The old `.debug` package is uninstalled. Upstream v1.0.3
+(`com.github.damontecres.wholphin`) is deliberately kept as a fallback
+because it is the only build with a working MPV backend.
+
+**There is no single build with both.** libmpv is behind the upstream
+author's private Maven credential; ours links the stub. This is fine —
+the ExoPlayer patch works, so MPV is no longer needed for correctness. It
+was the diagnostic that proved ExoPlayer was at fault.
+
+Note the new package has **fresh app data** — it needs signing in again
+(Quick Connect is easiest) and its experimental toggles start at defaults.
+The Live TV fixes now default ON, so nothing needs enabling by hand.
+
+### Security cleanup (`2114dcd8`)
+- **Removed `DebugReceiver`.** It was `android:exported="true"` with no
+  permission, so *any* app on the device could broadcast
+  `com.github.damontecres.wholphin.UPDATE_PREFS` and change Wholphin's
+  experimental preferences. Added purely to toggle prefs over adb during
+  diagnosis; no reason to ship.
+- **DeviceProfile dump ERROR → verbose.** It wrote the entire client
+  capability profile to logcat on every playback.
+- **Kept `WHOLPHIN_DIAG` track logging** — codec/mime/channel data only,
+  no tokens or credentials, and it is what makes this class of bug
+  diagnosable. Audited for token logging: none found.
+
+### Remote access
+pve-01 is on the tailnet at `100.125.154.95` /
+`pve-01.tail8f3e6.ts.net` — SSH there gives full capability, since all
+work runs from that host. `GL-MT6000` also advertises `192.168.9.0/24`,
+so with `--accept-routes` a client reaches Jellyfin (`192.168.9.50`) and
+the Chromecast (`192.168.9.203`) directly.
+
+### Still outstanding
+1. **Sign in to Wholphin Media-Core and re-test ch100/102.** Expected to
+   work — same binary as the build that was confirmed, plus hardening.
+2. **Publish the GitHub release** (§4) to enable self-update. Blocked on a
+   credential with write access to `nk-sys-ops`. APK archived at
+   `/root/wholphin-backups/Wholphin-MediaCore-1.0.3-32-gf248c314-armeabi-v7a.apk`.
+3. Dedicated signing keystore before relying on auto-update.
