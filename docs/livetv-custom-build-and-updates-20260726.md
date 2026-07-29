@@ -425,3 +425,61 @@ sudo sh -c 'export GH_TOKEN=$(cat /root/.wholphin-release-token); \
 
 Both names are load-bearing — get either wrong and the updater silently
 does nothing. Details and the reasoning are in §9.
+
+---
+
+## 12. MPV settings archive (upstream build uninstalled 2026-07-29)
+
+The upstream Wholphin build (`com.github.damontecres.wholphin`) was
+uninstalled to free storage — the Chromecast was at 93% (316 MB free of
+4 GB). These settings took several iterations to arrive at and are
+recorded here because they lived in that app's private data.
+
+**Playback Backend:** MPV
+**MPV: Use hardware decoding:** ON
+**MPV: Use gpu-next:** OFF
+
+**mpv.conf as last applied** (Settings → Advanced Settings → Edit mpv.conf):
+
+```
+hwdec=mediacodec-copy
+framedrop=vo
+video-sync=audio
+cache=yes
+demuxer-max-bytes=32MiB
+demuxer-readahead-secs=10
+```
+
+Reasoning, so it is not re-derived:
+
+- `hwdec=mediacodec-copy` — the default hardware path renders straight to
+  a surface, which puts the video pipeline outside mpv's clock and causes
+  progressive A/V drift on Amlogic. Copy mode brings frames back under
+  mpv's timing. **This is the line that produced the audible improvement.**
+- `framedrop=vo` — drop late frames to hold sync rather than drifting.
+- Cache values are deliberately modest. An earlier attempt used
+  `demuxer-max-bytes=64MiB`, `demuxer-readahead-secs=20`, `cache-secs=30`
+  and was *worse* — on a 32-bit device the larger buffer adds memory
+  pressure and latency without helping sync.
+
+**Recommended but never tested** (next thing to try if MPV is revisited):
+
+```
+profile=fast
+vo=gpu-next
+```
+
+`profile=fast` disables mpv's expensive default scaling, dithering and
+debanding, which is where a weak Mali GPU spends its budget — likely the
+bigger lever of the two. `vo=gpu-next` is the libplacebo renderer with
+better frame timing. Also untested: `hwdec=no`, which is the *diagnostic*
+that would confirm whether hwdec is the jitter source at all (if jitter
+disappears, hwdec is the culprit; if 1080p becomes a slideshow, the CPU
+cannot software-decode and hwdec must be made to work).
+
+**Status when uninstalled:** MPV played the affected channels *with audio*
+— which is what proved the bug was ExoPlayer-side — but was never as smooth
+as ExoPlayer on this hardware. With the ExoPlayer AAC fix working, MPV is
+no longer needed for correctness. Reinstall from
+`https://github.com/damontecres/Wholphin/releases` (armeabi-v7a) if it is
+ever wanted again.
