@@ -483,3 +483,83 @@ as ExoPlayer on this hardware. With the ExoPlayer AAC fix working, MPV is
 no longer needed for correctness. Reinstall from
 `https://github.com/damontecres/Wholphin/releases` (armeabi-v7a) if it is
 ever wanted again.
+
+---
+
+## 13. Working settings, and the AC3 trap (2026-07-29)
+
+### Known-good configuration — audio works on ALL channels
+
+Wholphin Custom (`com.github.damontecres.wholphin.custom`), Advanced Settings:
+
+| Setting | Value |
+|---|---|
+| Device supports AC3/Dolby Digital | **Enabled** |
+| Always downmix to stereo | Disabled |
+| Direct play Dolby Vision Profile 7 | Disabled |
+| AV1 software decoding | Disabled |
+| Experimental settings | **Enabled** |
+
+Experimental settings:
+
+| Setting | Value |
+|---|---|
+| Video tunneling | Disabled |
+| **IPTV Audio Track Recovery** | **Enabled** ← carries the AAC fix; required |
+| **Use AC3 for surround sound audio** | **Disabled** ← required, see below |
+| Direct play TS | Enabled |
+
+### The AC3 trap
+
+With **"Use AC3 for surround sound audio" enabled**, audio failed on some
+channels with:
+
+```
+MediaCodecAudioRenderer error, format=Format(..., audio/ac3, ...),
+format_supported=NO_UNSUPPORTED_SUBTYPE
+Decoder init failed: [-49999]   (ERROR_CODE_DECODER_INIT_FAILED)
+```
+
+Cause, confirmed in `DeviceProfileUtils.createDeviceProfile`:
+
+```kotlin
+if (preferAc3ForSurround) {
+    transcodingProfile {
+        ...
+        audioCodec(Codec.Audio.AC3)   // ONLY AC3 — no AAC fallback
+    }
+}
+```
+
+The flag makes the video transcoding profile advertise **AC3 as the only
+acceptable audio codec**, so Jellyfin transcodes every channel's audio to
+AC3. This device has **no AC3 decoder** (none registered in
+`dumpsys media.player`) and **our build has no software fallback** — the
+media3 ffmpeg decoder extension (`libavcodec` etc.) is behind the private
+Maven credential, so our APK ships only `libass`. Upstream's build has it,
+which is why AC3 channels worked there.
+
+Note this is a *different* setting from "Device supports AC3/Dolby
+Digital" (`ac3Supported`), which only adds AC3 to the supported list and
+can stay enabled.
+
+**Latent risk:** with `ac3Supported` still enabled, a channel whose source
+audio is AC3 could still be direct-played rather than transcoded, and
+would fail the same way unless the TV/receiver does Dolby Digital
+passthrough. If that appears, disabling "Device supports AC3/Dolby
+Digital" is the fix.
+
+### Correction to earlier advice
+
+§12 said dropping the upstream build was safe because "ExoPlayer is
+confirmed working". That was reasoned from channels 100/102 only, which
+are AAC. Our build is **strictly less capable than upstream** for AC3 and
+AV1 content because it lacks the decoder extensions. Removing upstream
+gave up a genuine fallback.
+
+### Outstanding cleanup
+
+`WholphinMediaSourceFactory` sets `setAllowChunklessPreparation(false)`.
+That was added speculatively, is not needed for the AAC fix, and changes
+preparation behaviour for **every** HLS stream. It did not cause the AC3
+failure, but it is an unreviewed change and should be removed.
