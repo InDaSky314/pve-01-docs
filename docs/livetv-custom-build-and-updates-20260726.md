@@ -494,7 +494,7 @@ Wholphin Custom (`com.github.damontecres.wholphin.custom`), Advanced Settings:
 
 | Setting | Value |
 |---|---|
-| Device supports AC3/Dolby Digital | **Enabled** |
+| Device supports AC3/Dolby Digital | **Disabled** |
 | Always downmix to stereo | Disabled |
 | Direct play Dolby Vision Profile 7 | Disabled |
 | AV1 software decoding | Disabled |
@@ -543,11 +543,18 @@ Note this is a *different* setting from "Device supports AC3/Dolby
 Digital" (`ac3Supported`), which only adds AC3 to the supported list and
 can stay enabled.
 
-**Latent risk:** with `ac3Supported` still enabled, a channel whose source
-audio is AC3 could still be direct-played rather than transcoded, and
-would fail the same way unless the TV/receiver does Dolby Digital
-passthrough. If that appears, disabling "Device supports AC3/Dolby
-Digital" is the fix.
+**Latent risk closed (2026-07-29):** "Device supports AC3/Dolby Digital"
+was also disabled. With `ac3Supported = false`, AC3 and EAC3 are filtered
+out of both the direct-play and transcoding profiles, so Jellyfin can
+never hand this client AC3 at all — it transcodes to AAC, which the device
+decodes natively. Correct for this hardware, which has no AC3 decoder and
+no ffmpeg software fallback in our build.
+
+Re-enable both settings only if the TV is ever fed through a receiver that
+does Dolby Digital passthrough, or if the build gains the media3 ffmpeg
+decoder extension. Until then the cost is that multichannel audio is
+transcoded to AAC rather than passed through as AC3 — inaudible on stereo
+TV speakers, relevant only with a surround setup.
 
 ### Correction to earlier advice
 
