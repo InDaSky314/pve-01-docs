@@ -693,3 +693,44 @@ Jellyfin DVR one — they take different paths.
 5. **Remove `setAllowChunklessPreparation(false)`** from
    `WholphinMediaSourceFactory` — added speculatively, affects all HLS.
 6. **Dedicated signing keystore** before relying on auto-update.
+
+### §15 addendum — recordings: one data point, still undiagnosed
+
+Attempted reproduction 2026-07-30 ~18:12 ("Space Chase USA"). Captured
+before the device was restarted:
+
+```
+PlayMethod=DirectPlay      <- and nothing else; no error in the window
+```
+
+That is *consistent with* the Bug 2 hypothesis (DirectPlay → non-GUID
+media source id → `Guid.Parse` → HTTP 500), because recordings take the
+same DirectPlay route that failed on the NextPVR live channel. **It is not
+confirmation** — no `Unrecognized Guid format` was captured for a
+recording. Reproduce and capture before treating it as the same bug.
+
+### ADB access after a reboot — read this first next time
+
+Wireless debugging does not survive a reboot, and on Android 11+ the
+**connect port rotates every time it is toggled**. Pairing worked
+repeatedly (`adb pair <ip>:<pair-port> <code>` → "Successfully paired")
+while `adb connect` kept failing on ports found by scanning, leaving the
+device stuck `offline`. Port-scanning to guess the connect port did not
+work — several ports are open simultaneously and only one is correct.
+
+Take the connect port from the **main Wireless debugging screen** (not the
+pairing dialog), and expect it to differ from the pairing port. If the
+device shows `offline`, `adb kill-server` then reconnect.
+
+**Do not block diagnosis on ADB.** Both live-TV bugs were found entirely
+in Jellyfin's server log, which is readable without touching the device
+and survives device reboots.
+
+### Device sluggishness after mass app updates
+
+After updating all apps via Play Store and rebooting, the Chromecast became
+very slow. Ping from pve-01 showed `min/avg/max = 1.5/32/93 ms` on the LAN
+with 43 ms mdev — the device was too busy to answer ICMP promptly, i.e.
+CPU/IO starved rather than a network fault. Cause is almost certainly
+background `dexopt` recompiling updated apps, made worse by storage sitting
+at ~85%. It settles on its own in 20-45 minutes; leave it idle.
