@@ -570,3 +570,126 @@ gave up a genuine fallback.
 That was added speculatively, is not needed for the AAC fix, and changes
 preparation behaviour for **every** HLS stream. It did not cause the AC3
 failure, but it is an unreviewed change and should be removed.
+
+---
+
+## 14. NextPVR A/B experiment — three Jellyfin bugs isolated (2026-07-29 evening)
+
+Both Threadfin and NextPVR serve **the same two channels from the same
+upstream URLs** (`cf.teltv.xyz/live/.../430234.ts` for ch100), reaching
+Jellyfin by two completely different code paths. That makes a controlled
+A/B possible on one server, and it paid off.
+
+Jellyfin has duplicate channel items — same name, same `SortName`
+(`00100.0-Madison: ABC 27 (WKOW)`), so they appear as indistinguishable
+twins in the guide:
+
+| Item id | ExternalId | Source |
+|---|---|---|
+| `dedb9f8f-6d3d-29a1-f404-614b84546247` | `7148` | NextPVR (plugin) |
+| `52dd5eb0-f5f0-3933-0245-5b8ae619cad8` | `hdhr_100` | Threadfin (tuner host) |
+
+**Finding the twin:** the NextPVR copy has no EPG data, so a guide
+*view-option filter* hides it. Enable "show details" in the guide's filter
+menu to reveal it. (An earlier guess that it appears at channel 103 was
+wrong — 103 is `channel_source_number`, internal to NextPVR.)
+
+### Bug 1 — tuner-host probe misses audio (now localised)
+
+Same channel, same stream, same server, minutes apart:
+
+| | Threadfin (TunerHost) | NextPVR (ILiveTvService) |
+|---|---|---|
+| probe result | video only | **`h264` + `aac` detected** |
+| ffmpeg audio | *(no `-codec:a`)* | **`-codec:a:0 copy`** |
+| client patch needed | yes | **no** (`hls_codecs_patched` never fired) |
+
+This rules out the stream, the codec, the provider and ffprobe itself. The
+defect is in the **HDHomeRun tuner-host media-source path**, not shared
+probe code. That is a far stronger issue report than "the probe sometimes
+fails".
+
+### Bug 2 — DirectPlay of a plugin-sourced live channel returns HTTP 500
+
+```
+System.FormatException: Unrecognized Guid format
+   at System.Guid.Parse(String input)
+   at Jellyfin.Api.Helpers.StreamingHelpers.GetStreamingState(...)
+   at Jellyfin.Api.Controllers.VideosController.GetVideoStream(...)
+```
+
+The NextPVR MediaSource Id is **`"34"`** — a bare integer. Jellyfin
+generates it, then rejects it when handed back to `/Videos/{id}/stream`.
+Client sees `ERROR_CODE_IO_BAD_HTTP_STATUS, Response code: 500`, retries,
+then falls back to Transcode — observed as **buffering/stalling** on the
+ch102 twin.
+
+**The two bugs mask each other.** Threadfin never hits Bug 2 because its
+probe fails, so DirectPlay is never chosen. Fixing Bug 1 *exposes* Bug 2.
+
+Workaround if NextPVR channels are wanted now: disable **Direct play TS**
+in Experimental Settings, forcing transcode instead of the broken direct
+path. Untested.
+
+### Bug 3 — username whitespace (unrelated, but real)
+
+Username/password login fails on the Chromecast and Android phone apps;
+Quick Connect works. Cause:
+
+```
+DB username:       'family'    (len 6, no spaces)
+client transmits:  "family "   <- trailing space
+log:               Authentication request for "family " has been denied
+```
+
+Android's keyboard word-suggestion appends a space. Jellyfin does not trim,
+so the user lookup finds nothing. `InvalidLoginAttemptCount` stayed **0**
+for `family` because the request never resolves to that account — which is
+why it looked like nothing was reaching the server. Web works because
+browsers do not auto-space.
+
+Fix: backspace before leaving the username field, or disable predictive
+text. Arguably Jellyfin should trim — an easy, reportable upstream bug.
+
+---
+
+## 15. OPEN — recordings playback failure (undiagnosed)
+
+Reported 2026-07-29 late: **recordings will not play back**. No evidence
+captured — the logcat capture had ended and the server log window had
+rolled past it. **Do not speculate; reproduce and capture.**
+
+Plausible-but-unverified: NextPVR recordings arrive through the same
+plugin, so they may carry the same non-GUID media source ids as Bug 2 and
+fail identically. That is a hypothesis only.
+
+To capture next time — start the capture **before** pressing play:
+
+```bash
+adb -s 192.168.9.203:5555 logcat -c
+adb -s 192.168.9.203:5555 logcat -v time > /tmp/rec.log &
+# play a recording, then:
+grep -aE "playback_error|Response code|Playback decision|WHOLPHIN_DIAG" /tmp/rec.log
+sudo /usr/sbin/pct exec 105 -- docker logs jellyfin --since 5m 2>&1 \
+  | grep -B2 -A6 "Unrecognized Guid format\|Error processing request"
+```
+
+Note whether the recording is a **NextPVR** recording (Recordings tab) or a
+Jellyfin DVR one — they take different paths.
+
+---
+
+## 16. Pick-up list
+
+1. **Diagnose recordings playback** (§15) — capture first, then diagnose.
+2. **Draft the Jellyfin issues.** Bug 2 is the most reportable: clean stack
+   trace, one-line cause, no dependence on this setup. Bug 1 has the
+   strongest evidence. Bug 3 is trivial and easy to land.
+3. **Submit the Wholphin PR** — branch `pr/livetv-mediasourceid`, drafted in
+   `livetv-upstreaming-20260726.md`, compiles against upstream. Needs a
+   fork of `damontecres/Wholphin` under `nk-sys-ops`.
+4. **media3 issue** — now unblocked: the real codecs string was captured,
+   `avc1.640028` (video-only, not empty).
+5. **Remove `setAllowChunklessPreparation(false)`** from
+   `WholphinMediaSourceFactory` — added speculatively, affects all HLS.
+6. **Dedicated signing keystore** before relying on auto-update.
