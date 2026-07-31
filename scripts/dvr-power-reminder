@@ -51,16 +51,35 @@ TEAMS = [
     ("Bucks",            "basketball/nba",                      "mil"),
 ]
 
-API = "https://site.api.espn.com/apis/site/v2/sports/{sport}/teams/{team}/schedule"
+API = ("https://site.api.espn.com/apis/site/v2/sports/{sport}"
+       "/teams/{team}/schedule?seasontype={stype}")
+
+# The default response is the regular season only. Preseason games are watched
+# too and start weeks earlier, and for some teams the default returns nothing
+# at all -- so always ask for each season type explicitly.
+SEASON_TYPES = (1, 2, 3)
 
 
-def fetch(sport: str, team: str) -> dict:
-    req = urllib.request.Request(
-        API.format(sport=sport, team=team),
-        headers={"User-Agent": "dvr-power-reminder/1.0"},
-    )
-    with urllib.request.urlopen(req, timeout=25) as r:
-        return json.load(r)
+def fetch(sport: str, team: str) -> list[dict]:
+    """All events across season types, de-duplicated by event id."""
+    events, seen = [], set()
+    for stype in SEASON_TYPES:
+        req = urllib.request.Request(
+            API.format(sport=sport, team=team, stype=stype),
+            headers={"User-Agent": "dvr-power-reminder/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                data = json.load(r)
+        except Exception:                                 # noqa: BLE001
+            continue
+        for ev in data.get("events", []):
+            key = ev.get("id") or ev.get("date")
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append(ev)
+    return events
 
 
 def outside_window(start: datetime, end: datetime) -> bool:
@@ -80,13 +99,15 @@ def games_needing_power(now: datetime) -> tuple[list[str], list[str]]:
 
     for label, sport, team in TEAMS:
         try:
-            data = fetch(sport, team)
+            events = fetch(sport, team)
         except Exception as exc:                      # noqa: BLE001
             problems.append(f"{label}: could not fetch schedule ({exc})")
             continue
+        # An empty schedule is normal out of season and indistinguishable from
+        # one, so it is not reported -- a daily "no events" mail would be noise.
 
         kind = "football" if "football" in sport else "basketball"
-        for ev in data.get("events", []):
+        for ev in events:
             raw = ev.get("date")
             if not raw:
                 continue

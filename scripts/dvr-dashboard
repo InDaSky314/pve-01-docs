@@ -76,18 +76,26 @@ def override_until() -> datetime | None:
     return ts if ts > datetime.now(LOCAL) else None
 
 
+# ESPN's default schedule response is the regular season only. Preseason and
+# postseason live behind seasontype, and preseason matters here -- those games
+# are watched too, and they start weeks before the regular season.
+SEASON_TYPES = {1: "Preseason", 2: "", 3: "Postseason"}
+
+
 def all_games(now: datetime) -> list[dict]:
-    """Every game ESPN lists for the followed teams. Cached 6 h."""
+    """Every game ESPN lists for the followed teams, all season types. Cached 6 h."""
     with _lock:
         if _sched["at"] and (now - _sched["at"]) < timedelta(hours=6):
             return _sched["games"]
 
     out: list[dict] = []
+    seen: set = set()
     for label, sport, team in TEAMS:
+      for stype, sname in SEASON_TYPES.items():
         try:
             req = urllib.request.Request(
                 f"https://site.api.espn.com/apis/site/v2/sports/{sport}"
-                f"/teams/{team}/schedule",
+                f"/teams/{team}/schedule?seasontype={stype}",
                 headers={"User-Agent": "dvr-dashboard/1.0"})
             with urllib.request.urlopen(req, timeout=20) as r:
                 data = json.load(r)
@@ -112,9 +120,13 @@ def all_games(now: datetime) -> list[dict]:
                     if ab and val is not None:
                         bits.append(f"{ab} {val}")
                 score = "  ".join(reversed(bits))
+            key = (label, ev.get("id") or start.isoformat())
+            if key in seen:
+                continue
+            seen.add(key)
             end = start + DURATION[kind]
             out.append({
-                "team": label, "kind": kind,
+                "team": label, "kind": kind, "season": sname,
                 "name": ev.get("shortName") or ev.get("name") or "game",
                 "start": start.isoformat(), "end": end.isoformat(),
                 "done": done, "score": score,
@@ -252,6 +264,7 @@ margin:0 0 10px;font-weight:600}
 .pill.warn{background:var(--warnbg);color:var(--warn)}
 .pill.rec{background:var(--okbg);color:var(--ok)}
 .pill.live{background:var(--live);color:#fff}
+.pill.season{background:var(--line);color:var(--dim)}
 .status{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .dot{width:10px;height:10px;border-radius:50%;flex:0 0 auto}
 .big{font-size:1.05rem;font-weight:600}
@@ -323,6 +336,7 @@ const esc=s=>String(s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[
 let TEAM='All', SCHED=null, PON=null;
 
 function pills(g){let h='';
+  if(g.season)h+=`<span class="pill season">${esc(g.season)}</span>`;
   if(g.recording)h+=`<span class="pill rec" title="${esc(g.recording)}">recording</span>`;
   if(g.needsPower&&!g.done)h+='<span class="pill warn">needs power</span>';
   return h}
