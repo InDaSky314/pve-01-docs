@@ -23,7 +23,7 @@ import hashlib
 import json
 import subprocess
 import sys
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -45,6 +45,20 @@ def pct(*args: str, timeout: int = 30) -> str:
                           capture_output=True, text=True,
                           timeout=timeout, check=True).stdout
 
+
+def npvr_start(tag) -> datetime:
+    """NextPVR start time as a real local datetime.
+
+    <start_time> is local wall time ("07/31/2026 22:00:00"). <start_time_ticks>
+    looks like an epoch but is that same wall time encoded as if it were UTC,
+    so reading it with fromtimestamp(tz=LOCAL) lands 2 h out in CEST. Parse the
+    string; fall back to relabelling the ticks rather than trusting them.
+    """
+    raw = tag("start_time")
+    if raw:
+        return datetime.strptime(raw.strip(), "%m/%d/%Y %H:%M:%S").replace(tzinfo=LOCAL)
+    naive = datetime.fromtimestamp(int(tag("start_time_ticks")), tz=timezone.utc)
+    return naive.replace(tzinfo=LOCAL)
 
 def next_power_on(now: datetime) -> datetime:
     today = now.replace(hour=POWER_ON.hour, minute=POWER_ON.minute,
@@ -80,11 +94,17 @@ def nextpvr_blockers(now: datetime, until: datetime) -> tuple[list[str], list[st
     for chunk in pending.split("<recording>")[1:]:
         def tag(t: str) -> str:
             return chunk.split(f"<{t}>")[1].split(f"</{t}>")[0] if f"<{t}>" in chunk else ""
+        # Epoch/second variants, not the formatted <start_time>/<duration>:
+        # parsing those threw and skipped every recording, so this guard could
+        # have shut the host down mid-recording.
         try:
-            start = datetime.fromtimestamp(int(tag("start_time")), tz=LOCAL)
+            start = npvr_start(tag)
+            end = start + timedelta(seconds=int(tag("duration_seconds") or 0))
         except (ValueError, IndexError):
             continue
-        if now <= start < until:
+        if start <= now <= end:
+            reasons.append(f"NextPVR: '{tag('name')}' is recording now")
+        elif now < start < until:
             reasons.append(f"NextPVR: '{tag('name')}' starts {start:%H:%M}")
     return reasons, []
 

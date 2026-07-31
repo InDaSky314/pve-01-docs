@@ -22,7 +22,7 @@ import json
 import subprocess
 import threading
 import urllib.request
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, timezone, time as dtime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -58,6 +58,20 @@ def pct(*args: str, timeout: int = 25) -> str:
                           capture_output=True, text=True,
                           timeout=timeout, check=True).stdout
 
+
+def npvr_start(tag) -> datetime:
+    """NextPVR start time as a real local datetime.
+
+    <start_time> is local wall time ("07/31/2026 22:00:00"). <start_time_ticks>
+    looks like an epoch but is that same wall time encoded as if it were UTC,
+    so reading it with fromtimestamp(tz=LOCAL) lands 2 h out in CEST. Parse the
+    string; fall back to relabelling the ticks rather than trusting them.
+    """
+    raw = tag("start_time")
+    if raw:
+        return datetime.strptime(raw.strip(), "%m/%d/%Y %H:%M:%S").replace(tzinfo=LOCAL)
+    naive = datetime.fromtimestamp(int(tag("start_time_ticks")), tz=timezone.utc)
+    return naive.replace(tzinfo=LOCAL)
 
 def outside_window(start: datetime, end: datetime) -> bool:
     cur = start
@@ -138,8 +152,30 @@ def all_games(now: datetime) -> list[dict]:
     return out
 
 
+def channel_names(sid: str) -> dict[str, str]:
+    """number -> name, so a Jellyfin timer's 'hdhr_100' can be shown as a name.
+
+    Jellyfin timers carry only the tuner's channel id. Both tuners number these
+    channels identically, so NextPVR's list resolves them.
+    """
+    out: dict[str, str] = {}
+    try:
+        xml = pct("curl", "-s", "--max-time", "10",
+                  f"{NEXTPVR}?method=channel.list&sid={sid}")
+    except Exception:                                       # noqa: BLE001
+        return out
+    for chunk in xml.split("<channel>")[1:]:
+        def tag(t: str) -> str:
+            return (chunk.split(f"<{t}>")[1].split(f"</{t}>")[0]
+                    if f"<{t}>" in chunk else "")
+        if tag("number"):
+            out[tag("number")] = tag("name")
+    return out
+
+
 def recordings(now: datetime) -> tuple[list[dict], list[str]]:
     items, problems = [], []
+    chmap: dict[str, str] = {}
     try:
         init = pct("curl", "-s", "--max-time", "10",
                    f"{NEXTPVR}?method=session.initiate&ver=1.0&device=dashboard")
@@ -148,6 +184,9 @@ def recordings(now: datetime) -> tuple[list[dict], list[str]]:
         h = hashlib.md5(f":{hashlib.md5(b'0000').hexdigest()}:{salt}".encode()).hexdigest()
         pct("curl", "-s", "--max-time", "10",
             f"{NEXTPVR}?method=session.login&md5={h}&sid={sid}")
+        chmap = channel_names(sid)
+        # A recording currently airing appears under BOTH filters, so track ids.
+        seen_rec: set = set()
         for f in ("inprogress", "pending"):
             xml = pct("curl", "-s", "--max-time", "10",
                       f"{NEXTPVR}?method=recording.list&filter={f}&sid={sid}")
@@ -155,14 +194,27 @@ def recordings(now: datetime) -> tuple[list[dict], list[str]]:
                 def tag(t: str) -> str:
                     return (chunk.split(f"<{t}>")[1].split(f"</{t}>")[0]
                             if f"<{t}>" in chunk else "")
+                # NextPVR exposes BOTH a formatted <start_time>
+                # ('07/31/2026 22:00:00') and epoch <start_time_ticks>;
+                # likewise <duration> ('00:30') and <duration_seconds>.
+                # Parsing the formatted pair threw and hit the continue
+                # below, so every NextPVR recording was silently invisible.
                 try:
-                    start = datetime.fromtimestamp(int(tag("start_time")), tz=LOCAL)
-                    end = start + timedelta(seconds=int(tag("duration") or 0))
+                    start = npvr_start(tag)
+                    end = start + timedelta(seconds=int(tag("duration_seconds") or 0))
                 except (ValueError, IndexError):
                     continue
+                start -= timedelta(seconds=int(tag("pre_padding") or 0) * 60)
+                end += timedelta(seconds=int(tag("post_padding") or 0) * 60)
+                rid = tag("id")
+                if rid and rid in seen_rec:
+                    continue
+                seen_rec.add(rid)
+                sub = tag("subtitle")
                 items.append({"source": "NextPVR", "name": tag("name") or "recording",
+                              "subtitle": sub, "channel": tag("channel"),
                               "start": start.isoformat(), "end": end.isoformat(),
-                              "live": f == "inprogress",
+                              "live": start <= now <= end,
                               "needsPower": outside_window(start, end)})
     except Exception as exc:                                # noqa: BLE001
         problems.append(f"NextPVR unreachable ({type(exc).__name__})")
@@ -179,7 +231,10 @@ def recordings(now: datetime) -> tuple[list[dict], list[str]]:
             end += timedelta(seconds=t.get("PostPaddingSeconds") or 0)
             if end < now:
                 continue
+            num = "".join(ch for ch in str(t.get("ChannelId", "")) if ch.isdigit())
             items.append({"source": "Jellyfin", "name": t.get("Name", "recording"),
+                          "channel": chmap.get(num) or (f"ch {num}" if num else ""),
+                          "subtitle": t.get("EpisodeTitle") or "",
                           "start": start.isoformat(), "end": end.isoformat(),
                           "live": start <= now <= end,
                           "needsPower": outside_window(start, end)})
@@ -343,8 +398,9 @@ function pills(g){let h='';
 function row(g,past,extra){
   return `<div class="row${past?' past':''}"><div class="when">${fD(g.start)}<br>
   <span class="tag">to ${fT(g.end)}</span></div>
-  <div class="what"><b>${esc(g.name)}</b><span class="tag">${esc(g.team||g.source||'')}${
-    g.score?' · '+esc(g.score):''}</span></div>
+  <div class="what"><b>${esc(g.name)}</b><span class="tag">${
+    [g.channel, g.subtitle, g.team||g.source, g.score].filter(Boolean).map(esc).join(' · ')
+  }</span></div>
   <div class="pills">${extra||''}${pills(g)}</div></div>`}
 
 function tab(w){
