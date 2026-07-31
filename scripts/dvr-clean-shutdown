@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Shut the host down cleanly before the mains timer cuts power -- unless a
+recording needs it to stay up.
+
+The timer cuts power at ~22:24 and restores at ~04:57. Being cut while running
+is an unclean poweroff every day, so we power down cleanly a little ahead of
+it. BIOS is set to "Power On" (verified 2026-07-31 by a clean shutdown
+followed by an unattended boot), so the box still comes back when power
+returns.
+
+On nights the timer is overridden for a game, a recording will be in progress
+or due before the next power-on. In that case we do nothing and let the box
+run -- the point is that overriding the mains timer should be the only action
+needed, with nothing here to remember to cancel.
+
+  --dry-run   report the decision, never power off
+
+Docs: /root/pve-01-docs/docs/livetv-custom-build-and-updates-20260726.md
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import sys
+from datetime import datetime, time as dtime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+# Written by the dashboard's "keep awake" button.
+OVERRIDE = Path("/var/lib/dvr-dashboard/override-until")
+
+LOCAL = ZoneInfo("Europe/Berlin")
+POWER_ON = dtime(4, 57)          # mains restores; recordings before this are at risk
+
+CT = "105"
+NEXTPVR = "http://localhost:8866/service"
+JELLYFIN_TIMERS = "/srv/media-core/jellyfin/config/data/livetv/timers.json"
+JF_DONE = {"Completed", "Cancelled", "Error"}
+MAILTO = "nathan.karras@gmail.com"
+
+
+def pct(*args: str, timeout: int = 30) -> str:
+    return subprocess.run(["/usr/sbin/pct", "exec", CT, "--", *args],
+                          capture_output=True, text=True,
+                          timeout=timeout, check=True).stdout
+
+
+def next_power_on(now: datetime) -> datetime:
+    today = now.replace(hour=POWER_ON.hour, minute=POWER_ON.minute,
+                        second=0, microsecond=0)
+    return today if today > now else today + timedelta(days=1)
+
+
+def nextpvr_blockers(now: datetime, until: datetime) -> tuple[list[str], list[str]]:
+    """(reasons to stay up, problems). A problem is itself a reason to stay up."""
+    try:
+        init = pct("curl", "-s", "--max-time", "10",
+                   f"{NEXTPVR}?method=session.initiate&ver=1.0&device=shutdownguard")
+        sid = init.split("<sid>")[1].split("</sid>")[0]
+        salt = init.split("<salt>")[1].split("</salt>")[0]
+        h = hashlib.md5(f":{hashlib.md5(b'0000').hexdigest()}:{salt}".encode()).hexdigest()
+        pct("curl", "-s", "--max-time", "10",
+            f"{NEXTPVR}?method=session.login&md5={h}&sid={sid}")
+    except Exception as exc:                              # noqa: BLE001
+        return [], [f"NextPVR: could not authenticate ({exc})"]
+
+    reasons: list[str] = []
+    try:
+        if pct("curl", "-s", "--max-time", "10",
+               f"{NEXTPVR}?method=recording.list&filter=inprogress&sid={sid}"
+               ).count("<recording>"):
+            reasons.append("NextPVR: a recording is in progress")
+
+        pending = pct("curl", "-s", "--max-time", "10",
+                      f"{NEXTPVR}?method=recording.list&filter=pending&sid={sid}")
+    except Exception as exc:                              # noqa: BLE001
+        return reasons, [f"NextPVR: could not list recordings ({exc})"]
+
+    for chunk in pending.split("<recording>")[1:]:
+        def tag(t: str) -> str:
+            return chunk.split(f"<{t}>")[1].split(f"</{t}>")[0] if f"<{t}>" in chunk else ""
+        try:
+            start = datetime.fromtimestamp(int(tag("start_time")), tz=LOCAL)
+        except (ValueError, IndexError):
+            continue
+        if now <= start < until:
+            reasons.append(f"NextPVR: '{tag('name')}' starts {start:%H:%M}")
+    return reasons, []
+
+
+def jellyfin_blockers(now: datetime, until: datetime) -> tuple[list[str], list[str]]:
+    try:
+        timers = json.loads(pct("cat", JELLYFIN_TIMERS))
+    except Exception as exc:                              # noqa: BLE001
+        return [], [f"Jellyfin: could not read timers ({exc})"]
+
+    reasons: list[str] = []
+    for t in timers:
+        if t.get("Status") in JF_DONE:
+            continue
+        try:
+            start = datetime.fromisoformat(
+                t["StartDate"].replace("Z", "+00:00")).astimezone(LOCAL)
+            end = datetime.fromisoformat(
+                t["EndDate"].replace("Z", "+00:00")).astimezone(LOCAL)
+        except (KeyError, ValueError):
+            continue
+        start -= timedelta(seconds=t.get("PrePaddingSeconds") or 0)
+        end += timedelta(seconds=t.get("PostPaddingSeconds") or 0)
+        name = t.get("Name", "recording")
+        if start <= now <= end:
+            reasons.append(f"Jellyfin: '{name}' is recording now")
+        elif now < start < until:
+            reasons.append(f"Jellyfin: '{name}' starts {start:%H:%M}")
+    return reasons, []
+
+
+def notify(subject: str, body: list[str]) -> None:
+    subprocess.run(["mail", "-s", subject, MAILTO],
+                   input="\n".join(body), text=True, check=False)
+
+
+def main() -> int:
+    dry = "--dry-run" in sys.argv
+    now = datetime.now(LOCAL)
+    until = next_power_on(now)
+
+    # Manual override from the dashboard wins over everything below.
+    try:
+        until = datetime.fromisoformat(OVERRIDE.read_text().strip())
+        if until > now:
+            print(f"override active until {until:%a %H:%M} -- staying up")
+            return 0
+    except (OSError, ValueError):
+        pass
+
+    reasons, problems = [], []
+    for fn in (nextpvr_blockers, jellyfin_blockers):
+        r, p = fn(now, until)
+        reasons += r
+        problems += p
+
+    # Failing safe means staying up: a box left running costs one unclean cut,
+    # a box shut down over a recording we could not see costs the recording.
+    if problems:
+        reasons += [f"could not verify -- {p}" for p in problems]
+
+    if reasons:
+        print(f"staying up: {len(reasons)} reason(s)")
+        for r in reasons:
+            print(f"  {r}")
+        if not dry:
+            notify("DVR: clean shutdown skipped, recording due", [
+                f"Host stayed up at {now:%H:%M} instead of shutting down.", "",
+                *[f"  {r}" for r in reasons], "",
+                "IMPORTANT: this does not hold the mains timer open.",
+                "If the timer is still armed it cuts power at ~22:24 and the",
+                "recording dies with it. Switch the timer off to record.", ""])
+        return 0
+
+    print(f"nothing scheduled before {until:%a %H:%M} -- shutting down cleanly")
+    if dry:
+        print("(dry run, not shutting down)")
+        return 0
+    subprocess.run(["/usr/sbin/shutdown", "-h", "+2",
+                    "Clean shutdown ahead of the mains timer"], check=False)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
