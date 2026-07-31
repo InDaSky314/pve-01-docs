@@ -272,6 +272,11 @@ background:var(--card);color:var(--dim);font:inherit;font-size:.82rem;font-weigh
 font-weight:700;margin:16px 0 4px;padding-top:8px;border-top:2px solid var(--line)}
 .month:first-child{margin-top:0;border-top:0;padding-top:0}
 .legend{font-size:.75rem;color:var(--dim);display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}
+button.danger{background:transparent;border-color:var(--live);color:var(--live)}
+button.danger.armed{background:var(--live);border-color:var(--live);color:#fff}
+.danger-note{font-size:.8rem;color:var(--warn);background:var(--warnbg);
+border-radius:8px;padding:10px 12px;margin-top:10px;display:none}
+.danger-note.show{display:block}
 </style></head><body>
 <h1>Media-Core DVR</h1>
 <div class="sub" id="sub">loading…</div>
@@ -292,6 +297,8 @@ font-weight:700;margin:16px 0 4px;padding-top:8px;border-top:2px solid var(--lin
     <div class="note"><b>This does not hold the wall timer open.</b>
     It only stops the server shutting itself down. If the physical timer is
     still armed, power is cut anyway — switch it off too.</div>
+    <div class="btns"><button class="act danger" id="sd" onclick="sd()">Shut down now</button></div>
+    <div class="danger-note" id="sdnote"></div>
   </div>
   <div class="card"><h2>Scheduled recordings</h2><div id="recs"></div></div>
   <div class="card"><h2>Next 10 days</h2><div id="games"></div></div>
@@ -313,7 +320,7 @@ const fD=s=>new Date(s).toLocaleString([],{weekday:'short',day:'numeric',month:'
   hour:'2-digit',minute:'2-digit'});
 const fT=s=>new Date(s).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
 const esc=s=>String(s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
-let TEAM='All', SCHED=null;
+let TEAM='All', SCHED=null, PON=null;
 
 function pills(g){let h='';
   if(g.recording)h+=`<span class="pill rec" title="${esc(g.recording)}">recording</span>`;
@@ -337,6 +344,7 @@ function tab(w){
 async function load(){
   let d;try{d=await (await fetch('/api/status')).json()}catch(e){
     document.getElementById('sub').textContent='cannot reach server';return}
+  PON=d.powerOn; SD=d.shutdownAt;
   document.getElementById('sub').textContent=
     `Power on ${d.powerOn} · off ${d.powerOff} · auto-shutdown ${d.shutdownAt}`;
   const dot=document.getElementById('dot');
@@ -384,9 +392,47 @@ function render(){
   document.getElementById('sched').innerHTML=html;
 }
 async function ov(h){
-  await fetch('/api/override',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({hours:h})});
+  const r=await fetch('/api/override',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({hours:h})});
+  const j=await r.json().catch(()=>({}));
+  if(j.rechecked){
+    note('Override cancelled. It is past '+(SD||'the shutdown time')+
+      ', so the nightly check ran again — the server will shut down shortly '+
+      'unless a recording is due.',true);
+  }
   load();
+}
+let armed=false, SD=null;
+function note(t,show){const n=document.getElementById('sdnote');
+  n.innerHTML=t;n.classList.toggle('show',!!show)}
+function disarm(){armed=false;const b=document.getElementById('sd');
+  b.classList.remove('armed');b.textContent='Shut down now';note('',false)}
+async function sd(force){
+  const b=document.getElementById('sd');
+  if(!armed&&!force){
+    armed=true;b.classList.add('armed');b.textContent='Tap again to confirm';
+    note('<b>The server will power off.</b> It comes back on its own only when '+
+      'the wall timer next restores power (about '+(PON||'04:57')+'). '+
+      'If you have switched the timer to always-on, you will have to press the '+
+      'power button by hand. Streaming, recordings and this page all stop.',true);
+    setTimeout(()=>{if(armed)disarm()},15000);
+    return;
+  }
+  const r=await fetch('/api/shutdown',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({force:!!force})});
+  if(r.status===409){
+    const j=await r.json();
+    const bits=[...(j.live||[]).map(n=>'<b>recording now:</b> '+esc(n)),
+                ...(j.soon||[]).map(n=>'<b>starts soon:</b> '+esc(n)),
+                ...(j.problems||[])];
+    note('Not shutting down — '+bits.join('; ')+
+      '. <button class="act danger" style="margin-top:8px" onclick="sd(true)">'+
+      'Shut down anyway</button>',true);
+    b.classList.remove('armed');b.textContent='Shut down now';armed=false;
+    return;
+  }
+  note('Shutting down in about a minute. This page will stop responding.',true);
+  b.disabled=true;b.textContent='Shutting down…';
 }
 load();setInterval(load,60000);
 </script></body></html>"""
@@ -424,21 +470,61 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, b"not found", "text/plain")
 
+    def _body(self) -> dict:
+        n = int(self.headers.get("Content-Length") or 0)
+        return json.loads(self.rfile.read(n) or b"{}")
+
     def do_POST(self):
-        if self.path != "/api/override":
-            return self._send(404, b"not found", "text/plain")
+        if self.path == "/api/override":
+            return self._override()
+        if self.path == "/api/shutdown":
+            return self._shutdown()
+        self._send(404, b"not found", "text/plain")
+
+    def _override(self):
         try:
-            n = int(self.headers.get("Content-Length") or 0)
-            hours = float(json.loads(self.rfile.read(n) or b"{}").get("hours", 0))
+            hours = float(self._body().get("hours", 0))
         except (ValueError, TypeError):
             return self._send(400, b'{"error":"bad request"}', "application/json")
         OVERRIDE.parent.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(LOCAL)
         if hours > 0:
-            OVERRIDE.write_text(
-                (datetime.now(LOCAL) + timedelta(hours=min(hours, 24))).isoformat())
-        else:
-            OVERRIDE.unlink(missing_ok=True)
-        self._send(200, json.dumps({"ok": True}).encode(), "application/json")
+            OVERRIDE.write_text((now + timedelta(hours=min(hours, 24))).isoformat())
+            return self._send(200, json.dumps({"ok": True}).encode(),
+                              "application/json")
+
+        OVERRIDE.unlink(missing_ok=True)
+        # Cancelling after the nightly check has already run would otherwise do
+        # nothing until tomorrow -- the timer fired hours ago. Re-run the guard
+        # so "cancel" means what it looks like it means.
+        rechecked = False
+        if now.time() >= SHUTDOWN_AT:
+            subprocess.Popen(["/usr/local/bin/dvr-clean-shutdown"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            rechecked = True
+        self._send(200, json.dumps({"ok": True, "rechecked": rechecked}).encode(),
+                   "application/json")
+
+    def _shutdown(self):
+        force = bool(self._body().get("force"))
+        now = datetime.now(LOCAL)
+        recs, problems = recordings(now)
+        live = [r["name"] for r in recs
+                if datetime.fromisoformat(r["start"]) <= now
+                <= datetime.fromisoformat(r["end"])]
+        soon = [r["name"] for r in recs
+                if now < datetime.fromisoformat(r["start"])
+                < now + timedelta(hours=2)]
+        if (live or soon or problems) and not force:
+            return self._send(409, json.dumps({
+                "ok": False, "live": live, "soon": soon,
+                "problems": problems}).encode(), "application/json")
+        OVERRIDE.unlink(missing_ok=True)
+        subprocess.Popen(["/usr/sbin/shutdown", "-h", "+1",
+                          "Shutdown requested from the DVR dashboard"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._send(200, json.dumps({"ok": True, "when": "+1 minute"}).encode(),
+                   "application/json")
 
 
 if __name__ == "__main__":

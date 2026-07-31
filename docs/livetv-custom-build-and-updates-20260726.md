@@ -1175,8 +1175,30 @@ The page states plainly that the button **does not hold the mains timer
 open** — that is a physical switch. Without saying so the control implies a
 power it does not have.
 
+**Schedules tab.** Full season per team (ESPN, cached 6 h), grouped by
+month with a team filter; past games dim and carry the score. Each game
+shows whether a DVR timer overlaps its slot. **The match is time-overlap
+only** and the pill carries the recording's name: neither DVR records "the
+Packers game", it records a channel for a span, so the honest thing is to
+report the overlap rather than assert coverage. Name-matching would produce
+confident wrong answers.
+
+**Shut down now** (`POST /api/shutdown`) is two-step: the first tap arms
+and explains, the second acts, and it disarms itself after 15 s. It returns
+**409** if a recording is live or starts within 2 h, or if a DVR could not
+be reached, naming what it found and offering an explicit override. The
+warning is precise about recovery: the box returns on its own only when the
+wall timer next restores power (~04:57) — if the timer has been switched to
+always-on, it must be powered on by hand.
+
+**Cancelling an override after 22:10 re-runs the guard.** Otherwise
+"cancel" would do nothing until the following night, since the timer fired
+hours earlier. The response carries `rechecked: true` and the page says so.
+
 No authentication: LAN and tailnet only, and the worst an unauthorised
-press can do is leave the server switched on.
+press can do is leave the server switched on — though note the shutdown
+button raises the stakes slightly, so this is the point at which basic auth
+starts to be worth adding.
 
 **Everything now lives in `scripts/` in this repo** — the four scripts,
 their unit files, and every timer drop-in for both host and CT105. Before
