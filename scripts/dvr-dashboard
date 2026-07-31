@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""Small dashboard: upcoming games, scheduled recordings, and a keep-awake override.
+
+Serves one responsive page plus a JSON API on the LAN and over Tailscale.
+Stdlib only -- no web framework, no build step, nothing to keep updated.
+
+  GET  /              the page
+  GET  /api/status    everything the page renders
+  POST /api/override  {"hours": N}  keep the host up; N<=0 clears
+
+The override writes a timestamp that dvr-clean-shutdown reads, so pressing
+the button stops tonight's automatic shutdown. It does NOT hold the mains
+timer open -- that is a physical switch and the page says so.
+
+Docs: /root/pve-01-docs/docs/livetv-custom-build-and-updates-20260726.md
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import threading
+import urllib.request
+from datetime import datetime, timedelta, time as dtime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+LOCAL = ZoneInfo("Europe/Berlin")
+PORT = 8099
+POWER_ON, POWER_OFF = dtime(4, 57), dtime(22, 24)
+SHUTDOWN_AT = dtime(22, 10)
+
+OVERRIDE = Path("/var/lib/dvr-dashboard/override-until")
+CT = "105"
+NEXTPVR = "http://localhost:8866/service"
+JELLYFIN_TIMERS = "/srv/media-core/jellyfin/config/data/livetv/timers.json"
+JF_DONE = {"Completed", "Cancelled", "Error"}
+
+LOOKAHEAD_DAYS = 10
+DURATION = {"football": timedelta(hours=3, minutes=45),
+            "basketball": timedelta(hours=2, minutes=45)}
+TEAMS = [
+    ("Packers",          "football/nfl",                       "gb"),
+    ("Badgers Football", "football/college-football",          "275"),
+    ("Badgers Basketball", "basketball/mens-college-basketball", "275"),
+    ("Bucks",            "basketball/nba",                     "mil"),
+]
+
+_cache: dict = {"at": None, "games": []}
+_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------- helpers
+def pct(*args: str, timeout: int = 25) -> str:
+    return subprocess.run(["/usr/sbin/pct", "exec", CT, "--", *args],
+                          capture_output=True, text=True,
+                          timeout=timeout, check=True).stdout
+
+
+def outside_window(start: datetime, end: datetime) -> bool:
+    cur = start
+    while cur <= end:
+        if not (POWER_ON <= cur.time() <= POWER_OFF):
+            return True
+        cur += timedelta(minutes=15)
+    return not (POWER_ON <= end.time() <= POWER_OFF)
+
+
+def override_until() -> datetime | None:
+    try:
+        ts = datetime.fromisoformat(OVERRIDE.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return ts if ts > datetime.now(LOCAL) else None
+
+
+# ---------------------------------------------------------------- sources
+def games(now: datetime) -> list[dict]:
+    """ESPN schedules, cached 30 min so page loads do not hammer the API."""
+    with _lock:
+        fresh = _cache["at"] and (now - _cache["at"]) < timedelta(minutes=30)
+        if fresh:
+            return _cache["games"]
+
+    out: list[dict] = []
+    horizon = now + timedelta(days=LOOKAHEAD_DAYS)
+    for label, sport, team in TEAMS:
+        try:
+            req = urllib.request.Request(
+                f"https://site.api.espn.com/apis/site/v2/sports/{sport}"
+                f"/teams/{team}/schedule",
+                headers={"User-Agent": "dvr-dashboard/1.0"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.load(r)
+        except Exception:                                  # noqa: BLE001
+            continue
+        kind = "football" if "football" in sport else "basketball"
+        for ev in data.get("events", []):
+            try:
+                start = datetime.fromisoformat(
+                    ev["date"].replace("Z", "+00:00")).astimezone(LOCAL)
+            except (KeyError, ValueError):
+                continue
+            if not (now <= start <= horizon):
+                continue
+            end = start + DURATION[kind]
+            out.append({"team": label,
+                        "name": ev.get("shortName") or ev.get("name") or "game",
+                        "start": start.isoformat(), "end": end.isoformat(),
+                        "needsPower": outside_window(start, end)})
+    out.sort(key=lambda g: g["start"])
+    with _lock:
+        _cache.update(at=now, games=out)
+    return out
+
+
+def recordings(now: datetime) -> tuple[list[dict], list[str]]:
+    items, problems = [], []
+
+    try:
+        init = pct("curl", "-s", "--max-time", "10",
+                   f"{NEXTPVR}?method=session.initiate&ver=1.0&device=dashboard")
+        sid = init.split("<sid>")[1].split("</sid>")[0]
+        salt = init.split("<salt>")[1].split("</salt>")[0]
+        h = hashlib.md5(f":{hashlib.md5(b'0000').hexdigest()}:{salt}".encode()).hexdigest()
+        pct("curl", "-s", "--max-time", "10",
+            f"{NEXTPVR}?method=session.login&md5={h}&sid={sid}")
+        for f in ("inprogress", "pending"):
+            xml = pct("curl", "-s", "--max-time", "10",
+                      f"{NEXTPVR}?method=recording.list&filter={f}&sid={sid}")
+            for chunk in xml.split("<recording>")[1:]:
+                def tag(t: str) -> str:
+                    return (chunk.split(f"<{t}>")[1].split(f"</{t}>")[0]
+                            if f"<{t}>" in chunk else "")
+                try:
+                    start = datetime.fromtimestamp(int(tag("start_time")), tz=LOCAL)
+                    end = start + timedelta(seconds=int(tag("duration") or 0))
+                except (ValueError, IndexError):
+                    continue
+                items.append({"source": "NextPVR", "name": tag("name") or "recording",
+                              "start": start.isoformat(), "end": end.isoformat(),
+                              "live": f == "inprogress",
+                              "needsPower": outside_window(start, end)})
+    except Exception as exc:                               # noqa: BLE001
+        problems.append(f"NextPVR unreachable ({type(exc).__name__})")
+
+    try:
+        for t in json.loads(pct("cat", JELLYFIN_TIMERS)):
+            if t.get("Status") in JF_DONE:
+                continue
+            start = datetime.fromisoformat(
+                t["StartDate"].replace("Z", "+00:00")).astimezone(LOCAL)
+            end = datetime.fromisoformat(
+                t["EndDate"].replace("Z", "+00:00")).astimezone(LOCAL)
+            start -= timedelta(seconds=t.get("PrePaddingSeconds") or 0)
+            end += timedelta(seconds=t.get("PostPaddingSeconds") or 0)
+            if end < now:
+                continue
+            items.append({"source": "Jellyfin", "name": t.get("Name", "recording"),
+                          "start": start.isoformat(), "end": end.isoformat(),
+                          "live": start <= now <= end,
+                          "needsPower": outside_window(start, end)})
+    except Exception as exc:                               # noqa: BLE001
+        problems.append(f"Jellyfin timers unreadable ({type(exc).__name__})")
+
+    items.sort(key=lambda r: r["start"])
+    return items, problems
+
+
+def status() -> dict:
+    now = datetime.now(LOCAL)
+    recs, problems = recordings(now)
+    ov = override_until()
+    return {
+        "now": now.isoformat(),
+        "powerOn": POWER_ON.strftime("%H:%M"),
+        "powerOff": POWER_OFF.strftime("%H:%M"),
+        "shutdownAt": SHUTDOWN_AT.strftime("%H:%M"),
+        "override": ov.isoformat() if ov else None,
+        "games": games(now),
+        "recordings": recs,
+        "problems": problems,
+    }
+
+
+# ---------------------------------------------------------------- http
+PAGE = r"""<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark"><title>Media-Core DVR</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--fg:#16181d;--dim:#666e7a;--line:#e3e6ea;
+--accent:#2f6fdd;--warn:#b3541e;--warnbg:#fff3e8;--ok:#1a7f4b;--okbg:#e9f7ef;--live:#c0392b}
+@media(prefers-color-scheme:dark){:root{--bg:#101216;--card:#181b21;--fg:#e8eaed;
+--dim:#98a0ad;--line:#262a32;--accent:#5b9bff;--warn:#e08a4a;--warnbg:#2a1e14;
+--ok:#4ec98a;--okbg:#12241a;--live:#ff6b5e}}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);
+font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+max-width:760px;margin-inline:auto}
+h1{font-size:1.3rem;margin:0 0 2px}
+.sub{color:var(--dim);font-size:.85rem;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+padding:14px 16px;margin-bottom:14px}
+h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);
+margin:0 0 10px;font-weight:600}
+.row{display:flex;gap:12px;padding:9px 0;border-top:1px solid var(--line);align-items:baseline}
+.row:first-of-type{border-top:0}
+.when{flex:0 0 8.5em;font-variant-numeric:tabular-nums;font-size:.9rem}
+.what{flex:1;min-width:0}
+.what b{font-weight:600}
+.tag{font-size:.72rem;color:var(--dim);display:block}
+.pill{font-size:.7rem;padding:2px 8px;border-radius:99px;white-space:nowrap;font-weight:600}
+.pill.warn{background:var(--warnbg);color:var(--warn)}
+.pill.live{background:var(--live);color:#fff}
+.status{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.dot{width:10px;height:10px;border-radius:50%;flex:0 0 auto}
+.big{font-size:1.05rem;font-weight:600}
+button{font:inherit;font-weight:600;padding:11px 16px;border-radius:10px;
+border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer;
+flex:1 1 auto;min-height:44px}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button:active{transform:translateY(1px)}
+.btns{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.note{font-size:.8rem;color:var(--dim);margin-top:10px}
+.empty{color:var(--dim);font-size:.9rem;padding:6px 0}
+.err{background:var(--warnbg);color:var(--warn);border-radius:8px;padding:8px 10px;
+font-size:.82rem;margin-bottom:10px}
+</style></head><body>
+<h1>Media-Core DVR</h1>
+<div class="sub" id="sub">loading…</div>
+<div class="card">
+  <h2>Server power</h2>
+  <div class="status"><span class="dot" id="dot"></span><span class="big" id="pstate">…</span></div>
+  <div class="note" id="pnote"></div>
+  <div class="btns">
+    <button class="primary" onclick="ov(12)">Keep awake tonight</button>
+    <button onclick="ov(0)">Cancel override</button>
+  </div>
+  <div class="note"><b>This does not hold the wall timer open.</b>
+  It only stops the server shutting itself down. If the physical timer is still
+  armed, power is cut anyway — switch it off too.</div>
+</div>
+<div class="card"><h2>Scheduled recordings</h2><div id="recs"></div></div>
+<div class="card"><h2>Upcoming games</h2><div id="games"></div></div>
+<script>
+const f=s=>{const d=new Date(s);return d.toLocaleString([], {weekday:'short',day:'numeric',
+month:'short',hour:'2-digit',minute:'2-digit'})};
+const ft=s=>new Date(s).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+function row(when,end,title,tag,pills){
+  return `<div class="row"><div class="when">${f(when)}<br><span class="tag">to ${ft(end)}</span></div>
+  <div class="what"><b>${title}</b><span class="tag">${tag}</span></div>
+  <div>${pills}</div></div>`}
+async function load(){
+  let d;
+  try{d=await (await fetch('/api/status')).json()}catch(e){
+    document.getElementById('sub').textContent='cannot reach server';return}
+  document.getElementById('sub').textContent=
+    `Power on ${d.powerOn} · off ${d.powerOff} · auto-shutdown ${d.shutdownAt}`;
+  const dot=document.getElementById('dot');
+  if(d.override){dot.style.background='var(--ok)';
+    document.getElementById('pstate').textContent='Staying awake';
+    document.getElementById('pnote').textContent='Override until '+f(d.override)+
+      '. The server will not shut itself down before then.'}
+  else{dot.style.background='var(--accent)';
+    document.getElementById('pstate').textContent='Normal schedule';
+    document.getElementById('pnote').textContent=
+      'Shuts down at '+d.shutdownAt+' unless a recording is due.'}
+  const rr=document.getElementById('recs');
+  rr.innerHTML=(d.problems||[]).map(p=>`<div class="err">${p}</div>`).join('')+
+    (d.recordings.length?d.recordings.map(r=>row(r.start,r.end,r.name,r.source,
+      (r.live?'<span class="pill live">RECORDING</span> ':'')+
+      (r.needsPower?'<span class="pill warn">needs power</span>':''))).join('')
+     :'<div class="empty">Nothing scheduled.</div>');
+  const gg=document.getElementById('games');
+  gg.innerHTML=d.games.length?d.games.map(g=>row(g.start,g.end,g.name,g.team,
+    g.needsPower?'<span class="pill warn">outside power window</span>':'')).join('')
+    :'<div class="empty">No games in the next 10 days.</div>';
+}
+async function ov(h){
+  await fetch('/api/override',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({hours:h})});
+  load();
+}
+load();setInterval(load,60000);
+</script></body></html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):                             # quiet
+        pass
+
+    def _send(self, code: int, body: bytes, ctype: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path.startswith("/api/status"):
+            try:
+                body = json.dumps(status()).encode()
+            except Exception as exc:                       # noqa: BLE001
+                body = json.dumps({"problems": [str(exc)], "games": [],
+                                   "recordings": []}).encode()
+            self._send(200, body, "application/json")
+        elif self.path in ("/", "/index.html"):
+            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+        else:
+            self._send(404, b"not found", "text/plain")
+
+    def do_POST(self):
+        if self.path != "/api/override":
+            return self._send(404, b"not found", "text/plain")
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            hours = float(json.loads(self.rfile.read(n) or b"{}").get("hours", 0))
+        except (ValueError, TypeError):
+            return self._send(400, b'{"error":"bad request"}', "application/json")
+        OVERRIDE.parent.mkdir(parents=True, exist_ok=True)
+        if hours > 0:
+            until = datetime.now(LOCAL) + timedelta(hours=min(hours, 24))
+            OVERRIDE.write_text(until.isoformat())
+        else:
+            OVERRIDE.unlink(missing_ok=True)
+        self._send(200, json.dumps({"ok": True}).encode(), "application/json")
+
+
+if __name__ == "__main__":
+    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

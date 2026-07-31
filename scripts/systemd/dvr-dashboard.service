@@ -1,0 +1,16 @@
+[Unit]
+Description=Media-Core DVR dashboard (upcoming games, recordings, keep-awake override)
+Documentation=file:///root/pve-01-docs/docs/livetv-custom-build-and-updates-20260726.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dvr-dashboard
+Restart=on-failure
+RestartSec=10
+# Needs root for `pct exec` into CT105; no ports below 1024 are used.
+StateDirectory=dvr-dashboard
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,55 @@
+#!/bin/bash
+# Keep an adb connection to the Chromecast alive across reboots and
+# wireless-debugging toggles.
+#
+# Android 11+ rotates the wireless-debugging connect port every time it is
+# toggled or the device reboots, which is why hardcoding a port fails. But the
+# device advertises its current port over mDNS (_adb-tls-connect._tcp), and our
+# pairing key persists in the device's /data/misc/adb/adb_keys, so rediscovery
+# is all that is needed -- no re-pairing, nobody at the TV.
+#
+# `adb mdns services` does not see the advertisement on this host (adb's
+# built-in openscreen backend), so we use avahi, which does.
+#
+# Docs: docs/livetv-custom-build-and-updates-20260726.md
+set -uo pipefail
+
+# Match the device by its mDNS service name (derived from the device serial, so
+# it is stable across DHCP changes). IP is the fallback if the name ever changes.
+DEVICE_NAME="${DEVICE_NAME:-adb-19171HFDD3PMZQ-N6YQJU}"
+DEVICE_IP="${DEVICE_IP:-192.168.9.203}"
+BROWSE_TIMEOUT=10
+
+log() { echo "$(date '+%F %T') $*"; }
+
+# Already connected and healthy? Nothing to do.
+if adb devices | grep -qE "^${DEVICE_IP}:[0-9]+[[:space:]]+device$"; then
+    exit 0
+fi
+
+# Drop any stale offline/unauthorized entries so they do not accumulate.
+adb devices | grep -E "^${DEVICE_IP}:[0-9]+" | awk '{print $1}' | while read -r stale; do
+    log "disconnecting stale $stale"
+    adb disconnect "$stale" >/dev/null 2>&1
+done
+
+# Ask mDNS where the device is listening right now.
+endpoint=$(timeout "$BROWSE_TIMEOUT" avahi-browse -rpt _adb-tls-connect._tcp 2>/dev/null \
+    | awk -F';' -v name="$DEVICE_NAME" -v ip="$DEVICE_IP" '
+        $1 == "=" && $3 == "IPv4" && ($4 == name || $8 == ip) { print $8 ":" $9; exit }')
+
+if [ -z "$endpoint" ]; then
+    # Not an error: the TV shares the household power timer, so it is simply
+    # off for a large part of the day. Exiting non-zero here would mark the
+    # unit failed every night and bury a real failure in the noise.
+    log "device not advertising _adb-tls-connect._tcp -- TV off, asleep, or wireless debugging disabled"
+    exit 0
+fi
+
+if adb connect "$endpoint" 2>&1 | grep -q '^connected to'; then
+    log "connected to $endpoint"
+    exit 0
+fi
+
+log "failed to connect to $endpoint (pairing may have been revoked -- re-pair from the TV)"
+exit 1

@@ -1,0 +1,9 @@
+[Unit]
+Description=Email a reminder when sport or recordings fall outside the power-timer window
+Documentation=file:///root/pve-01-docs/docs/livetv-custom-build-and-updates-20260726.md
+After=network-online.target postfix.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dvr-power-reminder

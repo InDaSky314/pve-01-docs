@@ -1,0 +1,12 @@
+[Unit]
+Description=Nightly clean-shutdown check before the mains cut
+
+[Timer]
+OnCalendar=*-*-* 22:10
+# Deliberately NOT Persistent: a missed run must never fire a shutdown at
+# some arbitrary later time, e.g. just after a morning boot.
+Persistent=false
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

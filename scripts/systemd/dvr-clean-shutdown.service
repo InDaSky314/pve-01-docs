@@ -1,0 +1,8 @@
+[Unit]
+Description=Clean shutdown ahead of the mains timer, unless a recording is due
+Documentation=file:///root/pve-01-docs/docs/livetv-custom-build-and-updates-20260726.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dvr-clean-shutdown

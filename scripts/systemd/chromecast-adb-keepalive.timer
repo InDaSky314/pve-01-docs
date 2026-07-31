@@ -1,0 +1,10 @@
+[Unit]
+Description=Reconnect adb to the Chromecast if the link has dropped
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

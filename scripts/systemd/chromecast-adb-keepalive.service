@@ -1,0 +1,9 @@
+[Unit]
+Description=Keep an adb connection to the Chromecast alive
+Documentation=file:///root/pve-01-docs/docs/livetv-custom-build-and-updates-20260726.md
+After=network-online.target avahi-daemon.service
+Wants=avahi-daemon.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/chromecast-adb-keepalive

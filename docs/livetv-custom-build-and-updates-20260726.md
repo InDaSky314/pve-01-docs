@@ -24,7 +24,7 @@ recordings can be deleted from the TV.
 | §14 | still accurate; Bug 2 is still live on Jellyfin 10.11.9 |
 | §15, §16 | **the recordings hypothesis in these sections is disproved** — see §17.1 |
 | §16 ADB note | **wrong** — see §17.6, rediscovery is trivial and now automated |
-| §17 | current: four new bugs, the NextPVR guide chain, the noon schedule |
+| §17 | current: four new bugs, the NextPVR guide chain, the noon schedule, power management |
 
 ---
 
@@ -1024,17 +1024,111 @@ Jellyfin `config/config/ScheduledTasks/<id>.js` `TimeOfDayTicks`
 (ticks = seconds since midnight x 10,000,000; needs Jellyfin stopped).
 Backups alongside each as `.bak-sched-*`.
 
-**Still overnight, not yet moved** (need the power-on window):
-`media-core-config-backup` 03:30, `pve-daily-update` 04:59,
-`router-backup` Sun 03:30, `vzdump` Sun 02:00, `xfs_scrub_all` Sun 03:10.
+Host-side jobs were moved too, once the power window was known
+(**on ~04:57, off ~22:24**):
 
-**Unclean shutdown risk.** If the timer cuts mains power rather than
-triggering a clean shutdown, that is an unclean poweroff of a Proxmox
-host every day. Usually survivable, eventually not. Shutting the box down
-cleanly a few minutes before the cut is worth more than any of the
-scheduling above.
+| Time | Job | Was |
+|---|---|---|
+| 13:30 | `media-core-config-backup` | 03:30 |
+| 14:00 | `pve-daily-update` | 04:59 |
+| Sun 09:00 | `router-backup` | Sun 03:30 |
+| Sun 09:30 | `vzdump` (CT105 + VM102, via `pvesh`, not a jobs.cfg edit) | Sun 02:00 |
+| Sun 11:00 | `xfs_scrub_all` | Sun 03:10 |
 
-### 17.9 Method notes worth keeping
+Sunday timings are not arbitrary: 07:00 local is 01:00 ET, which can still
+be inside a late Saturday college game on nights the mains timer is
+overridden. Everything heavy now starts after 08:30.
+
+**Why noon is the right slot, having checked.** 12:00 CET = 06:00 ET, the
+only dead zone in the US sporting day. Early morning is worse, not better
+— that is when overnight games *end* (an SNF recording runs to ~06:05
+CET), so maintenance there would collide precisely on the nights the timer
+was overridden. Evening is worse still: 19:00 CET is the early Sunday NFL
+slate.
+
+`logrotate` (00:00) still falls in the gap. It is `Persistent=yes` so it
+catches up at boot; left alone rather than churn a stock Debian unit.
+
+### 17.9 Power management: BIOS, the reminder, the shutdown guard
+
+**BIOS is set to "Power On" — verified, not assumed (2026-07-31).**
+
+This mattered and was nearly missed. Every prior boot followed an
+*unclean* mains cut, where the last power state was "on" — so **Power On**
+and **Last State** both restart the machine and the logs cannot tell them
+apart. The test that distinguishes them is a *clean* shutdown, which
+leaves the last state "off":
+
+```
+20:17:44  systemd-shutdown: Syncing filesystems … Journal stopped   (clean)
+20:21:02  kernel start                                             (unattended)
+```
+
+Under *Last State* it would have stayed dark. It did not. **Do not infer
+AC-restore behaviour from recovery after an unclean cut.**
+
+There is no remote path to the BIOS on this board: no BMC (`dmidecode`
+type 38 empty), no `/dev/ipmi0`, all DMI fields read `Default string`.
+`OsIndicationsSupported = 0x03` (bit 0 set), so
+`systemctl reboot --firmware-setup` does boot straight into setup — but a
+monitor is still needed to see it. A KVM-over-IP dongle is the durable fix
+if this comes up again.
+
+**The router shares the same timer.** This is the right way round and
+worth preserving: streams come from the provider over the internet through
+the router's VPN, so server-on + router-off records nothing. One timer
+means overriding it covers both. Verified across a full power cycle — both
+tunnels (`wgclient1`, `ovpnclient1`) re-established unaided, Tailscale
+reconnected, clock synced 60 s in to a 1 ms offset. Consequence: **no
+remote access at all between 22:24 and 04:57**, since Tailscale dies with
+the router.
+
+**`/usr/local/bin/dvr-power-reminder`** (timer 09:00 daily,
+`Persistent=true`). Mails when something worth recording falls in the
+power-off gap; silent otherwise, so a mail means something. Sources:
+ESPN's public site API (no key) for Packers, Badgers football, Badgers
+basketball, Bucks; NextPVR `recording.list`; Jellyfin
+`data/livetv/timers.json` read straight off disk via `pct exec`, so there
+is no API key to store. 48-hour lookahead. Timezone conversion is real
+(`zoneinfo`), not a fixed offset — verified against the late-Oct/early-Nov
+week where the US has not yet fallen back and the gap is 5 hours, not 6.
+
+**`/usr/local/bin/dvr-clean-shutdown`** (timer 22:10, deliberately
+**not** `Persistent`, so a missed run can never fire a shutdown at an
+arbitrary later time such as just after a morning boot). Checks both DVRs
+for a recording in progress or starting before 04:57. Nothing due → clean
+`shutdown -h +2`. Something due → stays up and mails. **If it cannot reach
+a DVR it treats that as a reason to stay up**: a box left running costs one
+unclean cut, a box shut down over an unseen recording costs the recording.
+
+Two things it deliberately does not do: it **cannot hold the mains timer
+open** (if a recording is due and the physical timer is still armed, power
+dies at 22:24 regardless — the 09:00 mail is the real mechanism), and it
+does not protect **active playback**, only recordings.
+
+**Which slot the sport actually fits.** Against 04:57–22:24, with
+ET = CET+6:
+
+| NFL slot | ET | CET | Fits? |
+|---|---|---|---|
+| International | 9:30 AM | 15:30 | yes |
+| Early Sunday slate | 1:00 PM | 19:00 | **no** — runs to ~22:45 |
+| Late Sunday slate | 4:05/4:25 PM | 22:05/22:25 | no |
+| TNF / SNF / MNF | 8:15/8:20 PM | 02:15/02:20 | no |
+
+NBA is worse: typical tip-offs 7:00–10:30 PM ET land at 01:00–04:30 CET.
+Only weekend afternoon games fit. A run against real 2026 data flagged
+**17 games** in the season needing the timer left on. There is no timer
+setting that covers US prime time — those games *end* around 05:30–06:00
+CET, after the 04:57 power-on — so the box simply has to stay up.
+
+**Keepalive exit codes.** `chromecast-adb-keepalive` originally exited 1
+when the TV was not advertising over mDNS. The TV shares the power timer,
+so that marked the unit failed every night and would have buried a real
+failure. It now exits 0 for "device absent" and reserves non-zero for
+genuine faults.
+
+### 17.10 Method notes worth keeping
 
 - **Capture before pressing play.** Every diagnosis here came from a
   logcat started beforehand. Two capture windows closed empty because
@@ -1047,7 +1141,7 @@ scheduling above.
 - **Trace settings to their point of use** (§17.2), and **check paths
   with `cat -A`** (§17.5).
 
-### 17.10 Open items
+### 17.11 Open items
 
 1. **Upstream the three client bugs** — §17.3 is the highest value,
    then §17.1, then §17.4. The Wholphin `mediaSourceId` PR
@@ -1062,3 +1156,30 @@ scheduling above.
 5. **Move the remaining overnight jobs** (§17.8).
 6. **Remove `setAllowChunklessPreparation(false)`** — still outstanding
    from §13.
+
+### 17.12 Dashboard and where the automation lives
+
+**`/usr/local/bin/dvr-dashboard`** — one responsive page plus a JSON API,
+stdlib only (no framework, no build step). Reachable on the LAN at
+`http://192.168.9.11:8099/` and over Tailscale at
+`http://100.125.154.95:8099/`.
+
+Shows upcoming games (10-day horizon, ESPN cached 30 min so page loads do
+not hammer the API), scheduled recordings from **both** DVRs with a
+RECORDING badge for anything live, and flags whatever falls outside the
+power window. The **Keep awake tonight** button writes
+`/var/lib/dvr-dashboard/override-until`, which `dvr-clean-shutdown` checks
+before anything else.
+
+The page states plainly that the button **does not hold the mains timer
+open** — that is a physical switch. Without saying so the control implies a
+power it does not have.
+
+No authentication: LAN and tailnet only, and the worst an unauthorised
+press can do is leave the server switched on.
+
+**Everything now lives in `scripts/` in this repo** — the four scripts,
+their unit files, and every timer drop-in for both host and CT105. Before
+this they existed only in `/usr/local/bin` and `/etc/systemd/system`, so a
+dead boot disk would have taken them with it. Copies here are the source of
+truth; re-deploy with `install -m 755 scripts/<name> /usr/local/bin/`.
