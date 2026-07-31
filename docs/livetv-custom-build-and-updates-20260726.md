@@ -1,8 +1,30 @@
 # Live TV: state, custom build, and the update plan
 
-Updated 2026-07-26 midday. Supersedes
-`livetv-audio-rootcause-20260726.md` for *status*; that doc remains the
-reference for the investigation and the ruled-out list.
+Updated **2026-07-31**. Supersedes `livetv-audio-rootcause-20260726.md`
+for *status*; that doc remains the reference for the investigation and
+the ruled-out list.
+
+---
+
+## START HERE — current state (2026-07-31)
+
+This doc grew by accretion and several sections each read as "the
+current state". They are not. Read this section, then §17. Everything
+between is history, useful for *why* but not for *what is true now*.
+
+**Everything works**: recordings play, Live TV plays on both the
+Threadfin and NextPVR copies of ch100/102, both have guide data, and
+recordings can be deleted from the TV.
+
+| Section | Status |
+|---|---|
+| §1–§11 | history — the audio + `NoCompatibleStream` investigation |
+| §12 | **superseded by §13** — do not act on its "safe to drop upstream" advice |
+| §13 | settings still broadly correct, but see §17.2 on Direct play TS |
+| §14 | still accurate; Bug 2 is still live on Jellyfin 10.11.9 |
+| §15, §16 | **the recordings hypothesis in these sections is disproved** — see §17.1 |
+| §16 ADB note | **wrong** — see §17.6, rediscovery is trivial and now automated |
+| §17 | current: four new bugs, the NextPVR guide chain, the noon schedule |
 
 ---
 
@@ -430,6 +452,12 @@ does nothing. Details and the reasoning are in §9.
 
 ## 12. MPV settings archive (upstream build uninstalled 2026-07-29)
 
+> **SUPERSEDED BY §13.** The reasoning below for dropping the upstream
+> build ("ExoPlayer is confirmed working") was drawn from ch100/102
+> only, which are AAC. Our build is strictly *less* capable than
+> upstream for AC3 and AV1. The MPV settings archived here are still
+> accurate and worth keeping; the removal advice is not.
+
 The upstream Wholphin build (`com.github.damontecres.wholphin`) was
 uninstalled to free storage — the Chromecast was at 93% (316 MB free of
 4 GB). These settings took several iterations to arrive at and are
@@ -653,7 +681,13 @@ text. Arguably Jellyfin should trim — an easy, reportable upstream bug.
 
 ---
 
-## 15. OPEN — recordings playback failure (undiagnosed)
+## 15. ~~OPEN~~ RESOLVED — recordings playback failure
+
+> **The hypothesis in this section is disproved.** Recordings were not
+> failing via Bug 2. The cause was a client-side crash in Wholphin's
+> track sorting — `NumberFormatException: "1/257"`. Fixed in `2f38f828`.
+> Full diagnosis in §17.1. The `PlayMethod=DirectPlay` data point below
+> was a coincidence, not evidence. Kept for the record.
 
 Reported 2026-07-29 late: **recordings will not play back**. No evidence
 captured — the logcat capture had ended and the server log window had
@@ -711,6 +745,10 @@ recording. Reproduce and capture before treating it as the same bug.
 
 ### ADB access after a reboot — read this first next time
 
+> **CORRECTED 2026-07-31 — the advice below is wrong.** Port-scanning
+> works fine, and mDNS is better still. Neither needs anyone at the TV.
+> ADB reconnection is now automated. See §17.6.
+
 Wireless debugging does not survive a reboot, and on Android 11+ the
 **connect port rotates every time it is toggled**. Pairing worked
 repeatedly (`adb pair <ip>:<pair-port> <code>` → "Successfully paired")
@@ -734,3 +772,293 @@ with 43 ms mdev — the device was too busy to answer ICMP promptly, i.e.
 CPU/IO starved rather than a network fault. Cause is almost certainly
 background `dexopt` recompiling updated apps, made worse by storage sitting
 at ~85%. It settles on its own in 20-45 minutes; leave it idle.
+
+---
+
+## 17. Four bugs, the NextPVR guide chain, and the noon schedule (2026-07-30/31)
+
+Everything in this section is verified against logs, not inferred.
+Commits `282a4eae`, `2f38f828`, `9cff6a76`, `0e3e89ca` are pushed to
+`nk-sys-ops/wholphin` (`main` and `fix/jellyfin-live-tv-ts-transcode`).
+
+### 17.1 Bug 4 — recordings crashed the app on a TS track id
+
+**This is what §15 was actually about.** Playing any Jellyfin DVR
+recording killed the process:
+
+```
+FATAL EXCEPTION: main
+java.lang.NumberFormatException: For input string: "1/257"
+  at TrackSelectionUtils.sortedById(TrackSelectionUtils.kt:162)
+  at PlaybackViewModel$changeStreams$…onTracksChanged
+  at androidx.media3.exoplayer.ExoPlayerImpl.updatePlaybackInfo
+```
+
+`sortedById` assumed `Format.id` is always Jellyfin's
+`"<source>:<stream>"`. On **direct play of a raw container** the id comes
+from ExoPlayer's own extractor instead: `TsExtractor` emits
+`"<program>/<pid>"`, and `1/257` is program 1, PID 0x101 — a textbook TS
+video PID. `split(":")` yields one element, `toInt()` throws, and because
+this runs on `onTracksChanged` on the main looper it is an uncaught
+exception, so the process dies rather than playback failing.
+
+Fixed in `2f38f828`: accept `:` or `/`, use `toIntOrNull`, pad both sort
+slots. A single-element id would also have thrown
+`IndexOutOfBoundsException` in the comparator — that latent second crash
+is closed too.
+
+**It was never Bug 2.** The media source id was
+`a1a47eb7ba6abff7984f235e124c0fa1` — a well-formed GUID. And there are no
+NextPVR recordings on this system at all, so the plugin path was never
+involved. Both tracks probed fine (H.264 + AAC-LC stereo English); the
+app crashed *after* a correct probe.
+
+Upstream-worthy: this hits any user direct-playing DVR recordings.
+
+### 17.2 Bug 5 — "Direct play TS" was a dead switch
+
+The setting wrote its preference correctly and did nothing. Two separate
+faults, found a day apart:
+
+1. `DeviceProfileService` hardcoded `tsDirectPlay = true` instead of
+   reading the preference — fixed in `2f38f828`.
+2. `createDeviceProfile` **accepted the parameter and never used it**.
+   `tsDirectPlay` appeared only in the signature; line 214 did
+   `containers.add(Codec.Container.TS)` unconditionally — fixed in
+   `0e3e89ca`.
+
+Fixing (1) without (2) is worthless, and cost a diagnostic cycle: the
+toggle was flipped, the profile still advertised `ts`, and the observed
+behaviour contradicted the setting. **If a setting appears inert, trace
+it all the way to its point of use before trusting either half.**
+
+§13's table says Direct play TS = Enabled. That was recorded while the
+switch did nothing, so it describes no real configuration. It is now a
+live setting — see §17.3 for what it actually controls.
+
+### 17.3 Bug 6 — client direct-plays against the server's decision
+
+Jellyfin evaluates the request and returns a `PlayMethod`. Wholphin
+ignores it, reading `MediaSourceInfo.SupportsDirectPlay` — which live-TV
+sources set to `true` unconditionally — instead. Captured on the NextPVR
+ch100 twin:
+
+```
+server 21:20:34  DirectPlay Result: PlayMethod: null,
+                 Reasons: ContainerNotSupported, VideoCodecNotSupported
+server 21:20:34  Transcode Result:  PlayMethod: Transcode  →  master.m3u8
+client 21:20:38  Playback decision for dedb9f8f…: DirectPlay
+```
+
+The client then requests `/Videos/{id}/stream` with `MediaSourceId: "25"`
+— a bare integer — which is exactly the value that trips Bug 2's
+`Guid.Parse`. Result: HTTP 500, and the player hangs on a blank surface
+with no error logged.
+
+Why the server refused DirectPlay is also visible: at decision time the
+probe had not run (`Waiting 3000ms before probing the live stream`), so
+every `MediaStream` had `Codec: null`.
+
+**Not fixed.** The workaround is the now-functional Direct play TS
+toggle: with `ts` absent from the direct-play container list the client's
+own check fails and it uses the transcode URL. Honouring the server's
+`PlayMethod` is the real fix and the best upstream candidate of the
+three — it explains a whole class of live-TV hangs.
+
+### 17.4 Bug 7 — display mode switch destroys the activity
+
+Presented as "it crashed, white screen". **It is not a crash** — zero
+`FATAL EXCEPTION` across 34k log lines. Wholphin requests a display mode
+change to match the stream, Android treats it as a configuration change,
+and `MainActivity` is destroyed and rebuilt "without playback":
+
+```
+21:32:03.486  Found display mode: modeId=17, 1280x720@59.94  | current=3840x…
+21:32:03.490  Switch preferredDisplayModeId to 17
+21:32:04.284  onPause      21:32:04.482  onDestroy
+21:32:04.552  onCreate     21:32:04.574  Restoring back stack without playback
+```
+
+100% correlation across every attempt captured:
+
+| Stream | Mode | Result |
+|---|---|---|
+| NextPVR copy | 17 = 1280x720 **@59.94** | activity destroyed |
+| Threadfin copy | 14 = 1920x1080 @25.0 | `Waiting for non-seamless switch` → plays |
+
+Both twins carry the same upstream stream; they differ only because
+Jellyfin's two paths report different resolution/framerate, and
+720p59.94 is a mode this TV cannot switch to without a teardown. That is
+why it looked channel-specific and sent the diagnosis chasing NextPVR.
+
+**Workaround (applied): Advanced Settings → Playback → disable both
+"Resolution switching" and "Refresh rate switching".** Verified after:
+zero mode switches, zero `onDestroy`, sustained `PLAYING`.
+
+Cost: no refresh-rate matching, so 25 fps content may judder slightly.
+The real fix is client-side — declare the relevant `configChanges` or
+persist playback across recreation.
+
+### 17.5 NextPVR guide data — the full chain
+
+Channels 7148 (ch100) / 7149 (ch102) had no guide, so nothing could be
+recorded. Four separate problems, in the order they were hit:
+
+1. **The configured XMLTV path did not exist.**
+   `IPTV_RECORDER.xmltv_url = /epg/threadfin.xml`. Wrong twice: `/epg` is
+   mounted into the **Jellyfin** container, not NextPVR's (which gets
+   only `/config` and `/buffer`), and `threadfin.xml` does not exist on
+   disk under any mount. NextPVR failed silently.
+2. **Threadfin's XMLTV is not the guide source.**
+   `http://localhost:34400/xmltv/threadfin.xml` has `<channel>` entries
+   for both channels but **zero `<programme>` entries**. The real guide is
+   `/srv/media-core/epg/epg.xml` (generated by `xtream-sync.py`), whose
+   channel ids `mc430234` / `mc429409` match the M3U's `tvg-id` exactly.
+3. **A trailing space in the path.** The UI stored
+   `<XmltvSources>/config/epg.xml </XmltvSources>`, so `File.Exists`
+   failed and the update reported `[0 inserted, 0 updated, 0 skipped]`.
+   Same class as §14's Bug 3 username whitespace. **Check for trailing
+   whitespace with `cat -A` before believing any path is correct.**
+4. **The source id is derived from the path.** Removing the trailing
+   space changed it from `xmltv--147538803` to `xmltv-303203766`, and the
+   per-channel mapping ids changed with it.
+
+**Do the channel mapping in the UI, not the database.** Direct DB writes
+to `CHANNEL.epg_source` / `epg_mapping` do not work — the API's
+`setting.epg.sources` handle is not the stored value. The real schema is:
+
+```
+epg_source  = XMLTV                       ← literal string
+epg_mapping = <epg><source>XMLTV</source>
+                <file>/config/epg.xml</file>
+                <mapping_id>mc430234</mapping_id>
+                <mapping_name>Madison: ABC 27 (WKOW)</mapping_name></epg>
+```
+
+Settings → EPG → **Auto Map** does this correctly in seconds. The API
+route is blocked anyway: a PIN session returns `allow_settings=false`, so
+`setting.epg.automap` fails with `Not Allowed` (code 13).
+
+Result: 230 `EPG_EVENT` rows; Jellyfin ingested 78 programmes for WKOW
+and 86 for WMSN.
+
+**Staleness fix.** `epg.xml` is regenerated daily and NextPVR cannot read
+its directory, so a drop-in copies it after every sync:
+
+```
+/etc/systemd/system/media-core-sync.service.d/nextpvr-epg-copy.conf
+  ExecStartPost=/bin/cp /srv/media-core/epg/epg.xml \
+                        /srv/media-core/nextpvr/config/epg.xml
+```
+
+**Consequence to expect:** these channels are duplicates of the Threadfin
+ones, previously hidden only because they lacked EPG. With a guide they
+now appear as indistinguishable twins.
+
+### 17.6 ADB reconnection is automated
+
+§16's claim that port-scanning "did not work" is wrong. The device
+advertises its current port over mDNS and the pairing key persists, so
+rediscovery is all that is needed — no re-pairing, nobody at the TV.
+`adb mdns services` does not see it on this host, but avahi does.
+
+```
+/usr/local/bin/chromecast-adb-keepalive          (script)
+/etc/systemd/system/chromecast-adb-keepalive.{service,timer}
+timer: every 2 min, plus 2 min after boot
+```
+
+If the link is up it exits in ~20 ms; otherwise it queries
+`_adb-tls-connect._tcp` and reconnects. Verified through the systemd path
+— the device comes back `device`, not `unauthorized`, so root's
+`~/.android` key resolves correctly under systemd. Only wireless
+debugging being switched off on the device defeats it.
+
+Manual fallback, if ever needed:
+```bash
+nmap -Pn -p 30000-49999 --open -T4 <device-ip>     # 3 ports appear
+adb connect <device-ip>:<port>                     # exactly one succeeds
+```
+
+### 17.7 Delete recordings — no patch needed
+
+Wholphin already handles `BaseItemKind.RECORDING` in its delete path. It
+is hidden because `AppPreference.ManageMedia` defaults to false.
+
+**Settings → Advanced Settings → Interface → "Show media management
+options"** (it is in `advancedPreferences`, *not* the basic Interface
+screen). The `family` user already has `EnableLiveTvManagement` and
+`EnableContentDeletion`.
+
+### 17.8 Scheduling moved to noon (power timer)
+
+The host is on a power timer and typically off overnight, so the whole
+04:00 media cascade either never ran or all fired at once at power-on.
+Moved to midday, preserving dependency order:
+
+| Time (CEST) | Job | Was |
+|---|---|---|
+| 12:00 | `media-core-sync` — playlist, EPG, VOD | 04:00 |
+| 12:25 | `media-core-xepg` — Threadfin XEPG | 04:25 |
+| 12:35 | NextPVR EPG update | 02:44 |
+| 12:50 | Jellyfin *Refresh Guide* | 04:30 |
+| 13:05 | Jellyfin *Scan Media Library* | 04:45 |
+
+`media-core-ppv` now skips hour 12 instead of hour 04.
+
+This ordering is better than the original: sync writes `epg.xml` and the
+drop-in copies it to NextPVR, *then* NextPVR ingests at 12:35, *then*
+Jellyfin pulls from both tuners. Previously NextPVR loaded at 02:44,
+before the 04:00 sync, so it always ingested the previous day's file.
+
+**`Persistent=true` vs Jellyfin's `DailyTrigger`.** The systemd timers
+catch up missed runs at boot; **Jellyfin's daily triggers do not**. Every
+day the box was off at 04:30, Refresh Guide and Scan Media Library simply
+did not run. That is the likeliest explanation for guide data repeatedly
+looking stale.
+
+Implementation: systemd drop-ins named `noon.conf` (revert = delete +
+`daemon-reload`); NextPVR `config.xml` `EPGUpdateHour`/`EPGUpdateTime`
+(needs the container stopped, or NextPVR rewrites it on shutdown);
+Jellyfin `config/config/ScheduledTasks/<id>.js` `TimeOfDayTicks`
+(ticks = seconds since midnight x 10,000,000; needs Jellyfin stopped).
+Backups alongside each as `.bak-sched-*`.
+
+**Still overnight, not yet moved** (need the power-on window):
+`media-core-config-backup` 03:30, `pve-daily-update` 04:59,
+`router-backup` Sun 03:30, `vzdump` Sun 02:00, `xfs_scrub_all` Sun 03:10.
+
+**Unclean shutdown risk.** If the timer cuts mains power rather than
+triggering a clean shutdown, that is an unclean poweroff of a Proxmox
+host every day. Usually survivable, eventually not. Shutting the box down
+cleanly a few minutes before the cut is worth more than any of the
+scheduling above.
+
+### 17.9 Method notes worth keeping
+
+- **Capture before pressing play.** Every diagnosis here came from a
+  logcat started beforehand. Two capture windows closed empty because
+  they were too short — use an hour, not fifteen minutes.
+- **"It crashed" is a symptom, not a diagnosis.** Of the failures
+  reported that way, one was a real crash (§17.1), one was an activity
+  teardown (§17.4), and one was a silent hang (§17.3).
+- **A/B against the working twin.** Threadfin vs NextPVR copies of the
+  same channel isolated §17.4 in one comparison.
+- **Trace settings to their point of use** (§17.2), and **check paths
+  with `cat -A`** (§17.5).
+
+### 17.10 Open items
+
+1. **Upstream the three client bugs** — §17.3 is the highest value,
+   then §17.1, then §17.4. The Wholphin `mediaSourceId` PR
+   (`pr/livetv-mediasourceid`) is still drafted and unsubmitted.
+2. **Jellyfin issues** — Bug 2 (§14) is still live on 10.11.9, 8
+   occurrences in 30 minutes. Cleanest report of the set.
+3. **Cut a release** for `1.0.3-38-g0e3e89ca`. The device runs it but the
+   published release is still `-34-`, so self-update advertises an older
+   build. Asset must be `Wholphin-debug-armeabi-v7a.apk` and the release
+   name exactly a version string (§9).
+4. **Dedicated signing keystore** — unchanged from §16.
+5. **Move the remaining overnight jobs** (§17.8).
+6. **Remove `setAllowChunklessPreparation(false)`** — still outstanding
+   from §13.
