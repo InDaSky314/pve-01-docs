@@ -17,15 +17,43 @@ Docs: /root/pve-01-docs/docs/livetv-custom-build-and-updates-20260726.md
 """
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
 import subprocess
+import sys
 import threading
 import urllib.request
 from datetime import datetime, timedelta, timezone, time as dtime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+AUTH_FILE = Path("/etc/dvr-dashboard.auth")
+
+
+def load_auth() -> tuple[str, str]:
+    if not AUTH_FILE.exists():
+        sys.stderr.write(f"ERROR: Auth file missing: {AUTH_FILE}. DVR dashboard refuses to start unauthenticated.\n")
+        sys.exit(1)
+    try:
+        content = AUTH_FILE.read_text().strip()
+    except Exception as exc:
+        sys.stderr.write(f"ERROR: Failed to read auth file {AUTH_FILE}: {exc}\n")
+        sys.exit(1)
+    if not content or ":" not in content:
+        sys.stderr.write(f"ERROR: Auth file {AUTH_FILE} invalid format. Expected 'username:password' on one line.\n")
+        sys.exit(1)
+    user, pwd = content.split(":", 1)
+    user, pwd = user.strip(), pwd.strip()
+    if not user or not pwd:
+        sys.stderr.write(f"ERROR: Auth file {AUTH_FILE} contains empty username or password.\n")
+        sys.exit(1)
+    return user, pwd
+
+
+AUTH_USER, AUTH_PASS = load_auth()
 
 LOCAL = ZoneInfo("Europe/Berlin")
 PORT = 8099
@@ -298,6 +326,8 @@ PAGE = r"""<!doctype html><html lang="en"><head>
 body{margin:0;padding:16px;background:var(--bg);color:var(--fg);
 font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
 max-width:820px;margin-inline:auto}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
 h1{font-size:1.3rem;margin:0 0 2px}
 .sub{color:var(--dim);font-size:.85rem;margin-bottom:14px}
 .tabs{display:flex;gap:6px;margin-bottom:14px}
@@ -351,6 +381,7 @@ border-radius:8px;padding:10px 12px;margin-top:10px;display:none}
 <div class="tabs" role="tablist">
   <button role="tab" aria-selected="true" onclick="tab('now')" id="t-now">Tonight</button>
   <button role="tab" aria-selected="false" onclick="tab('sched')" id="t-sched">Schedules</button>
+  <button role="tab" aria-selected="false" onclick="tab('links')" id="t-links">Links</button>
 </div>
 
 <div id="p-now">
@@ -383,6 +414,88 @@ border-radius:8px;padding:10px 12px;margin-top:10px;display:none}
   </div>
 </div>
 
+<div id="p-links" hidden>
+  <div class="note" style="margin-bottom:14px">Note: These services are accessible on LAN or Tailscale only.</div>
+  <div class="card">
+    <h2>Media servers</h2>
+    <div class="row">
+      <div class="what">
+        <a href="http://192.168.9.50:8096" target="_blank" rel="noopener"><b>Jellyfin - production</b></a>
+        <span class="tag">http://192.168.9.50:8096</span>
+      </div>
+    </div>
+    <div class="row">
+      <div class="what">
+        <a href="http://192.168.9.195:8096" target="_blank" rel="noopener"><b>Jellyfin - live (Threadfin)</b></a>
+        <span class="tag">http://192.168.9.195:8096</span>
+      </div>
+    </div>
+    <div class="row">
+      <div class="what">
+        <a href="http://192.168.9.134:8096" target="_blank" rel="noopener"><b>Jellyfin - VOD</b></a>
+        <span class="tag">http://192.168.9.134:8096</span>
+      </div>
+    </div>
+    <div class="row">
+      <div class="what">
+        <a href="http://192.168.9.219:8096" target="_blank" rel="noopener"><b>Jellyfin - NextPVR</b></a>
+        <span class="tag">http://192.168.9.219:8096</span>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Tuners / DVR</h2>
+    <div class="row">
+      <div class="what">
+        <a href="http://192.168.9.50:34400" target="_blank" rel="noopener"><b>Threadfin - production</b></a>
+        <span class="tag">http://192.168.9.50:34400</span>
+      </div>
+    </div>
+    <div class="row">
+      <div class="what">
+        <a href="http://192.168.9.195:34400" target="_blank" rel="noopener"><b>Threadfin - live</b></a>
+        <span class="tag">http://192.168.9.195:34400</span>
+      </div>
+    </div>
+    <div class="row">
+      <div class="what">
+        <a href="http://192.168.9.50:8866" target="_blank" rel="noopener"><b>NextPVR - production</b></a>
+        <span class="tag">http://192.168.9.50:8866</span>
+      </div>
+    </div>
+    <div class="row">
+      <div class="what">
+        <a href="http://192.168.9.219:8866" target="_blank" rel="noopener"><b>NextPVR - live</b></a>
+        <span class="tag">http://192.168.9.219:8866</span>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Monitoring</h2>
+    <div class="row">
+      <div class="what">
+        <a href="http://192.168.9.164:3000" target="_blank" rel="noopener"><b>Grafana</b></a>
+        <span class="tag">http://192.168.9.164:3000</span>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Infrastructure</h2>
+    <div class="row">
+      <div class="what">
+        <a href="https://192.168.9.11:8006" target="_blank" rel="noopener"><b>Proxmox</b></a>
+        <span class="tag">https://192.168.9.11:8006</span>
+      </div>
+    </div>
+    <div class="row">
+      <div class="what">
+        <a href="http://192.168.9.1" target="_blank" rel="noopener"><b>Router (GL-MT6000)</b></a>
+        <span class="tag">http://192.168.9.1</span>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 const fD=s=>new Date(s).toLocaleString([],{weekday:'short',day:'numeric',month:'short',
   hour:'2-digit',minute:'2-digit'});
@@ -404,12 +517,14 @@ function row(g,past,extra){
   <div class="pills">${extra||''}${pills(g)}</div></div>`}
 
 function tab(w){
-  const n=w==='now';
+  const n=w==='now', s=w==='sched', l=w==='links';
   document.getElementById('p-now').hidden=!n;
-  document.getElementById('p-sched').hidden=n;
+  document.getElementById('p-sched').hidden=!s;
+  document.getElementById('p-links').hidden=!l;
   document.getElementById('t-now').setAttribute('aria-selected',n);
-  document.getElementById('t-sched').setAttribute('aria-selected',!n);
-  if(!n&&!SCHED)loadSched();
+  document.getElementById('t-sched').setAttribute('aria-selected',s);
+  document.getElementById('t-links').setAttribute('aria-selected',l);
+  if(s&&!SCHED)loadSched();
 }
 async function load(){
   let d;try{d=await (await fetch('/api/status')).json()}catch(e){
@@ -514,6 +629,35 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _send_401(self) -> None:
+        body = b"401 Unauthorized\n"
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="DVR"')
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authenticate(self) -> bool:
+        auth_header = self.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Basic "):
+            self._send_401()
+            return False
+        try:
+            encoded = auth_header.split(" ", 1)[1].strip()
+            decoded = base64.b64decode(encoded).decode("utf-8")
+            if ":" not in decoded:
+                self._send_401()
+                return False
+            user, pwd = decoded.split(":", 1)
+            if hmac.compare_digest(user, AUTH_USER) and hmac.compare_digest(pwd, AUTH_PASS):
+                return True
+        except Exception:
+            pass
+        self._send_401()
+        return False
+
     def _send(self, code: int, body: bytes, ctype: str) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -531,6 +675,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, body, "application/json")
 
     def do_GET(self):
+        if not self._authenticate():
+            return
         if self.path.startswith("/api/status"):
             self._json(status)
         elif self.path.startswith("/api/schedule"):
@@ -545,6 +691,8 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(n) or b"{}")
 
     def do_POST(self):
+        if not self._authenticate():
+            return
         if self.path == "/api/override":
             return self._override()
         if self.path == "/api/shutdown":
