@@ -96,3 +96,91 @@ second recorder safe to run at all — without it, any NextPVR recording
 visible to production Jellyfin got cancelled and recreated every minute.
 Verified in production: an 800 MB single-file recording where the previous
 attempt produced 18 fragments.
+
+---
+
+## Afternoon session (2026-08-01, later)
+
+### CT 112 recorded successfully — the split is proven
+
+`Second Chance Pets`, ch102, 15:00-15:30. Result: **one file,
+1,133,419,666 bytes, status Ready, no "cancelled early" reason.**
+
+The same test on production the previous night produced 18 fragments. The
+isolated stack behaves as a DVR should. CT 112 is no longer unproven.
+
+### Shared recordings layout
+
+CT 105's `/srv/media-core` is on a thin LV that cannot be double-mounted,
+so the shared area lives on the Proxmox host:
+
+```
+/srv/shared-recordings/
+    nextpvr/     <- CT 112 writes (only writer)
+    threadfin/   <- CT 110 writes (only writer)
+```
+
+Mounted into CTs 110/111/112 and added as a Jellyfin library "Recordings"
+on each, so a recording made by one stack is playable from any of them.
+Separate writers, shared readers: merging the *write* paths would recreate
+the ambiguity that made the guard bug so hard to attribute.
+
+**Known gap:** read-only is enforced on CT 111 only (`ro=1`). CTs 110 and
+112 mount the parent read-write because each needs write access to its own
+subdirectory. Consequence: CT 110's Jellyfin can delete CT 112's
+recordings and vice versa. The correct shape is two mounts per CT — parent
+read-only, own subdirectory read-write. Not yet done.
+
+### Recording persistence — a near miss
+
+CT 112's NextPVR was writing to `/root/recordings` **inside the
+container's writable layer**, not a bind mount. `docker compose up
+--force-recreate` destroys that, and the container was recreated twice
+that afternoon. The 1.13 GB recording survived only because it was made
+after the last recreate. Copy-then-verify-bytes was made an explicit
+precondition before any further recreate.
+
+Check the recording directory is on a bind mount whenever a DVR container
+is built. NextPVR does not default to one.
+
+### Clocks
+
+`nextpvr-live` now reads CEST, matching the host, in both the container
+and NextPVR's own rendering.
+
+Two separate faults, found in sequence:
+1. The container ignored `TZ=Europe/Berlin` in compose. It needed
+   `/etc/localtime` bind-mounted. Note `docker restart` does NOT apply new
+   env vars — that needs `up -d --force-recreate`.
+2. Even then NextPVR still rendered UTC, because it stores its **own**
+   timezone captured at setup time. That is a NextPVR setting, not a
+   container one.
+
+**Recordings were never at risk from this.** Scheduling is epoch-based and
+internally consistent — the 15:00 CEST recording fired correctly while
+NextPVR displayed 13:00. The risk was EPG *ordering*: `EPGUpdateTime`
+fires on NextPVR's internal clock, so 12:35 was ingesting at ~14:35,
+after Jellyfin's 12:50 guide pull, leaving Jellyfin with day-old data.
+
+**Verify EPG timing by observation, not config values.** Config numbers
+were wrong twice in one day — the sync schedule and the container TZ — and
+in both cases the value looked right while behaviour differed.
+
+### Production
+
+Duplicate channels are gone: 998 -> **996 channels, WKOW x1, WMSN x1**.
+Removing the NextPVR plugin does not purge channels already in Jellyfin's
+database; that needs a guide refresh, which was triggered manually.
+Production tuner config verified intact (`hdhomerun -> 127.0.0.1:34400`
+plus the `xmltv` provider).
+
+### Still open
+
+1. Read-only mount refinement (above).
+2. Production recordings are not in the shared parent; CT 105 was
+   deliberately kept read-only to agy.
+3. New servers not yet added to Wholphin, so no A/B has happened on the TV.
+4. Only ONE provider stream exists estate-wide. TiviMate, production, CT
+   110 and CT 112 all contend for it. **Comparisons must be sequential.**
+   With one stream, three Live-TV-capable stacks is more than can be used
+   at once — once a backend is chosen, retiring the other simplifies this.
