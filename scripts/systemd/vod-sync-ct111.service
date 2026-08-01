@@ -1,0 +1,8 @@
+[Unit]
+Description=One-way VOD media sync from CT 105 to CT 111 shared storage
+Documentation=file:///root/pve-01-docs/docs/dual-backend-design-20260801.md
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vod-sync-ct111

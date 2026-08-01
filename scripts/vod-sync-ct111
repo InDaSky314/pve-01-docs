@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# vod-sync-ct111: One-way rsync of VOD media (.strm files) from CT 105 to CT 111 shared storage
+# Created 2026-08-01
+
+CT_ID="105"
+DEST_DIR="/srv/shared-vod-media"
+
+if ! pct status "$CT_ID" | grep -q "status: running"; then
+    echo "CT $CT_ID is not running; skipping VOD sync"
+    exit 0
+fi
+
+PID=$(lxc-info -n "$CT_ID" -p -H)
+SRC_DIR="/proc/$PID/root/srv/media-core/media/"
+
+if [ ! -d "$SRC_DIR" ]; then
+    echo "Source directory $SRC_DIR does not exist; skipping VOD sync"
+    exit 0
+fi
+
+echo "Starting VOD sync from CT $CT_ID (PID $PID) to $DEST_DIR..."
+rsync -a --delete --exclude="recordings*" "$SRC_DIR" "$DEST_DIR/"
+echo "VOD sync completed successfully."
