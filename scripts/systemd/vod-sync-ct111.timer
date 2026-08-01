@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily VOD media sync from CT 105 to CT 111 at 13:45 local
+
+[Timer]
+OnCalendar=*-*-* 13:45:00
+Persistent=true
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target
