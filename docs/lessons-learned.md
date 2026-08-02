@@ -24,6 +24,24 @@ operation solved in minutes what hours of counting had not.
 Check stderr, check the tool exists, and confirm the absence means what
 you think.
 
+**Verify at the layer the user sees — this is a gate, not advice.** On
+2026-08-02 it was violated three times in one session, and the owner caught
+every one:
+
+- icons confirmed correct at the NextPVR API; 33 of 82 had not reached Jellyfin
+- a lineup renumber confirmed in Threadfin's xepg; Jellyfin was 14 channels behind
+- CT 112's renumber confirmed in NextPVR's database; its Jellyfin still served
+  the old lineup and 404-ing icon URLs
+
+Each intermediate check was true. None of them meant the change had landed.
+
+**A lineup or artwork change is not done until the Jellyfin channel list has
+been queried and matches** — not the tuner, not the playlist, not the
+database. Pull a rendered image and compare byte counts; do not count rows.
+Twice the owner had to insist a problem was real after being told it was
+client-side caching. When someone says the change has not landed and a
+re-login did not fix it, believe them and look again.
+
 **Verify at the layer the user sees.** Channel icons were confirmed
 correct at the NextPVR API (`HTTP 200`, right byte count) while the user
 still saw the old ones, because Jellyfin caches separately. A green check
@@ -151,6 +169,37 @@ system is up. Always set `location` explicitly.
 
 ---
 
+## Channel identity across the media stack
+
+**`tvg-name` IS the channel's identity.** Threadfin keys on it (`_uuid.key`),
+Jellyfin matches on it. Renaming a channel does not edit it — it deletes one
+channel and creates another, losing its number history, its Jellyfin entry and
+any locally cached artwork.
+
+**Never rename a channel in the same change that moves it.** On 2026-08-02 a
+renumber renamed 14 channels as a side effect of using the config's dict form,
+whose value is the display name. Recovery took three sync/refresh cycles.
+
+**A rename is not cleanly reversible.** Reverting the names did not restore the
+channels: Jellyfin had already dropped the originals during the intermediate
+sync, so the reverted names arrived as *new* channels. Renamed channels also
+land in Threadfin with `x-active=False` and need `media-core-xepg` to activate
+them — a plain guide refresh will never show them.
+
+**Neither backend renumbers existing channels.** Threadfin adopts `tvg-chno`
+only for new channels; NextPVR does the same at import. Changing numbers in
+the playlist does nothing to channels that already exist. Threadfin needs
+`renumber-xepg.py`; NextPVR needs a delete-then-scan.
+
+**Re-importing a NextPVR source changes every channel OID.** Any consumer
+holding those OIDs breaks silently — CT 112's Jellyfin was left with 955 icon
+URLs returning 404, which the owner saw as channels rendering as plain text.
+After any re-import, clear the downstream Jellyfin's channel image rows.
+
+**Clearing a subset of Jellyfin's channel image rows does not work.** It
+re-fetches nothing and leaves those channels with no artwork at all. Clear
+*all* of them and run *one* guide refresh to completion.
+
 ## Configuration traps seen more than once
 
 **Trailing whitespace in paths.** NextPVR stored `/config/epg.xml ` and
@@ -241,6 +290,20 @@ here, not a delivery mechanism — use the self-update release channel.
 produces a version string the updater cannot parse.
 
 ---
+
+## Reverse-engineering a "no API" web UI
+
+NextPVR looked like it had no API for channel management. It has a complete
+one; the UI is a thin client over it. Two paths exist and are not the same:
+`/service?method=` is the documented API, `/services/service?method=` is what
+the UI calls. Seven guessed method names returned empty on the wrong path.
+
+**Read the UI's own source before concluding an endpoint does not exist:**
+
+    docker exec <container> sh -c 'grep -rhoE "service\?method=[a-zA-Z.]+" /app/wwwroot | sort -u'
+
+That found `setting.scan.*` and `system.epg.*` in minutes after a day of
+assuming a browser was required. Full sequence in `nextpvr-cli.md`.
 
 ## Working with agy
 
