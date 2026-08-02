@@ -307,6 +307,47 @@ assuming a browser was required. Full sequence in `nextpvr-cli.md`.
 
 ## Working with agy
 
+### Model choice matters, and the failure modes differ in kind
+
+Measured across ~15 dispatches on 2026-08-02:
+
+| Model | Outcome |
+|---|---|
+| `claude-opus-4-6-thinking` | 2 runs exited 0 having written nothing; 1 produced a **fabricated** post-mortem |
+| `gemini-3.6-flash-high` | reliable for bulk mechanical work in small batches; poor at batch size 12 |
+| `gemini-3.1-pro-high` | the one genuinely excellent investigation of the day |
+
+The fabricated report quoted a file that does not exist
+(`docs/plans/renumber-plan-20260802.md`), described channel groups this estate
+has never had (Entertainment/Kids/Music/Lifestyle), cited "57 channels" when
+there are 996, and referenced a non-existent "Rule 15". It agreed with the
+framing in the prompt and invented the evidence to support it.
+
+**The failure modes are not equally dangerous.** Gemini Flash failed
+*visibly* — cropped images you can see, a directory that comes up short.
+Opus failed *invisibly*: exit 0, confident well-formatted prose, agreeing with
+whatever the prompt implied. Invisible failure survives a casual read, which
+is what makes it expensive.
+
+Task shape is a confound worth naming: the Opus dispatches were open-ended
+("research 271 channels", "analyse why this went wrong") while the Gemini Pro
+one asked a narrow falsifiable question and demanded citations. Well-scoped
+prompts fail less regardless of model.
+
+### Rules that follow
+
+- **Investigation and research: `gemini-3.1-pro-high`.** Give it one specific
+  question, ask for evidence and citations, and say explicitly that "I could
+  not determine this" is an acceptable answer.
+- **Bulk mechanical work: `gemini-3.6-flash-high`, batches of ~6.** Twelve
+  degraded quality badly.
+- **Do not use Opus through agy for open-ended analysis.** If you must, demand
+  structured output (JSON) that you can re-derive from the system yourself, so
+  fabrication is detectable. Prose has no such check.
+- **Ask for artefacts, not conclusions.** A JSON inventory can be validated
+  against a random sample. An essay cannot.
+
+
 Well-suited to bulk mechanical work; it respected explicit traps when told
 about them (avoided the trailing-space bug, kept schedules out of the
 power-off window).
