@@ -1,0 +1,1899 @@
+[
+ {
+  "channel": "50 CENT ACTION CHANNEL",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "ACC DIGITAL NETWORK",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "ALIEN NATION BY DUST",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "ALWAYS FUNNY",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "ALWAYS FUNNY PRANKS & FAILS",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "AMERICAN CRIMES",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "AMERICAN HEROES",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/american-heroes-channel-us.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'american heroes channel' (overlap 0.65)"
+ },
+ {
+  "channel": "AMERICAS GOT TALENT",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "AMERICAS TEST KITCHEN",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/vod/americas-test-kitchen-vod.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'americas test kitchen vod' (overlap 0.84)"
+ },
+ {
+  "channel": "ANGER MANAGEMENT",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "ARE WE THERE YET",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BALLY SPORTS CINCINNATI HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BALLY SPORTS CINCINNATI PLUS HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BALLY SPORTS PRIME TICKET HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC EARTH",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/canada/bbc-earth-ca.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "BBC NEWS HEVC \u25c9",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-kingdom/bbc-news-uk.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "BBC PARLAMENT \u25c9",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 1",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 10",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 11",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 12",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 13",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 14",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 15",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 16",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 17",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 18",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 2",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 3",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 4",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 42 \u00b3",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 5",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 6",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 7",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 8",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC STREAM 9",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BBC WORLD NEWS HD \u25c9",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-kingdom/bbc-world-news-uk.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "BIG 12",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BIG BROTHER 1 4K",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BIG BROTHER 2 4K",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BIG BROTHER 3 4K",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BIG BROTHER 4 4K",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BIG BROTHER QUAD VIEW 4K",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BOB ROSS CHANNEL",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/vod/the-bob-ross-channel-vod.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'bob ross channel vod' (overlap 0.80)"
+ },
+ {
+  "channel": "BOUNCE TV HD",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/bounce-us.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'bounce' (overlap 0.67)"
+ },
+ {
+  "channel": "BOUNCE XL",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/bounce-us.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'bounce' (overlap 0.67)"
+ },
+ {
+  "channel": "BOUNCETV",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BR FERNSEHEN HD NORD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "BR FERNSEHEN HD S\u00dcD",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/br-fernsehen-de.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'fernsehen' (overlap 0.69)"
+ },
+ {
+  "channel": "C-SPAN",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/c-span-1-us.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'c span 1' (overlap 0.75)"
+ },
+ {
+  "channel": "CNNI EAST",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "COSMIC FRONTIERS",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "CRIME 360",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/vod/crime-360-vod.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'crime 360 vod' (overlap 0.69)"
+ },
+ {
+  "channel": "CSN BAY AREA HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "CSN BOSTON HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "CSN CALIFORNIA HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "CSN CHICAGO HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "CSN CHICAGO PLUS HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "CSN PHILADELPHIA HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "CSN PHILADELPHIA PLUS HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "CSN WASHINGTON HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "CURIOSITY CHANNEL POWERED BY SPIEGEL HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "CURIOSITY NOW",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/curiosity-now-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "CW ATLANTA HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "CW PITTSBURGH",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "CW SACRAMENTO HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "CW SAN FRANCISCO HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "CW SEATTLE HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "CW TAMPA BAY HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "CW-WPIX",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/us-local/cw/cw-11-wpix-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign WPIX"
+ },
+ {
+  "channel": "Chicago NBC 5 (WMAQ)",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/us-local/nbc-5-wmaq-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign WMAQ"
+ },
+ {
+  "channel": "Chicago PBS 11 (WTTW)",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/us-local/pbs/pbs-11-wttw-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign WTTW"
+ },
+ {
+  "channel": "DANCE MOMS BY LIFETIME",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "DANGER TV",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "DECLASSIFIED",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "DISCOVERY+ 4K",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/media/discovery-plus.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "DISNEY JUNIOR",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "DOCUMENTARY+",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "DOG WHISPERER",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "DRAFTKINGS",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "DROOL",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "Denver NBC 9 (KUSA)",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/us-local/nbc-9-kusa-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign KUSA"
+ },
+ {
+  "channel": "Denver PBS 12 (KBDI)",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/us-local/pbs/pbs-12-kbdi-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign KBDI"
+ },
+ {
+  "channel": "EARTH TOUCH",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "EARTHX",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "FAIL ARMY",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "FAMILY ENTERTAINMENT TELEVISION",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "FAMILY MOVIE CLASSICS",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "FUEL TV",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/portugal/fueltv-pt.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "FX MOVIE CHANNEL",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "GOLF CHANNEL",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/argentina/golf-channel-ar.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "GOTRAVELER",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "GUSTO TV",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/vod/gusto-tv-vod-us.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'gusto tv vod' (overlap 0.67)"
+ },
+ {
+  "channel": "Green Bay CBS 5 (WFRV)",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "Green Bay CBS 5 (WFRV) Alt",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "Green Bay NBC 26 (WGBA)",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/nbc-26-wgba-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign WGBA"
+ },
+ {
+  "channel": "Green Bay NBC 26 (WGBA) Alt",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/nbc-26-wgba-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign WGBA"
+ },
+ {
+  "channel": "Green Bay PBS 38 (WPNE)",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HALLMARK DRAMA HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HALLMARK HD",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/hallmark-tv-us.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'hallmark tv' (overlap 0.73)"
+ },
+ {
+  "channel": "HALLMARK M & M HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HALLMARK MOVIESMYSTERIES 4K",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL 1",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL 10",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL 11",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL 12",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL 13",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL 15",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL 16",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL 17",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL 2",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL 3",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL 4",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL 5",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL 6",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL 7",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL 8",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL 9",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HBO MAX ORIGINAL INFO",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HISTORY & WARFARE",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HOME SHOPPING NETWORK",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "HORROR BY ALTER",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "I (ALMOST) GOT AWAY WITH IT",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/paramount-plus-with-showtime-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign WITH"
+ },
+ {
+  "channel": "I24 NEWS",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/israel/i24-news-il.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "INFAST",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "INFOWARS TV HD",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/info-wars-us.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'infowars' (overlap 0.73)"
+ },
+ {
+  "channel": "INWONDER",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "IT PIRATI DEI CARAIBI CHANNEL 4K",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "KABEL 1 CLASSICS HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "KABEL 1 HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "LOOLOO KIDS",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/india/discovery-kids-in.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign KIDS"
+ },
+ {
+  "channel": "Los Angeles NBC 4 (KNBC)",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/us-local/nbc-4-knbc-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign KNBC"
+ },
+ {
+  "channel": "Los Angeles PBS (KQIN)",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "MDR HD S-ANHALT",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "MDR HD SACHSEN",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "MDR HD TH\u00dcRINGEN",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "METV",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/me-tv-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "MLB MLB NETWORK",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/mlb-network-us.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'mlb network' (overlap 0.73)"
+ },
+ {
+  "channel": "MLB NETWORK (US)",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/mlb-network-us.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'mlb network' (overlap 0.79)"
+ },
+ {
+  "channel": "MNT-WWOR",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/us-local/mytv/my-9-wwor-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign WWOR"
+ },
+ {
+  "channel": "MSG SPORTSNET 635",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "MUSIC CHOICE CLASSIC COUNTRY HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "MUSIC CHOICE HIP-HOP AND R&B",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "MUSIC CHOICE HIP-HOP CLASSICS",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "MUSIC CHOICE MAX",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/music-choice-us.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'music choice' (overlap 0.75)"
+ },
+ {
+  "channel": "MUSIC CHOICE POP HITS",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "MUSIC CHOICE TROPICALES HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "Madison CBS 3 (WISC)",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/us-local/cbs-3-wisc-tv-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign WISC"
+ },
+ {
+  "channel": "Milwaukee NBC 4 (WTMJ)",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/us-local/nbc-4-wtmj-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign WTMJ"
+ },
+ {
+  "channel": "NDR HD HAMBURG",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/ndr-hamburg-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "NDR HD MECKLENBURG V.",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/ndr-mecklenburg-vorpommern-de.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'ndr mecklenburg vorpommern' (overlap 0.65)"
+ },
+ {
+  "channel": "NDR HD NIEDERSACHSEN",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "NDR HD SCHLESWIG-HOLSTEIN",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/ndr-schleswig-holstein-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "NEWS 12 BROOKLYN",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/news12-brooklyn-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "NEWS 12 CONNECTICUT",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/news12-connecticut-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "NEWS 12 LONG ISLAND 4K",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/news12-long-island-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "NEWS 12 THE BRONX 4K",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/news12-the-bronx-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "NFL 4K",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/sports/leagues/nfl-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "NHL 4K",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "NHL ALTERNATE",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "NHL NETWORK",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/nhl-network-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "NICKTOONS",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/nick-toons-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "NOSEY",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "New York NBC 4 (WNBC)",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/us-local/nbc-4-wnbc-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign WNBC"
+ },
+ {
+  "channel": "New York PBS (WNJN)",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PICKLEBALL TV",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PLAYERS TV",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/vod/players-tv-vod-us.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'players tv vod' (overlap 0.71)"
+ },
+ {
+  "channel": "POKERGO",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME ALL WOMENS SPORTS NETWORK",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME BIG 12 STUDIOS",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME BILLIARD TV",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME DP WORLD TOUR",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME ESPN OCHO",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME F1 TV",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME FANDUEL SPORTS NETWORK DETROIT",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME FANDUEL SPORTS NETWORK EXTRA",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME GLORY KICKBOXING",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME GOLFPASS",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME HBO BOXING",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME MLB",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME MONSTER JAM",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME MOTORTREND FAST TV",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME MSG SPORTSZONE",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME NASCAR",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME NBA",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME NBA TV HDTV",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME NESN NATION",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME NHL CHANNEL",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME NHRA",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME ONE CHAMPIONSHIP TV",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME OVERTIME",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME PAC-12 INSIDER",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME PGA TOUR",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME PICKLEBALLTV",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME PICKLETV",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME RACER SELECT",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME REAL MADRID TV",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME RED BULL",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME RUGBYPASS TV",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME RYZ SPORTS",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME SPEEDVISION",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME SPORTSGRID",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME SWERVE COMBAT",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME TEAM USA",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME THE JIM ROME SHOW",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME THE WOMENS SPORTS NETWORK",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME TNA WRESTLING CHANNEL",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME TORQUE",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME TRITON POKER",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME UEFA CHAMPIONS LEAGUE",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PRIME WORLD POKER TOUR",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "PROSIEBEN FUN HD",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/pro-sieben-fun-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "PROSIEBEN HD",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/pro-sieben-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "RACING AMERICA",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "RBB HD BERLIN",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/rbb-berlin-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "RBB HD BRANDENBURG",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/rbb-brandenburg-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "RECIPETV",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/recipe-tv-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "REELZCHANNEL",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "RIG TV",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "RT DOCUMENTARY HD",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/international/rt-documentary-int.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'rt documentary int' (overlap 0.78)"
+ },
+ {
+  "channel": "RTL HD",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/croatia/rtl-hr.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "RTL ZWEI HD",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/rtl-zwei-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "RVTV",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "SAT.1 EMOTIONS HD",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/sat-1-emotions-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "SAT.1 HD",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/sat-1-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "SCIENCE",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "SCIENTOLOGY NETWORK",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "SKY SPORT BUNDESLIGA HD",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/sky-sport/sky-sport-bundesliga-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "SKY SPORT BUNDESLIGA HD (720P)",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/sky-sport/sky-sport-bundesliga-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "SKY SPORT BUNDESLIGA HD (SAT)",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/sky-sport/sky-sport-bundesliga-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "SKY SPORT BUNDESLIGA \u00b3",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/sky-sport/sky-sport-bundesliga-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "SOMOS NOVELAS",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "SONY AXN HD",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/sony-axn-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "SONY CHANNEL HD",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/brazil/sony-channel-br.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "SPIEGEL TV GESCHICHTE HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "SPORTSNET NEW YORK 639",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "STADIUM STREAM",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "SURF CINEMA",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "SWR HD BADEN-W\u00dcRTTEMBERG",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "SWR HD RHEINLAND-PFALZ",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "THE DESIGN NETWORK",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/vod/the-design-network-vod.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'design network vod' (overlap 0.78)"
+ },
+ {
+  "channel": "THE VICTORY CHANNEL HD",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "THEGRIO",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "THREE STOOGES",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "TMO-WNJU",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/us-local/telemundo/telemundo-47-wnju-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign WNJU"
+ },
+ {
+  "channel": "TNA",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "TORQUE BY HISTORY",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "TOTAL CRIME",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "TRIBECA FESTIVAL+",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "TRUE CRIME NOW",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-kingdom/true-crime-uk.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'true crime' (overlap 0.71)"
+ },
+ {
+  "channel": "UNIVISION-WXTV",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/us-local/univision/univision-41-wxtv-nueva-york-us.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign WXTV"
+ },
+ {
+  "channel": "US HALLMARK MOVIESMYSTERIES 4K",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "US IT PIRATI DEI CARAIBI CHANNEL 4K",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "WDR HD AACHEN",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/wdr-aachen-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "WDR HD BIELEFELD",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/wdr-bielefeld-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "WDR HD BONN",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/wdr-bonn-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "WDR HD DORTMUND",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/wdr-dortmund-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "WDR HD DUISBURG",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/wdr-duisburg-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "WDR HD D\u00dcSSELDORF",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/wdr-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign WDR"
+ },
+ {
+  "channel": "WDR HD ESSEN",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/wdr-essen-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "WDR HD K\u00d6LN",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/wdr-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign WDR"
+ },
+ {
+  "channel": "WDR HD M\u00dcNSTER",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/wdr-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": "matched on call sign WDR"
+ },
+ {
+  "channel": "WDR HD SIEGEN",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/wdr-siegen-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "WDR HD WUPPERTAL",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/wdr-wuppertal-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "WELT DER WUNDER",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/welt-der-wunder-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "WELT HD",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/germany/welt-de.png",
+  "source": "tv-logos",
+  "confidence": "high",
+  "notes": ""
+ },
+ {
+  "channel": "WILLOW SPORTS",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "WOMENS SPORTS NETWORK",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "YAHOO FINANCE",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/vod/yahoo-finance-vod.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'yahoo finance vod' (overlap 0.76)"
+ },
+ {
+  "channel": "YANKEES ENTERTAINMENT & SPORTS NETWORK",
+  "logo_url": null,
+  "source": null,
+  "confidence": "low",
+  "notes": "no match in tv-logos index"
+ },
+ {
+  "channel": "YU-GI-OH!",
+  "logo_url": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/vod/yu-gi-oh-vod.png",
+  "source": "tv-logos",
+  "confidence": "medium",
+  "notes": "substring match on 'yu gi oh vod' (overlap 0.67)"
+ }
+]

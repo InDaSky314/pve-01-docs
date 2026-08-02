@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly IPTV provider lineup drift report
+
+[Timer]
+# Sunday midday: after the 12:01 sync, and inside the window when the host is
+# powered on (mains timer normally cuts 22:24-04:57).
+OnCalendar=Sun *-*-* 12:40:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

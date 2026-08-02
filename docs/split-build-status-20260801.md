@@ -184,3 +184,37 @@ plus the `xmltv` provider).
    110 and CT 112 all contend for it. **Comparisons must be sequential.**
    With one stream, three Live-TV-capable stacks is more than can be used
    at once — once a backend is chosen, retiring the other simplifies this.
+
+---
+
+## CT 110 retired (2026-08-02)
+
+`jellyfin-live` is **stopped**, with `onboot=0` so it stays down through the
+nightly mains cycle. Nothing was deleted.
+
+Reason: its Threadfin backend duplicates production, and the thing it existed
+to be a control for — the recording-fragmentation mystery — turned out to be
+the `pre-recording-guard` bug, not Threadfin. With that answered, a clean-room
+Threadfin control buys little, while costing disk (3.4 GB of guide artwork
+already), a share of the single provider stream, and surface area in every
+guard. It had also never recorded anything.
+
+Retired from monitoring in the same change, deliberately. `stack-monitor.py`
+reports `epg_age_hours = 999.0` when it cannot stat the file and `stack_up = 0`
+when the endpoint is down, so leaving CT 110 in its target lists would have
+fired `epg-freshness-stale` and `stack-health-down` every cycle for an outage
+we chose — training the owner to ignore alerts that had only just been
+repaired. The three `jellyfin-live` entries are commented in place.
+
+**To revive:**
+
+```
+pct set 110 --onboot 1 && pct start 110
+```
+
+then restore the `jellyfin-live` entries in `/root/bin/stack-monitor.py`
+(backup: `.bak-20260802`) and give it an EPG propagation job like
+`epg-sync-ct112`, which it never had.
+
+`dvr-clean-shutdown` needs no change — it detects a stopped container and
+skips it explicitly rather than treating it as unmeasurable.
