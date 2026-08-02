@@ -64,6 +64,12 @@ STACKS = [
      "host_prefix": "/srv/media-core/jellyfin/config"},
     {"name": "ct112-nextpvr", "ct": "112", "kind": "nextpvr",
      "dir": "/srv/jellyfin-npvr/nextpvr/config/media/channels"},
+    # Generated artwork that is not installed anywhere yet. Without this the
+    # archive would miss it entirely -- it only ever snapshotted live stacks,
+    # and an agy run destroyed 102 of its own generated icons on 2026-08-02
+    # before any of them reached a stack.
+    {"name": "generated-pending", "ct": None, "kind": "hostdir",
+     "dir": "/root/agy-icons-keep"},
     {"name": "ct112-jellyfin", "ct": "112", "kind": "jellyfin",
      "db": "/srv/jellyfin-npvr/jellyfin/config/data/jellyfin.db",
      "container_prefix": "/config",
@@ -122,6 +128,20 @@ print(json.dumps(out))
     return {n: base64.b64decode(b) for n, b in json.loads(raw)}
 
 
+def collect_hostdir(stack):
+    """(channel name -> raw bytes) from a plain directory on the host."""
+    d = stack["dir"]
+    if not os.path.isdir(d):
+        raise RuntimeError(f"{d} does not exist")
+    out = {}
+    for f in os.listdir(d):
+        p = os.path.join(d, f)
+        if os.path.isfile(p):
+            with open(p, "rb") as fh:
+                out[os.path.splitext(f)[0]] = fh.read()
+    return out
+
+
 def collect_nextpvr(stack):
     """(channel name -> raw bytes) from NextPVR's name-keyed icon directory."""
     script = f"""
@@ -147,8 +167,12 @@ def export():
 
     for stack in STACKS:
         try:
-            imgs = (collect_jellyfin(stack) if stack["kind"] == "jellyfin"
-                    else collect_nextpvr(stack))
+            if stack["kind"] == "jellyfin":
+                imgs = collect_jellyfin(stack)
+            elif stack["kind"] == "hostdir":
+                imgs = collect_hostdir(stack)
+            else:
+                imgs = collect_nextpvr(stack)
         except Exception as exc:                              # noqa: BLE001
             # Carry forward the previous good entry rather than replacing it
             # with an error stub -- a transient failure must not erase the

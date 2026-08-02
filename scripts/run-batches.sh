@@ -18,9 +18,21 @@ mkdir -p "$KEEP"
 
 for f in "$BATCHDIR"/fast-*.json "$BATCHDIR"/sports-*.json "$BATCHDIR"/affiliate-*.json; do
     slug=$(basename "$f" .json)
-    [ "$slug" = "fast-01" ] && { echo "$slug already done, skipping" | tee -a "$LOG"; continue; }
-
     want=$(python3 -c "import json;print(len(json.load(open('$f'))))")
+
+    # Resumable: skip batches whose icons are already in the keep directory.
+    # The 2026-08-02 run lost fast-01..17 when a later agy session cleared the
+    # working directory, so only the missing ones need regenerating.
+    have=$(python3 -c "
+import json, os
+items = json.load(open('$f'))
+print(sum(os.path.exists('/root/agy-icons-keep/' + i['channel'] + '.png') for i in items))
+")
+    if [ "$have" = "$want" ]; then
+        echo "$slug already complete ($have/$want), skipping" | tee -a "$LOG"
+        continue
+    fi
+
     python3 /root/mkprompt.py "$slug" >/dev/null
 
     /root/bin/agy-task.sh run "icon-$slug" build "@$BATCHDIR/$slug.md" \

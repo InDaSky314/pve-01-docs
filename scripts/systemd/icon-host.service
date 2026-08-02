@@ -1,0 +1,18 @@
+[Unit]
+Description=Media-Core curated channel icon host
+Documentation=file:///root/pve-01-docs/docs/lineup-runbook.md
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/icon-host
+Restart=always
+RestartSec=5
+# Read-only service: it only ever serves files from the icon archive.
+ProtectSystem=strict
+ReadOnlyPaths=/root/icon-archive
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
