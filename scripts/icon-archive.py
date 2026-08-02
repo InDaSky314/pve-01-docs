@@ -261,8 +261,10 @@ def extract(dest, stack_pref=None, custom_only=True):
     import re
     m = json.load(open(MANIFEST))
     order = ([stack_pref] if stack_pref else
-             ["ct112-nextpvr", "production-jellyfin", "ct112-jellyfin"])
-    best = {}
+             ["ct112-nextpvr", "generated-pending",
+              "production-jellyfin", "ct112-jellyfin"])
+    best, aliases = {}, {}
+    PREFIX = re.compile(r"^(US|UK|DE|CA|IT|FR|ES|NL|PT|PL|TR|AR|BR|MX)\s+", re.I)
     for sname in order:
         s = m["stacks"].get(sname) or {}
         for ch, e in (s.get("entries") or {}).items():
@@ -272,18 +274,34 @@ def extract(dest, stack_pref=None, custom_only=True):
             # will be written. "Madison: CBS 3 (WISC)" from Jellyfin and
             # "Madison CBS 3 (WISC)" from NextPVR are the same channel and
             # must compete, not silently overwrite each other.
-            key = re.sub(r"[:/|]", "", ch).strip()
-            cur = best.get(key)
-            if cur is None or e["bytes"] > cur["bytes"]:
+            # Two stacks name the same channel differently: production says
+            # "US: CNN 4K", NextPVR says "CNN 4K". Keyed literally they look
+            # like different channels, so each keeps its own art -- which is
+            # how a contaminated production copy survived beside the correct
+            # NextPVR one. Group on the prefix-stripped name so they compete,
+            # then write the winner out under every alias seen.
+            flat = re.sub(r"[:/|]", "", ch).strip()
+            key = PREFIX.sub("", flat).strip().upper()
+            aliases.setdefault(key, set()).add(flat)
+            # STRICT source precedence, never size. Largest-wins let a
+            # contaminated production copy beat CT 112's correct file: on
+            # 2026-08-02 an archive run happened while production's channel
+            # images were misaligned, so CNN's logo was captured as LAFF TV's
+            # artwork and then served back as the source of truth. NextPVR's
+            # files are name-keyed on disk and cannot drift that way, so they
+            # win outright; generated artwork next; Jellyfin's cache last,
+            # because it is the only source that can silently mis-associate.
+            if key not in best:
                 best[key] = e
     os.makedirs(dest, exist_ok=True)
     written = 0
-    for safe, e in best.items():
+    for key, e in best.items():
         blob = os.path.join(BLOBS, e["md5"])
         if not os.path.exists(blob):
             continue
-        shutil.copy2(blob, os.path.join(dest, safe + ".png"))
-        written += 1
+        for alias in aliases.get(key, {key}):
+            shutil.copy2(blob, os.path.join(dest, alias + ".png"))
+            written += 1
     print(f"extracted {written} images to {dest}")
     return 0
 
