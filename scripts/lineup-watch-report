@@ -1,0 +1,24 @@
+#!/bin/bash
+# Weekly IPTV lineup drift report.
+#
+# The query runs inside CT 105 (it holds the provider credentials and egresses
+# via the Swiss tunnel the account expects); the mail is sent from the host,
+# which is where `mail` is configured. Exit 2 from the inner script means there
+# is something worth sending -- silence otherwise, so a quiet week stays quiet
+# and the mail keeps meaning something.
+set -uo pipefail
+
+MAILTO="nathan.karras@gmail.com"
+OUT="$(pct exec 105 -- python3 /srv/media-core/sync/lineup-watch.py 2>&1)"
+RC=$?
+
+if [ "$RC" -eq 2 ]; then
+    SUBJ="$(printf '%s\n' "$OUT" | sed -n 's/^SUBJECT: //p' | head -1)"
+    printf '%s\n' "$OUT" | sed '/^SUBJECT: /d' | mail -s "${SUBJ:-IPTV lineup changed}" "$MAILTO"
+    echo "reported: $SUBJ"
+elif [ "$RC" -ne 0 ]; then
+    printf '%s\n' "$OUT" | mail -s "IPTV lineup check FAILED" "$MAILTO"
+    echo "check failed, mailed"
+else
+    echo "no lineup changes"
+fi

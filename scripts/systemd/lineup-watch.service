@@ -1,0 +1,7 @@
+[Unit]
+Description=Weekly IPTV provider lineup drift report
+Documentation=file:///root/pve-01-docs/docs/channel-icons-runbook.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/lineup-watch-report
