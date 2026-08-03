@@ -140,6 +140,26 @@ timezone. The gap was invisible from the sync side — the job reported success
 every day and was telling the truth. Trigger the consumer explicitly and log
 what it reports back.
 
+
+**Rebuilding a source underneath a running consumer costs data, silently.**
+CT 112's Jellyfin reads the guide from NextPVR one channel at a time. A
+NextPVR EPG update clears and reinserts `EPG_EVENT`, so a Jellyfin guide
+refresh running at the same moment reads *nothing* for whichever channels are
+mid-rebuild — and caches the emptiness. On 2026-08-03 that cost 19 channels
+their entire guide while NextPVR held 64-160 events for each of them, and it
+happened because a fix for a *different* problem (triggering the ingest
+explicitly) was applied without asking what else was reading at that moment.
+
+`epg-sync-ct112` now checks Jellyfin's guide-refresh task before triggering,
+and treats "could not read the state" the same as "running". The cost of
+skipping is a late guide; the cost of colliding is channels losing it
+entirely.
+
+Generalise it: **before making a shared source rebuild itself, enumerate what
+reads it.** This is the same failure as the watchdogs that assumed a single
+recorder, and the third time in this estate that adding a component
+invalidated an assumption nobody had written down.
+
 ---
 
 ## Destructive-action discipline
