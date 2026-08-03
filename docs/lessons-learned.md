@@ -444,6 +444,24 @@ Task shape is a confound worth naming: the Opus dispatches were open-ended
 one asked a narrow falsifiable question and demanded citations. Well-scoped
 prompts fail less regardless of model.
 
+
+**A generated logo is only as good as the mark you composite onto.** agy was
+asked to add regional identifiers to 21 channels and did exactly that, to
+spec, with an accurate self-report. Three came out visibly weaker than the
+rest — because the on-disk source for those three Bally feeds was the small
+generic "pill" mark, not the full script wordmark the other 44 regionals use.
+The instruction had no way to catch that; the *brief* was the defect, not the
+work.
+
+**When commissioning artwork, state the quality bar for the source, not just
+the output**: "if the source logo for a channel is a generic or low-detail
+mark, say so and stop rather than decorating it". Then re-source the base and
+regenerate — here the full wordmark was one file away in `tv-logos`.
+
+This is why the deliverable to ask for is *artefacts you can look at*. The
+byte counts, filenames and margin measurements all passed; only the contact
+sheet showed the problem.
+
 ### Rules that follow
 
 - **Investigation and research: `gemini-3.1-pro-high`.** Give it one specific

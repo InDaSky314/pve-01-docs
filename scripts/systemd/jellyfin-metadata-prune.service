@@ -1,0 +1,9 @@
+[Unit]
+Description=Prune orphaned Jellyfin Live TV metadata on CT 105 and CT 112
+Documentation=file:///root/pve-01-docs/docs/nextpvr-stack-runbook.md
+After=pve-guests.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/pct exec 112 -- python3 /root/prune-jellyfin-orphan-metadata.py /srv/jellyfin-npvr/jellyfin --apply
+ExecStart=/usr/sbin/pct exec 105 -- python3 /root/prune-jellyfin-orphan-metadata.py /srv/media-core/jellyfin --apply
