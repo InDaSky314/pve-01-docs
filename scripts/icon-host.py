@@ -82,7 +82,11 @@ class Handler(BaseHTTPRequestHandler):
         # Refuse anything that could escape the icon directory. normpath first
         # so "a/../../etc/passwd" collapses before the check.
         safe = posixpath.normpath("/" + name).lstrip("/")
-        if not safe or safe != name or os.path.isabs(name) or ".." in safe:
+        # `".." in safe` would be wrong here: it is a substring test, and a
+        # legitimate channel filename can contain two dots
+        # ("DE NDR HD MECKLENBURG V..png"). Check path *components*.
+        if (not safe or safe != name or os.path.isabs(name)
+                or ".." in safe.split("/")):
             return self._send(400, b"bad name")
 
         full = os.path.join(ICON_DIR, safe)
