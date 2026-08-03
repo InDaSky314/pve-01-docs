@@ -7,6 +7,13 @@ renumber that went mostly right and taught two expensive lessons.
 Read `lessons-learned.md` first. Icon detail lives in
 `channel-icons-runbook.md`; this file covers the lineup itself.
 
+> **CT 112 (NextPVR) has its own runbook: `nextpvr-stack-runbook.md`.**
+> It covers renumbering, renaming, artwork build/organisation and the
+> verification gates for that stack end to end. The two ecosystems store
+> artwork and channel identity differently enough that mixing the procedures
+> has caused real damage — use the one that matches the stack you are on.
+
+
 ---
 
 ## The one rule that matters most
