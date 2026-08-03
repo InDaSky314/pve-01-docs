@@ -109,6 +109,37 @@ Decades, Victory Channel or AFV entry. A plain name card is honest; leaving the
 channel wearing a different network's logo is not, and a stretched fuzzy match
 is worse than both because it looks deliberate.
 
+
+**A client-side HTTP cache can survive a complete server-side rebuild.** On
+2026-08-03, production's channel artwork was cleared entirely — every
+`BaseItemImageInfos` row, every cached file — and a full guide refresh run.
+113 of 996 channels came back with the *pre-fix* logo. The source files, the
+playlist, the XMLTV, and Jellyfin's own parsed copy of the XMLTV were all
+verified correct. Only the bytes were wrong.
+
+The cause was `Cache-Control: public, max-age=86400` on the icon host: Jellyfin
+still held the previous fetch and never asked again. Two more cycles were spent
+before looking at the header.
+
+**When every layer you can inspect is correct and the output still is not, the
+next thing to check is a cache you do not own.** Add Jellyfin's
+`config/cache/images` to that list — it is a processed-image cache that no
+database row references, so the "clear both halves" rule does not reach it.
+
+**Uniqueness is not correctness.** Merging two stacks' artwork by the rule
+"prefer the image that is unique over one that is shared" imported production's
+own misalignment: `US: MTV HD` was serving Antenna TV's logo — uniquely, and
+therefore confidently selected. Of five channels the rule picked, one was
+actively wrong and three were images the other stack already had. Prefer one
+verified source wholesale and check the exceptions by eye.
+
+**Publishing a file is not ingesting it.** `epg-sync-ct112` had been
+delivering a validated guide on time for days while CT 112 served a
+day-old one, because NextPVR ingests on its own internal clock in its own
+timezone. The gap was invisible from the sync side — the job reported success
+every day and was telling the truth. Trigger the consumer explicitly and log
+what it reports back.
+
 ---
 
 ## Destructive-action discipline
