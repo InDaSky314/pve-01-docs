@@ -61,6 +61,54 @@ placeholder. The request succeeded; the content was wrong.
 days while parsing was completely broken, because there were no recordings
 to parse. The bug surfaced the moment a real recording existed.
 
+
+**NextPVR serves `.jpg` in preference to `.png`, and this is silent.** The
+runbook said "do not create both for one channel" without saying which wins.
+On 2026-08-03, 129 of 997 channels on CT 112 had both; in 69 of them the
+`.jpg` was a small provider placeholder shared by dozens of channels and the
+`.png` was the bespoke logo. NextPVR served the placeholder every time, and
+Jellyfin faithfully cached it — so the artwork looked broken at the layer the
+user sees while the "good" file sat right next to it on disk.
+
+Confirmed two ways. Empirically: 69 differing pairs, `.jpg` served 69/69,
+`.png` 0/69. And in NextPVR's own code — `StreamIcon` in `NShared.dll`
+evaluates `File.Exists(base + ".jpg")` first and branches straight to serving
+it, never reaching the `.png` check. Removing the `.jpg` takes effect on the
+very next request; no restart, because the lookup hits the filesystem each
+time.
+
+**Three hashes localise an artwork fault in one pass.** Hash the file on disk,
+the bytes `channel.icon` returns, and the bytes Jellyfin's
+`/Items/<id>/Images/Primary` returns. Two comparisons split the fault cleanly
+and remove the guessing:
+
+| disk vs served | served vs rendered | means |
+|---|---|---|
+| equal | equal | correct |
+| equal | differ | Jellyfin's cache is stale — clear all rows + files, one guide refresh |
+| differ | equal | NextPVR is picking a different file — the `.jpg`/`.png` trap above |
+
+Both classes were present simultaneously on 2026-08-03 (36 stale, 69 wrong
+file), which is why single-cause theories kept half-explaining the symptom.
+
+**A same-brand shared logo is not the same defect as a foreign logo.** Of 625
+channels sharing an image, 567 are dynamic event pools (`NBA 07`, `Soccer PPV
+42`, `UEFA 16`) where a bespoke logo would be wrong by the next fixture.
+Counting "channels sharing an image" as a defect number overstates the problem
+by an order of magnitude. Count only cross-brand collisions.
+
+**Eyes catch what hashes cannot.** After 997/997 rendered images matched their
+source byte-for-byte, a contact sheet of the rendered artwork still found eight
+channels wearing another network's logo — LAFF TV showing PLTV, DECADES showing
+Newsy, AFV Family showing WLIW21. Hash equality proves the pipeline is
+consistent, never that the artwork is right. Render a contact sheet and look at
+it.
+
+**Where no logo exists upstream, generate a wordmark.** `tv-logos` has no
+Decades, Victory Channel or AFV entry. A plain name card is honest; leaving the
+channel wearing a different network's logo is not, and a stretched fuzzy match
+is worse than both because it looks deliberate.
+
 ---
 
 ## Destructive-action discipline

@@ -40,8 +40,33 @@ silence. This started as "colons are stripped"; it is really "illegal
 characters are stripped", and the rule was rediscovered twice — once for 36 of
 the first 37 installs, once for the last 2 of 997.
 
-There is no per-channel extension rule: `.png` and `.jpg` both work, and the
-directory currently holds both. Do not create *both* for one channel.
+Both `.png` and `.jpg` work. **Never create both for one channel** — the
+`.jpg` silently wins and the `.png` is never read. See the next section.
+
+## Extension precedence (layer 1) — the trap that cost 2026-08-03
+
+`.png` and `.jpg` both work, but **when both exist for one channel NextPVR
+always serves the `.jpg`** and never looks at the `.png`. Its `StreamIcon`
+routine tests `File.Exists(<name>.jpg)` first and branches straight to serving
+it.
+
+This matters because the provider import writes `.jpg` placeholders and
+`logofix`-style installs write `.png`. Installing good artwork as `.png` over a
+channel that already has a provider `.jpg` **changes nothing that anyone can
+see**, and the file you just wrote is sitting there to prove you did the work.
+
+Find them before installing anything:
+
+```bash
+pct exec 112 -- bash -c 'cd /srv/jellyfin-npvr/nextpvr/config/media/channels && \
+  ls | sed "s/\.[^.]*$//" | sort | uniq -d'
+```
+
+Move the `.jpg` aside rather than deleting it. The change takes effect on the
+next request — no restart, because the lookup hits the filesystem every time.
+
+As of 2026-08-03 all 129 dual-extension files on CT 112 were quarantined to
+`media/channels.quarantine-jpgdup-20260803/`.
 
 **NextPVR never re-fetches icons.** They are populated once, at channel import.
 Clearing `media/channels` does not trigger a re-fetch — it leaves you with
