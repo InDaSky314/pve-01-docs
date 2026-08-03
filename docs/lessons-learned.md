@@ -160,6 +160,36 @@ reads it.** This is the same failure as the watchdogs that assumed a single
 recorder, and the third time in this estate that adding a component
 invalidated an assumption nobody had written down.
 
+
+**Jellyfin caches the tuner's channel list too, and a guide refresh does not
+invalidate it.** On 2026-08-03 two channels were swapped in the lineup. The
+config, the generated playlist, Threadfin's `xepg.json` and Threadfin's own
+`lineup.json` all showed the new pair; Jellyfin kept serving the old two
+through a full guide refresh. The stale copy was
+`jellyfin/cache/<tuner-id>_channels` — and it had been *rewritten* during the
+refresh, from Jellyfin's own stale list, so its timestamp looked current.
+
+Moving that file aside and refreshing enumerated the new channels immediately.
+
+That makes **four** caches between a lineup change and the screen, and the
+"clear both halves" rule reaches only two of them:
+
+| # | Cache | Cleared by |
+|---|---|---|
+| 1 | `BaseItemImageInfos` rows | the SQL delete |
+| 2 | `metadata/livetv/<guid>/` files | the file delete |
+| 3 | `cache/images` (processed images) | nothing — must be removed explicitly |
+| 4 | `cache/<tuner-id>_channels` (tuner lineup) | nothing — must be removed explicitly |
+
+**A renamed channel keeps the previous occupant's artwork.** Jellyfin matched
+the new names onto the existing channel slots, so 120/121 rendered the old
+Bally logos under the new names. Clearing the image rows and refreshing is the
+fix; there is no partial version of it that works.
+
+The general rule this session kept re-teaching: **when every layer you can
+inspect is correct and the output still is not, the next thing to check is a
+cache you do not own.**
+
 ---
 
 ## Destructive-action discipline
