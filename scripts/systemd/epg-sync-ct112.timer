@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily XMLTV propagation to CT 112 (jellyfin-npvr)
+
+[Timer]
+# 12:28: after media-core-sync (12:01, ~95s) and media-core-xepg (12:25) on
+# CT 105, before NextPVR's 12:35 ingest on CT 112. Midday deliberately -- the
+# host is on a mains timer and is normally off 22:24-04:57.
+OnCalendar=*-*-* 12:28:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

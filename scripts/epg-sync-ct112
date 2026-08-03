@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""
+Propagate the generated XMLTV guide from CT 105 to CT 112 (jellyfin-npvr).
+
+CT 105 rebuilds /srv/media-core/epg/epg.xml at 12:01 (media-core-sync) and
+refreshes it hourly (media-core-ppv). CT 112's NextPVR ingests
+/config/epg.xml at 12:35 on its own clock. Nothing connected the two, so
+CT 112's guide was frozen at whatever was copied by hand -- verified
+2026-08-02, when the file was 13 hours old and forward coverage had decayed
+to 9 events for Aug 5.
+
+CT 105's /srv/media-core is a thin LV that cannot be double-mounted, so the
+transfer goes CT 105 -> host -> CT 112 via `pct pull` / `pct push` rather
+than a shared mount.
+
+Runs at 12:28: after media-core-sync (12:01, ~95s) and media-core-xepg
+(12:25), before NextPVR's 12:35 ingest.
+
+Refuses to publish a file it cannot validate. A stale guide degrades slowly;
+a truncated or unparseable one aborts the entire EPG update for all 997
+channels and reports success while inserting nothing -- that failure has
+already cost this project a day.
+"""
+import hashlib
+import re
+import subprocess
+import sys
+import os
+import tempfile
+import time
+import urllib.request
+import xml.etree.ElementTree as ET
+
+SRC_CT = "105"
+SRC_PATH = "/srv/media-core/epg/epg.xml"
+DST_CT = "112"
+DST_PATH = "/srv/jellyfin-npvr/nextpvr/config/epg.xml"
+DST_TMP = DST_PATH + ".incoming"
+
+# The file has run 18-23 MB all year. Anything far below that is a truncated
+# write or a failed provider pull, not a real guide.
+MIN_BYTES = 8 * 1024 * 1024
+
+# Publishing the file is not the same as ingesting it. NextPVR ingests on its
+# own internal clock, which has its own timezone -- 12:35 there has been
+# observed firing at 14:35 here -- so a freshly published guide could sit
+# unread for hours. Trigger the ingest explicitly instead, straight after a
+# file we have already validated.
+NPVR = "http://localhost:8866"
+NPVR_PIN = "0000"
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def npvr(path, timeout=60):
+    """One NextPVR HTTP call, from inside CT 112."""
+    out = run(["pct", "exec", DST_CT, "--", "curl", "-s", "-m", str(timeout),
+               NPVR + path])
+    return out.stdout
+
+
+def trigger_epg_update():
+    """Ask NextPVR to ingest the guide now, and wait for it to finish.
+
+    Best-effort: the file is already published, so a failure here means the
+    guide is late, not lost. Returns a status string for the log.
+    """
+    try:
+        x = npvr("/service?method=session.initiate&ver=1.0&device=epg-sync")
+        sid = re.search(r"<sid>([^<]+)</sid>", x).group(1)
+        salt = re.search(r"<salt>([^<]+)</salt>", x).group(1)
+        md5 = hashlib.md5(
+            (":" + hashlib.md5(NPVR_PIN.encode()).hexdigest() + ":" + salt)
+            .encode()).hexdigest()
+        npvr(f"/service?method=session.login&md5={md5}&sid={sid}")
+        npvr(f"/services/service?method=system.epg.update&format=json&sid={sid}")
+    except Exception as exc:                                   # noqa: BLE001
+        return f"WARNING: could not trigger EPG update ({exc}); NextPVR will ingest on its own schedule"
+
+    # "[0 inserted, 0 updated, 0 skipped]" is the tell that the file was not
+    # read at all -- surface the counts rather than just "complete".
+    for _ in range(60):
+        time.sleep(15)
+        try:
+            s = npvr(f"/services/service?method=system.epg.status&format=json&sid={sid}")
+        except Exception:                                      # noqa: BLE001
+            continue
+        if '"updating": false' in s or '"updating":false' in s:
+            m = re.search(r'"status":\s*"([^"]*)"', s)
+            return "EPG update: " + (m.group(1) if m else s.strip())
+    return "WARNING: EPG update still running after 15 minutes"
+
+
+def main():
+    fd, tmp = tempfile.mkstemp(prefix="epg-ct112-", suffix=".xml")
+    os.close(fd)
+    try:
+        try:
+            run(["pct", "pull", SRC_CT, SRC_PATH, tmp])
+        except subprocess.CalledProcessError as e:
+            log(f"FAIL: could not pull {SRC_PATH} from CT {SRC_CT}: {e.stderr.strip()}")
+            return 1
+
+        size = os.path.getsize(tmp)
+        if size < MIN_BYTES:
+            log(f"FAIL: source is {size} bytes, below the {MIN_BYTES} floor -- not publishing")
+            return 1
+
+        # An unescaped '&' in a channel name has silently aborted a full EPG
+        # update here before. Parse it on this side, where failing is cheap.
+        try:
+            root = ET.parse(tmp).getroot()
+        except ET.ParseError as e:
+            log(f"FAIL: source does not parse as XML ({e}) -- not publishing")
+            return 1
+
+        channels = len(root.findall("channel"))
+        programmes = len(root.findall("programme"))
+        if not programmes:
+            log("FAIL: source parsed but contains zero programmes -- not publishing")
+            return 1
+
+        try:
+            run(["pct", "push", DST_CT, tmp, DST_TMP])
+            # Atomic within the destination filesystem, so NextPVR never sees
+            # a half-written file even if it reads mid-copy.
+            run(["pct", "exec", DST_CT, "--", "mv", "-f", DST_TMP, DST_PATH])
+        except subprocess.CalledProcessError as e:
+            log(f"FAIL: could not publish to CT {DST_CT}: {e.stderr.strip()}")
+            run(["pct", "exec", DST_CT, "--", "rm", "-f", DST_TMP])
+            return 1
+
+        log(f"published {size} bytes to CT {DST_CT}: {channels} channels, {programmes} programmes")
+        log(trigger_epg_update())
+        return 0
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
