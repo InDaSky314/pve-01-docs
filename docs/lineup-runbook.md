@@ -177,11 +177,12 @@ icon-verify repair <stack>       # NextPVR stacks only -- see limitation below
 lineup-watch (Sun 12:40)         # weekly new/dropped/renamed channels + new movies
 ```
 
-**Known limitation:** `icon-verify repair` works only on NextPVR stacks,
-because that is the one place a file can be put back. Production's artwork
-arrives via playlist URLs, so repairing it needs either local hosting with
-`tvg-logo` rewritten, or direct writes to Jellyfin's image rows. Detection
-works on production; repair does not. Not yet built.
+**Superseded 2026-08-03:** this said repair worked only on NextPVR stacks.
+It now works on production too — via the icon host, which is exactly the
+"local hosting with `tvg-logo` rewritten" route this note anticipated. See
+*Procedure: install artwork on production* below. `icon-verify repair` itself
+is still NextPVR-only; production is repaired by republishing through the
+icon host.
 
 ---
 
@@ -230,11 +231,10 @@ stacks hold art for the same channel **the largest file wins** — consistently
 the better image here. Filenames already have `:` `/` `|` stripped, so the
 output drops straight into a NextPVR icon directory.
 
-**Repair works on NextPVR stacks only.** Production's artwork arrives as
-playlist URLs, so putting a file back there requires either hosting the images
-locally and rewriting `tvg-logo`, or writing directly into Jellyfin's image
-rows. Detection works on production; repair is not built. Treat production
-artwork as *protected by backup, not by restore*.
+**Production is now restorable too**, through the icon host — see
+*Procedure: install artwork on production*. `icon-verify repair` still writes
+files only on NextPVR stacks; production is restored by publishing the art to
+the icon host and republishing the playlist.
 
 ### What the archive holds
 
@@ -253,6 +253,87 @@ Jellyfin** and nowhere else. That is what this protects.
 3. Follow `channel-icons-runbook.md` to make Jellyfin pick them up — clear
    **all** channel image rows and run **one** guide refresh to completion.
    Clearing a subset does not re-fetch.
+
+---
+
+## Procedure: install artwork on production
+
+**This works now.** The runbook previously said repair was "detection only,
+not built" for production — that was true while artwork arrived as provider
+URLs. The icon host closed it. Done end to end on 2026-08-03; both stacks now
+render byte-identical artwork for all 996 shared channels.
+
+The route is: **CT 112 is the source of truth, the icon host publishes it, and
+production's playlist points at the icon host.**
+
+```
+CT 112 media/channels/<name>.png     curated, verified
+   │  (export the *effective* file per channel — NextPVR prefers .jpg)
+   ▼
+/root/icon-archive/extracted/        served by icon-host.service :8100
+   │  xtream-sync pick_logo() prefers a curated URL over the provider's
+   ▼
+playlist.m3u + epg.xml               tvg-logo / <icon src>
+   │  media-core-xepg repoints xepg.json
+   ▼
+production Jellyfin
+```
+
+```bash
+# 1. export CT 112's effective artwork, keyed the way pick_logo() looks it up
+pct exec 112 -- python3 /root/ct112-effective-icons.py      # scripts/
+pct pull 112 /root/ct112-icons.tgz /root/ct112-icons.tgz
+tar xzf /root/ct112-icons.tgz -C /root/
+cp -a /root/icon-archive/extracted /root/icon-archive/extracted.bak-$(date +%Y%m%d)
+cp /root/ct112-effective-icons/* /root/icon-archive/extracted/
+curl -s http://192.168.9.11:8100/healthz          # expect icons == channel count
+
+# 2. regenerate and republish
+pct exec 105 -- systemctl start media-core-sync.service    # "icons: N channels using curated artwork"
+pct exec 105 -- systemctl start media-core-xepg.service    # "N channels repointed at the icon host"
+
+# 3. clear production Jellyfin's channel artwork -- rows, files AND cache
+pct exec 105 -- docker stop jellyfin
+pct exec 105 -- python3 /root/prod-clear-channel-images.py
+pct exec 105 -- rm -rf /srv/media-core/jellyfin/cache/images
+pct exec 105 -- docker start jellyfin
+# then trigger Refresh Guide; ~20 minutes for 996 channels
+
+# 4. verify at the layer the user sees
+pct exec 105 -- python3 /root/prod-verify-icons.py         # expect {"MATCH": 996}
+python3 scripts/icon-contact-sheet-prod.py 100 250 /tmp/p.png   # then LOOK at it
+```
+
+### Three traps, each of which cost a full 20-minute cycle
+
+**Clear the HTTP image cache too.** `config/cache/images` is Jellyfin's
+processed-image cache and no database row references it, so the usual
+"clear both halves" rule does not catch it. Left in place it will re-serve
+the old logo after a correct re-fetch.
+
+**Watch the icon host's `Cache-Control`.** It used to send `max-age=86400`.
+113 of 996 channels came back with pre-fix logos through a *complete*
+clear-and-refresh, because Jellyfin served them from its HTTP cache and never
+asked. The source, the playlist, the XMLTV and Jellyfin's own parsed copy were
+all correct — only the bytes were stale. Now `max-age=60, must-revalidate`.
+
+**Do not let Threadfin's restarts race the refresh.** Run sync and xepg to
+completion, confirm Threadfin serves the new logos
+(`curl :34400/m3u/threadfin.m3u | grep -c 8100`), and only then clear and
+refresh. A refresh started during xepg's Threadfin restarts produced 342
+stale channels.
+
+### Production's own artwork is not a safe reference
+
+The obvious merge rule — "keep production's image where it is unique and
+CT 112's is shared" — imported production's *own* misalignment: `US: MTV HD`
+was serving Antenna TV's logo, uniquely and confidently. Of five candidates
+the rule selected, one was actively wrong and three were the same image
+CT 112 already had.
+
+**Take CT 112 wholesale and check the exceptions by eye**, or verify each
+candidate against what the channel should look like. Uniqueness is not
+correctness.
 
 ---
 
