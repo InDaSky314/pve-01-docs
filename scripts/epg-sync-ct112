@@ -49,6 +49,15 @@ MIN_BYTES = 8 * 1024 * 1024
 NPVR = "http://localhost:8866"
 NPVR_PIN = "0000"
 
+# Jellyfin on CT 112 reads the guide from NextPVR per channel. NextPVR's EPG
+# update clears and reinserts EPG_EVENT, so a Jellyfin guide refresh running
+# at the same time reads *nothing* for whichever channels are mid-rebuild and
+# caches the emptiness. Observed 2026-08-03: 19 channels lost their guide
+# entirely that way, while NextPVR held 64-160 events for each of them.
+JF = "http://192.168.9.219:8096"
+JF_KEY = "1f74eabb57a5a6165e67c08aed0108b6"
+JF_GUIDE_TASK = "bea9b218c97bbf98c5dc1303bdb9a0ca"
+
 
 def run(cmd, **kw):
     return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
@@ -65,12 +74,35 @@ def npvr(path, timeout=60):
     return out.stdout
 
 
+def jellyfin_refresh_running():
+    """Is CT 112's Jellyfin part-way through a guide refresh?
+
+    Unmeasurable returns None, and the caller treats that as "do not touch" —
+    the cost of skipping is a late guide; the cost of colliding is channels
+    losing their guide entirely.
+    """
+    try:
+        out = run(["curl", "-s", "-m", "15", "-H",
+                   "Authorization: MediaBrowser Token=" + JF_KEY,
+                   f"{JF}/ScheduledTasks/{JF_GUIDE_TASK}"]).stdout
+        import json as _json
+        return _json.loads(out).get("State") != "Idle"
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
 def trigger_epg_update():
     """Ask NextPVR to ingest the guide now, and wait for it to finish.
 
     Best-effort: the file is already published, so a failure here means the
     guide is late, not lost. Returns a status string for the log.
     """
+    busy = jellyfin_refresh_running()
+    if busy is not False:
+        why = "is running" if busy else "state could not be read"
+        return (f"skipped EPG update: Jellyfin's guide refresh {why}. "
+                "Rebuilding NextPVR's EPG underneath a running refresh costs "
+                "channels their guide. NextPVR will ingest on its own schedule.")
     try:
         x = npvr("/service?method=session.initiate&ver=1.0&device=epg-sync")
         sid = re.search(r"<sid>([^<]+)</sid>", x).group(1)
