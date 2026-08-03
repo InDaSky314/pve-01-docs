@@ -334,7 +334,18 @@ things. Metadata — not media — is what fills these disks.
 
 **Floors, not targets:**
 
-- **Live TV stack: 40 GB.** 16 GB is not survivable — proven twice.
+- **Live TV stack: 40 GB steady state, 60 GB if you will be iterating.**
+  16 GB is not survivable — proven twice. 40 GB is not enough either once you
+  start *repeating* guide refreshes: each one caches programme artwork under
+  new item GUIDs and orphans the previous set, so CT 112 went from 7 GB to
+  34 GB across four refreshes on 2026-08-03 and was losing 150 MB/minute with
+  4 GB left. Grown to 59 GB mid-run rather than deleting anything under
+  pressure — `pct resize 112 rootfs +20G` is online and takes seconds, and the
+  thin pool had 1.4 TB free the whole time.
+
+  **Check free space before starting a guide refresh, not during one.** The
+  arithmetic is simple: measure the rate over one minute, multiply by the
+  remaining percentage.
 - **VOD stack: 80 GB per ~236k items.** CT 111 sits at 70% after a full scan.
 - **RAM: 4 GB is the floor and it is tight.** `jellyfin-vod` held 2.8 GB of
   its 4 GB cap during the library scan. Under-sizing here does not fail
