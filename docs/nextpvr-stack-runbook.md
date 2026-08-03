@@ -311,7 +311,21 @@ broken.
 ## Feeding CT 112
 
 * **EPG**: `epg-sync-ct112.timer` on the host, 12:28 daily, pushes the XMLTV
-  generated on CT 105.
+  generated on CT 105, then triggers NextPVR's ingest explicitly and logs the
+  insert counts. It does **not** trigger while Jellyfin's guide refresh is
+  running — see the ordering rule below.
+
+  **Ordering rule: never rebuild NextPVR's EPG under a running Jellyfin guide
+  refresh.** Jellyfin reads the guide from NextPVR one channel at a time, and
+  a NextPVR EPG update clears and reinserts `EPG_EVENT`. A refresh running at
+  that moment reads nothing for whichever channels are mid-rebuild and caches
+  the emptiness. On 2026-08-03 that cost 19 channels their entire guide while
+  NextPVR held 64-160 events for each. The correct sequence is:
+
+      publish epg.xml -> NextPVR ingest (wait for completion) -> Jellyfin refresh
+
+  `epg-sync-ct112` enforces the first half. If you are driving this by hand,
+  check `/ScheduledTasks/bea9b218c97bbf98c5dc1303bdb9a0ca` is `Idle` first.
 * **Playlist**: there is **no timer**. `playlist.m3u` is pushed by hand and was
   stale for a day without anyone noticing. Propagating it makes NextPVR
   re-import at its next scan, and whether that preserves the icon files is
