@@ -1,0 +1,8 @@
+[Unit]
+Description=Propagate generated XMLTV guide from CT 105 to CT 112 (jellyfin-npvr)
+Documentation=file:///root/pve-01-docs/docs/split-build-status-20260801.md
+After=pve-guests.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/epg-sync-ct112
