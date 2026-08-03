@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly prune of orphaned Jellyfin Live TV metadata
+
+[Timer]
+# Sunday 06:30 — after the host's power-on at 04:57, well clear of the daily
+# 12:01/12:25/12:28 lineup jobs and of any guide refresh they trigger.
+OnCalendar=Sun 06:30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

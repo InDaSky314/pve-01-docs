@@ -1,0 +1,138 @@
+[
+  {
+    "channel": "US: MUSIC CHOICE POP HITS",
+    "file": "US MUSIC CHOICE POP HITS.png",
+    "identifier": "POP HITS",
+    "band_colour": "#E31B23",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/US MUSIC CHOICE POP HITS.png",
+    "bytes": 27336
+  },
+  {
+    "channel": "US: MUSIC CHOICE CLASSIC COUNTRY HD",
+    "file": "US MUSIC CHOICE CLASSIC COUNTRY HD.png",
+    "identifier": "CLASSIC COUNTRY",
+    "band_colour": "#E31B23",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/US MUSIC CHOICE CLASSIC COUNTRY HD.png",
+    "bytes": 28980
+  },
+  {
+    "channel": "US: MUSIC CHOICE HIP-HOP AND R&B",
+    "file": "US MUSIC CHOICE HIP-HOP AND R&B.png",
+    "identifier": "HIP-HOP & R&B",
+    "band_colour": "#E31B23",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/US MUSIC CHOICE HIP-HOP AND R&B.png",
+    "bytes": 28336
+  },
+  {
+    "channel": "US: MUSIC CHOICE TROPICALES HD",
+    "file": "US MUSIC CHOICE TROPICALES HD.png",
+    "identifier": "TROPICALES",
+    "band_colour": "#E31B23",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/US MUSIC CHOICE TROPICALES HD.png",
+    "bytes": 29424
+  },
+  {
+    "channel": "US: MUSIC CHOICE: HIP-HOP CLASSICS",
+    "file": "US MUSIC CHOICE HIP-HOP CLASSICS.png",
+    "identifier": "HIP-HOP CLASSICS",
+    "band_colour": "#E31B23",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/US MUSIC CHOICE HIP-HOP CLASSICS.png",
+    "bytes": 27978
+  },
+  {
+    "channel": "Green Bay: PBS 38 (WPNE)",
+    "file": "Green Bay PBS 38 (WPNE).png",
+    "identifier": "WPNE 38",
+    "band_colour": "#2638C4",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/Green Bay PBS 38 (WPNE).png",
+    "bytes": 24403
+  },
+  {
+    "channel": "New York: PBS (WNJN)",
+    "file": "New York PBS (WNJN).png",
+    "identifier": "WNJN",
+    "band_colour": "#2638C4",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/New York PBS (WNJN).png",
+    "bytes": 21772
+  },
+  {
+    "channel": "Los Angeles: PBS (KQIN)",
+    "file": "Los Angeles PBS (KQIN).png",
+    "identifier": "KQIN",
+    "band_colour": "#2638C4",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/Los Angeles PBS (KQIN).png",
+    "bytes": 22259
+  },
+  {
+    "channel": "US: BALLY SPORTS PRIME TICKET HD",
+    "file": "US BALLY SPORTS PRIME TICKET HD.png",
+    "identifier": "PRIME TICKET",
+    "band_colour": "#E4022D",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/US BALLY SPORTS PRIME TICKET HD.png",
+    "bytes": 13034
+  },
+  {
+    "channel": "US: BALLY SPORTS CINCINNATI HD",
+    "file": "US BALLY SPORTS CINCINNATI HD.png",
+    "identifier": "CINCINNATI",
+    "band_colour": "#E4022D",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/US BALLY SPORTS CINCINNATI HD.png",
+    "bytes": 12538
+  },
+  {
+    "channel": "US: BALLY SPORTS CINCINNATI PLUS HD",
+    "file": "US BALLY SPORTS CINCINNATI PLUS HD.png",
+    "identifier": "CINCINNATI / PLUS",
+    "band_colour": "#E4022D",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/US BALLY SPORTS CINCINNATI PLUS HD.png",
+    "bytes": 13995
+  },
+  {
+    "channel": "DE: BR FERNSEHEN HD NORD",
+    "file": "DE BR FERNSEHEN HD NORD.png",
+    "identifier": "NORD",
+    "band_colour": "#2A65A9",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/DE BR FERNSEHEN HD NORD.png",
+    "bytes": 18063
+  },
+  {
+    "channel": "DE: BR FERNSEHEN HD S\u00dcD",
+    "file": "DE BR FERNSEHEN HD S\u00dcD.png",
+    "identifier": "S\u00dcD",
+    "band_colour": "#2A65A9",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/DE BR FERNSEHEN HD S\u00dcD.png",
+    "bytes": 16767
+  },
+  {
+    "channel": "DE: MTV HD",
+    "file": "DE MTV HD.png",
+    "identifier": "DEUTSCHLAND",
+    "band_colour": "#00A9CF",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/DE MTV HD.png",
+    "bytes": 22625
+  },
+  {
+    "channel": "US: CSN PHILADELPHIA PLUS HD",
+    "file": "US CSN PHILADELPHIA PLUS HD.png",
+    "identifier": "PLUS",
+    "band_colour": "#008CC3",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/US CSN PHILADELPHIA PLUS HD.png",
+    "bytes": 44792
+  },
+  {
+    "channel": "US: HALLMARK MOVIES/MYSTERIES 4K",
+    "file": "US HALLMARK MOVIESMYSTERIES 4K.png",
+    "identifier": "4K",
+    "band_colour": "#CDE950",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/US HALLMARK MOVIESMYSTERIES 4K.png",
+    "bytes": 37051
+  },
+  {
+    "channel": "Green Bay: CBS 5 (WFRV) Alt",
+    "file": "Green Bay CBS 5 (WFRV) Alt.png",
+    "identifier": "ALT",
+    "band_colour": "#0055A5",
+    "source_file": "/srv/jellyfin-npvr/nextpvr/config/media/channels/Green Bay CBS 5 (WFRV) Alt.png",
+    "bytes": 26158
+  }
+]
