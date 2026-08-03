@@ -48,8 +48,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         if cache:
-            # Icons change rarely; let clients hold them.
-            self.send_header("Cache-Control", "public, max-age=86400")
+            # Icons change rarely, but when they do, a day-long client cache
+            # is the difference between a fix landing and not. Jellyfin held
+            # 113 stale channel logos through a full clear-and-refresh on
+            # 2026-08-03 because of a 24h max-age here. Revalidate instead:
+            # the images are small and both consumers are on the LAN.
+            self.send_header("Cache-Control", "public, max-age=60, must-revalidate")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
