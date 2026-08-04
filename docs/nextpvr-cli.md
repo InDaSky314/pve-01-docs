@@ -61,6 +61,52 @@ Four traps, each of which cost a round trip:
 4. **Scan status is consumed by reading it.** Poll once, keep the payload — a
    second read returns empty and the channel list is gone.
 
+
+## Importing channels over HTTP — two things the scan does not do
+
+Learned 2026-08-04 rebuilding CT 112 from a modernised playlist.
+
+**`scan.save` takes the BARE channels array as its body.** Wrapping it as
+`{"channels": [...]}` returns HTTP 500 with no useful detail. The shape the
+status endpoint hands back is the shape save expects:
+
+```python
+payload = json.loads(get("...setting.scan.status&format=json&sid=" + sid))
+post("...setting.scan.save&format=json&groups=all&sid=" + sid,
+     payload["channels"])          # not {"channels": ...}
+```
+
+**`scan.save` does NOT populate `epg_source` / `epg_mapping`.** All 957
+channels imported with both empty, and the next EPG update reported:
+
+```
+EPG Update complete. [0 inserted, 0 updated, 0 skipped]
+```
+
+which is the tell from `lessons-learned.md` that the mechanism never ran —
+not that there was nothing to do. It reads exactly like success.
+
+Run `scripts/ct112-map-epg.py` after any re-import. It matches channel name to
+the XMLTV `display-name` and writes the blob NextPVR expects:
+
+```xml
+<epg>
+  <source>XMLTV</source>
+  <file>/config/epg.xml</file>
+  <mapping_id>BET.us</mapping_id>
+  <mapping_name>BET HD</mapping_name>
+</epg>
+```
+
+`mapping_name` **must be XML-escaped**. An unescaped `&` in "A&E HD" produces
+an invalid blob, and one invalid blob aborts EPG ingest for *every* channel
+while still reporting success. The script re-parses every blob before exiting
+and returns non-zero if any fails.
+
+**Order matters.** The scan maps against whatever `epg.xml` is on disk at that
+moment. Push the current guide *first*, or every channel imports unmapped —
+that is exactly how the empty-mapping case above happened.
+
 ## Renumbering: existing channels never change
 
 `tvg-chno` is honoured **only for channels NextPVR does not already have** —
