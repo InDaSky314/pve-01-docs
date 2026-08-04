@@ -1,0 +1,112 @@
+{
+  "uid": "brewers-schedule",
+  "title": "Milwaukee Brewers \u2014 Schedule",
+  "tags": [
+    "brewers",
+    "media-core"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30m",
+  "time": {
+    "from": "now",
+    "to": "now+14d"
+  },
+  "panels": [
+    {
+      "type": "table",
+      "title": "Upcoming games",
+      "description": "Live from statsapi.mlb.com, filtered by the dashboard time range.\n\nBrewers games carry on **channel 121 (Milwaukee Brewers HD)** \u2014 an MLB.TV team feed, verified carrying a live game on 2026-08-04.\n\nCaveat: 'Broadcast' is whichever feed MLB lists first, which for away games is often the opponent's regional network rather than the Brewers feed. Treat it as 'a broadcaster', not 'your broadcaster'.",
+      "id": 1,
+      "gridPos": {
+        "h": 16,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "mlb-statsapi"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "mlb-statsapi"
+          },
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "parser": "backend",
+          "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&teamId=158&startDate=${__from:date:YYYY-MM-DD}&endDate=${__to:date:YYYY-MM-DD}&hydrate=team,broadcasts(all)",
+          "url_options": {
+            "method": "GET"
+          },
+          "root_selector": "dates.games",
+          "columns": [
+            {
+              "selector": "gameDate",
+              "text": "First pitch",
+              "type": "timestamp"
+            },
+            {
+              "selector": "teams.away.team.name",
+              "text": "Away",
+              "type": "string"
+            },
+            {
+              "selector": "teams.home.team.name",
+              "text": "Home",
+              "type": "string"
+            },
+            {
+              "selector": "status.detailedState",
+              "text": "Status",
+              "type": "string"
+            },
+            {
+              "selector": "broadcasts.0.name",
+              "text": "Broadcast",
+              "type": "string"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "First pitch"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 200
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "sortBy": [
+          {
+            "displayName": "First pitch",
+            "desc": false
+          }
+        ],
+        "footer": {
+          "show": false
+        }
+      }
+    }
+  ]
+}
