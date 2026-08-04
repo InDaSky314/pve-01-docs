@@ -190,6 +190,25 @@ The general rule this session kept re-teaching: **when every layer you can
 inspect is correct and the output still is not, the next thing to check is a
 cache you do not own.**
 
+
+**Never start a refresh while the thing it reads from is still being edited.**
+This cost two cycles on 2026-08-04 and is the same shape both times:
+
+- A Jellyfin guide refresh was started while the icon host was still being
+  re-keyed. 150 channels came back with no artwork at all — the source was
+  correct by the time anyone looked, so nothing pointed at the cause.
+- A NextPVR channel scan was run against a stale `epg.xml`, so all 957
+  channels imported with an empty `epg_mapping` and the EPG update then
+  reported `[0 inserted, 0 updated, 0 skipped]`.
+
+Both jobs reported success. The ordering rule is explicit:
+
+    change the source -> let it settle -> verify the source -> then refresh
+
+Verifying the source is the cheap step that catches this: `curl` a sample of
+the icon-host URLs, or check `epg_mapping` is populated, *before* spending
+twenty-five minutes on a refresh that will have to be repeated.
+
 ---
 
 ## Destructive-action discipline
