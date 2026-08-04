@@ -68,12 +68,14 @@ JF_DONE = {"Completed", "Cancelled", "Error"}
 
 UPCOMING_DAYS = 10
 DURATION = {"football": timedelta(hours=3, minutes=45),
-            "basketball": timedelta(hours=2, minutes=45)}
+            "basketball": timedelta(hours=2, minutes=45),
+            "baseball": timedelta(hours=3, minutes=15)}
 TEAMS = [
     ("Packers",            "football/nfl",                       "gb"),
     ("Badgers Football",   "football/college-football",          "275"),
     ("Badgers Basketball", "basketball/mens-college-basketball", "275"),
     ("Bucks",              "basketball/nba",                     "mil"),
+    ("Brewers",            "baseball/mlb",                       "mil"),
 ]
 
 # Schedules change rarely; recordings change often. Cached separately.
@@ -138,12 +140,21 @@ def all_games(now: datetime) -> list[dict]:
             req = urllib.request.Request(
                 f"https://site.api.espn.com/apis/site/v2/sports/{sport}"
                 f"/teams/{team}/schedule?seasontype={stype}",
-                headers={"User-Agent": "dvr-dashboard/1.0"})
+                # No custom User-Agent. ESPN's edge 403s "dvr-dashboard/1.0",
+                # any Mozilla string, and Wget, but serves curl/* and Python's
+                # default urllib UA. Setting a polite identifying UA is exactly
+                # what silently broke every team's schedule -- all_games()
+                # swallows the exception and returns an empty list, so the
+                # dashboard just showed no games rather than an error.
+                )
             with urllib.request.urlopen(req, timeout=20) as r:
                 data = json.load(r)
         except Exception:                                   # noqa: BLE001
             continue
-        kind = "football" if "football" in sport else "basketball"
+        # Derived from the sport path, not guessed. The old
+        # football-or-basketball test silently called baseball "basketball"
+        # and gave every Brewers game a 2h45 duration.
+        kind = sport.split("/")[0]
         for ev in data.get("events", []):
             try:
                 start = datetime.fromisoformat(
