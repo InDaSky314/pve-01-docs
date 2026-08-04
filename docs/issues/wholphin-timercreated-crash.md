@@ -72,3 +72,23 @@ a NextPVR backend, not just this fork. Worth reporting upstream to
 Full ACRA report, including the logcat showing the successful POST followed by
 the crash 0.15 s later, is on the server at:
 `jellyfin/config/log/upload_Wholphin Custom_1.0.5-0-gcaf61d30_20260804191303_*.log`
+
+---
+
+## Follow-ups, 2026-08-04 evening
+
+**Upstream:** filed as jellyfin/jellyfin-sdk-kotlin#1263. The server is
+compliant — its OpenAPI spec lists no `required` fields on `TimerEventInfo` —
+so the fix belongs in the SDK generator, which appears to derive optionality
+from `nullable` rather than from `required`. Precedent: upstream #936 was the
+same class of bug on `SearchHint.matchedTerm`, fixed per-field in 2024.
+
+**Reproduced** a second time at 21:54 with an identical stack
+(`upload_Wholphin Custom_1.0.5-0-gcaf61d30_20260804195455_*.log`).
+
+**The live-buffer change did NOT fix the playback loop-back.** Pointing
+`LiveTVBufferDirectory` at the dedicated `/buffer` mount was still worth doing
+— it had been sharing the recordings directory while `/buffer` sat empty — but
+watching a channel that is recording still resumes from the moment the
+recording began. So that behaviour is *not* caused by the shared directory,
+and the cause is still unknown. Do not repeat that hypothesis.
