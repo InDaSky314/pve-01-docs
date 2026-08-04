@@ -209,6 +209,29 @@ Verifying the source is the cheap step that catches this: `curl` a sample of
 the icon-host URLs, or check `epg_mapping` is populated, *before* spending
 twenty-five minutes on a refresh that will have to be repeated.
 
+
+**A client crash report may already be sitting on the server.** Wholphin
+crashed every time a recording was started, and the instinct was to reach for
+ADB and a logcat from the TV. It was not needed: the app uploads its ACRA
+report to Jellyfin, and it was already in
+`jellyfin/config/log/upload_<app>_<version>_<timestamp>_*.log` — full stack
+trace and the surrounding logcat. **Check the server's log directory before
+pairing with a device.**
+
+**"The recording failed" and "the client crashed" are different claims.** The
+recordings were completing normally the whole time — 951 MB and 361 MB files
+on disk, and a Jellyfin timer reading `InProgress`. Only the notification
+afterwards killed the app. Establishing which half is broken took one `ls` of
+the recordings directory and reframed the entire investigation.
+
+**A WebSocket event that fails its own schema will take a client down.**
+Jellyfin's NextPVR plugin emits `TimerCreated` with only `ProgramId`, while
+the Kotlin SDK marks `TimerEventInfo.Id` as required — so deserialization
+throws from a background coroutine and the process dies.
+`TimerCancelled` sends `Id` and works, which is what isolated it. Two lessons:
+the server should not emit events that violate the SDK contract, and a client
+should never let one unparseable message be fatal.
+
 ---
 
 ## Destructive-action discipline
