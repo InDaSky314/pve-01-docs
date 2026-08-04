@@ -1,0 +1,15 @@
+apiVersion: 1
+datasources:
+  - name: MLB StatsAPI
+    uid: mlb-statsapi
+    type: yesoreyeram-infinity-datasource
+    access: proxy
+    isDefault: false
+    jsonData:
+      # Restricted to the one host it needs. Infinity will refuse any other
+      # URL, so a mis-typed panel cannot turn this into a general-purpose
+      # outbound fetcher.
+      allowedHosts:
+        - https://statsapi.mlb.com
+      global_queries: []
+      timeoutInSeconds: 20
