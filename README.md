@@ -9,9 +9,12 @@ per-device Swiss VPN tunnel.
 > GitHub. It contains internal addressing but **no secrets** — provider
 > credentials and passwords live only on the server (see [Secrets](#secrets)).
 
-**Status (2026-07-10): fully deployed and verified end-to-end — lineup v8
-(per-city locals, 1,856 channels) + Movies/Series libraries live.**
-Remaining user-side niceties are listed in [Loose ends](#loose-ends).
+**Status (2026-08-04): two Live TV stacks running side by side, both on the
+same 957-channel lineup, verified identical at the layer the user sees.**
+Names carry no provider group tags, every channel has artwork, and the dead
+regional sports networks have been removed. Movies/Series libraries live.
+See `docs/handoff-20260804.md` for the current state and
+[Loose ends](#loose-ends) for what is outstanding.
 
 ---
 
@@ -25,6 +28,12 @@ Remaining user-side niceties are listed in [Loose ends](#loose-ends).
 | Router (GL-MT6000 "Flint 2") | <http://192.168.9.1> (password not in this repo) |
 | Media container | `pct exec 105 -- bash` on pve-01 (CT has no SSH — disabled on purpose) |
 | Stack home | `/srv/media-core` inside CT 105 |
+| CT 112 Jellyfin (NextPVR stack) | <http://192.168.9.219:8096> |
+| DVR dashboard (games, recordings, keep-awake) | <http://100.125.154.95:8099> — auth in `/etc/dvr-dashboard.auth` |
+| Grafana | <http://pve-01.tail8f3e6.ts.net:3000> — reachable across the tailnet |
+| Icon host (channel artwork, both stacks) | <http://192.168.9.11:8100/index.json> |
+| Suspend tonight's shutdown | `dvr-shutdown-hold on` — **never** stop the timer, see lessons |
+| Verify a lineup change | `scripts/icon-verify-enduser.py`, `scripts/icon-crosscheck-stacks.py` |
 | Health check | `curl -so /dev/null -w '%{http_code}' http://192.168.9.50:8096` → 200; same for `:34400/web/` |
 | Sync (playlist/EPG/VOD) | `systemctl status media-core-sync.timer` in CT; manual run: `python3 /srv/media-core/sync/xtream-sync.py` |
 | Threadfin auto-recovery | `systemctl status media-core-healthcheck.timer` (every 5 min) + `media-core-guard.timer` (every 1 min, pre-recording) in CT |
@@ -171,46 +180,44 @@ on 2026-07-05**; the Flint 2 does all routing, and CT 105 replaced VM 103.
 ### Architecture
 
 ```
-IPTV provider (Xtream API, cf.teltv.xyz — get.php M3U download is DISABLED, HTTP 884)
-   │  (all egress via Swiss tunnel)
+IPTV provider (Xtream API, cf.teltv.xyz — get.php M3U download DISABLED, HTTP 884)
+   │  all egress via the Swiss tunnel — 156.146.62.42. The provider refuses
+   │  anything else, so this is a hard constraint on every change.
    ▼
-xtream-sync.py  (CT 105, systemd timer, daily 04:00)
-   ├─→ threadfin/conf/playlist.m3u   366 channels, regional number blocks
-   │       (tvg-chno) — see "Channel map v6" below; strictly US/UK/DE
-   │       content (Telemundo/ES dropped); dead brands, event channels and
-   │       duplicate-quality prints excluded; per-block start_chno in
-   │       config.json
-   ├─→ epg/epg.xml                   a <channel> entry with LOGO for every channel
-   │                                 (display-name == tuner name → Jellyfin auto-maps
-   │                                 artwork) + provider programmes, backfilled from
-   │                                 external XMLTV (epgshare01 US/UK/DE dumps) →
-   │                                 under v6: 366/366 channels mapped in Threadfin,
-   │                                 253 of 343 unique guide ids carry programmes
-   │                                 (the rest are PPV/event channels no EPG covers)
-   ├─→ media/movies/**.strm          ~20,700 VOD movies, titles normalized to
-   │                                 "Title (Year)" (provider prefixes incl. "EN-TOP -
-   │                                 NN.", superscript digits ²→" 2", quality tags
-   │                                 stripped; 4K/HD copies, year-less duplicate
-   │                                 prints, and non-EN twins collapsed) → reliable
-   │                                 TMDB artwork matching
-   └─→ media/shows/**.strm           TV series (added 2026-07-06): one folder per
-                                     show "Title (Year)", Season NN/ subfolders,
-                                     "Title SxxEyy.strm" + .nfo per episode and a
-                                     tvshow.nfo per show; EN categories first
-                                     (same dedupe rule as movies), per-show
-                                     episode cleanup + library prune guard
-   ▼
-Threadfin 1.2.37 (Docker, :34400) — HDHomeRun emulation, ffmpeg buffer,
-   │                                 Tuner = 1  ← hard 1-stream brake
-   ▼
-Jellyfin 10.11.9 (Docker, host network, :8096)
-   ├─ Live TV tuner:  HDHomeRun @ http://127.0.0.1:34400
-   ├─ Guide:          XMLTV @ /epg/epg.xml
-   ├─ Library:        "Movies" → /media/movies (.strm; named "IPTV Cinema" until 2026-07-08)
-   ├─ Library:        "Series" → /media/shows (.strm, added 2026-07-06; named "IPTV Series" until 2026-07-08)
-   └─ DVR:            records to /media/recordings (remux, no transcode)
-   ▼
-Clients (Chromecast/web): Jellyfin app → Add server → http://192.168.9.50:8096
+xtream-sync.py  (CT 105, systemd timer, daily 12:01)
+   │
+   ├── channel_naming.py ── display-name rules, applied where a provider name
+   │                        becomes a display name. Drops the group tag
+   │                        ("US:", "GO:", "DE:"), Title Cases, corrects
+   │                        renamed brands. Gated by "modernise_names".
+   │                        Imported by build-rename-map.py too, so the
+   │                        preview and the real thing cannot drift.
+   │
+   ├─→ threadfin/conf/playlist.m3u    957 channels, regional number blocks
+   │                                  (tvg-chno). tvg-logo points at the icon
+   │                                  host, not the provider.
+   ├─→ epg/epg.xml                    <channel> + programmes, backfilled from
+   │                                  external XMLTV
+   ├─→ media/movies/**.strm           ~24,800 across 11 libraries
+   └─→ media/shows/**.strm            ~7,400 shows across 13 libraries
+   │
+   ├──────────────────────────────┬───────────────────────────────────────────┐
+   ▼                              ▼                                           │
+PRODUCTION  (CT 105)          CT 112  "jellyfin-npvr"                          │
+Threadfin :34400              NextPVR :8866                                    │
+  HDHomeRun emulation           imports the same playlist; artwork is FILES    │
+  artwork = tvg-logo URL        on disk, name-keyed, populated once at import  │
+   ▼                              ▼                                           │
+Jellyfin :8096 (CT 105)       Jellyfin :8096 (CT 112)                          │
+   └─ DVR → /media/recordings    └─ the only stack that has ever recorded      │
+                                                                               │
+icon-host.service (host, :8100) ───────────────────────────────────────────────┘
+   serves /root/icon-archive/extracted, keyed by display name with : / |
+   stripped. The single source of channel artwork for BOTH stacks — which is
+   why a rename orphans icons and they must be re-keyed together.
+
+Clients: Jellyfin app → http://192.168.9.50:8096 (production)
+                     → http://192.168.9.219:8096 (CT 112 / NextPVR)
 ```
 
 ### Layout in CT 105 (`/srv/media-core`, the 1 TB backup-excluded mount)
