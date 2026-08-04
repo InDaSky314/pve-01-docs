@@ -14,6 +14,7 @@ Docs: /root/pve-01-docs/docs/livetv-custom-build-and-updates-20260726.md
 """
 from __future__ import annotations
 
+import html
 import json
 import subprocess
 import sys
@@ -31,10 +32,27 @@ POWER_OFF = dtime(22, 20)
 LOOKAHEAD_DAYS = 2
 MAILTO = "nathan.karras@gmail.com"
 
-# Which DVR is in use is still undecided, so check both. Jellyfin timers are
-# read straight off disk inside CT 105 -- no API key to store or rotate.
-JELLYFIN_TIMERS = "/srv/media-core/jellyfin/config/data/livetv/timers.json"
-CT = "105"
+# Which DVR is in use is still undecided, so check every stack that can hold a
+# recording. This was CT 105 alone until 2026-08-02, which meant a game
+# recorded on CT 112 -- the only stack that had actually recorded successfully
+# -- produced no reminder to leave the mains timer on, and would have been cut
+# off at 22:24. Jellyfin timers are read straight off disk inside each
+# container: no API key to store or rotate.
+#
+# A missing timers.json means that stack has never scheduled a Jellyfin
+# recording. It is skipped silently rather than reported as a problem -- a
+# reminder that carries the same complaint every morning stops being read.
+STACKS = (
+    {"ct": "105", "label": "media-core",
+     "nextpvr": "http://192.168.9.50:8866/service",
+     "jellyfin_timers": "/srv/media-core/jellyfin/config/data/livetv/timers.json"},
+    {"ct": "110", "label": "jellyfin-live",
+     "nextpvr": None,
+     "jellyfin_timers": "/srv/jellyfin-live/jellyfin/config/data/livetv/timers.json"},
+    {"ct": "112", "label": "jellyfin-npvr",
+     "nextpvr": "http://192.168.9.219:8866/service",
+     "jellyfin_timers": "/srv/jellyfin-npvr/jellyfin/config/data/livetv/timers.json"},
+)
 # Terminal states. Anything else with a future start date is treated as
 # upcoming, so an unexpected status string errs toward reminding.
 JF_DONE = {"Completed", "Cancelled", "Error"}
@@ -49,6 +67,12 @@ TEAMS = [
     ("Badgers football", "football/college-football",           "275"),
     ("Badgers basket",   "basketball/mens-college-basketball",  "275"),
     ("Bucks",            "basketball/nba",                      "mil"),
+    # The Brewers are deliberately NOT here, though they ARE on the dashboard.
+    # 36 of 50 upcoming games start inside the 22:24-04:57 mains-off window,
+    # so including them would fire a reminder most nights of the season --
+    # and an alert that fires nightly for an expected event gets muted along
+    # with the real ones. The owner watches selectively and uses the
+    # dashboard's keep-awake button for the games they want.
 ]
 
 API = ("https://site.api.espn.com/apis/site/v2/sports/{sport}"
@@ -66,7 +90,12 @@ def fetch(sport: str, team: str) -> list[dict]:
     for stype in SEASON_TYPES:
         req = urllib.request.Request(
             API.format(sport=sport, team=team, stype=stype),
-            headers={"User-Agent": "dvr-power-reminder/1.0"},
+            # No custom User-Agent. ESPN's edge 403s "dvr-power-reminder/1.0"
+            # and any Mozilla string, but serves curl/* and Python's default
+            # urllib UA. This silently emptied every reminder: the fetch
+            # failed, the exception was swallowed, and the job reported
+            # "nothing outside the window" every night. Same bug was in
+            # dvr-dashboard. Do not add a polite identifying UA back.
         )
         try:
             with urllib.request.urlopen(req, timeout=25) as r:
@@ -140,11 +169,11 @@ def games_needing_power(now: datetime) -> tuple[list[str], list[str]]:
     return sorted(hits), problems
 
 
-def nextpvr_pending(now: datetime) -> tuple[list[str], list[str]]:
+def nextpvr_pending(stack: dict, now: datetime) -> tuple[list[str], list[str]]:
     """Recordings NextPVR already has scheduled that fall outside the window."""
     import hashlib
 
-    base = "http://192.168.9.50:8866/service"
+    base, label = stack["nextpvr"], stack["label"]
     problems: list[str] = []
     try:
         out = subprocess.run(
@@ -163,7 +192,7 @@ def nextpvr_pending(now: datetime) -> tuple[list[str], list[str]]:
              f"{base}?method=recording.list&filter=pending&sid={sid}"],
             capture_output=True, text=True, check=True).stdout
     except Exception as exc:                          # noqa: BLE001
-        return [], [f"NextPVR: could not read pending recordings ({exc})"]
+        return [], [f"NextPVR/{label}: could not read pending recordings ({exc})"]
 
     hits: list[str] = []
     for chunk in xml.split("<recording>")[1:]:
@@ -182,20 +211,33 @@ def nextpvr_pending(now: datetime) -> tuple[list[str], list[str]]:
         if outside_window(start, end):
             ch = tag("channel")
             hits.append(f"  {start:%a %d %b  %H:%M}-{end:%H:%M}  "
-                        f"{tag('name')}" + (f"  [{ch}]" if ch else ""))
+                        # tag() splits raw XML, so entities arrive undecoded and
+                        # "Men's Health" mails as "Men&apos;s Health".
+                        f"{html.unescape(tag('name'))}  ({label})"
+                        + (f"  [{html.unescape(ch)}]" if ch else ""))
     return sorted(hits), problems
 
 
-def jellyfin_pending(now: datetime) -> tuple[list[str], list[str]]:
+def jellyfin_pending(stack: dict, now: datetime) -> tuple[list[str], list[str]]:
     """Upcoming Jellyfin DVR timers that fall outside the window."""
+    ct, label, path = stack["ct"], stack["label"], stack["jellyfin_timers"]
     horizon = now + timedelta(days=LOOKAHEAD_DAYS)
+
+    try:
+        subprocess.run(["/usr/sbin/pct", "exec", ct, "--", "test", "-f", path],
+                       capture_output=True, text=True, timeout=20, check=True)
+    except subprocess.CalledProcessError:
+        return [], []                                 # no timers here yet
+    except Exception as exc:                          # noqa: BLE001
+        return [], [f"Jellyfin/{label}: could not check for timers ({exc})"]
+
     try:
         raw = subprocess.run(
-            ["/usr/sbin/pct", "exec", CT, "--", "cat", JELLYFIN_TIMERS],
+            ["/usr/sbin/pct", "exec", ct, "--", "cat", path],
             capture_output=True, text=True, timeout=30, check=True).stdout
         timers = json.loads(raw)
     except Exception as exc:                          # noqa: BLE001
-        return [], [f"Jellyfin: could not read timers ({exc})"]
+        return [], [f"Jellyfin/{label}: could not read timers ({exc})"]
 
     hits: list[str] = []
     for t in timers:
@@ -214,16 +256,27 @@ def jellyfin_pending(now: datetime) -> tuple[list[str], list[str]]:
             continue
         if outside_window(start, end):
             hits.append(f"  {start:%a %d %b  %H:%M}-{end:%H:%M}  "
-                        f"Jellyfin: {t.get('Name', 'recording')}")
+                        f"Jellyfin: {t.get('Name', 'recording')}  ({label})")
     return sorted(hits), []
 
 
 def main() -> int:
     now = datetime.now(LOCAL)
     games, gp = games_needing_power(now)
-    recs, rp = nextpvr_pending(now)
-    jf, jp = jellyfin_pending(now)
-    problems = gp + rp + jp
+
+    recs: list[str] = []
+    jf: list[str] = []
+    problems: list[str] = list(gp)
+    for stack in STACKS:
+        if stack["nextpvr"]:
+            r, p = nextpvr_pending(stack, now)
+            recs += r
+            problems += p
+        j, p = jellyfin_pending(stack, now)
+        jf += j
+        problems += p
+    recs.sort()
+    jf.sort()
 
     if not games and not recs and not jf and not problems:
         return 0                                      # nothing to say; stay quiet
