@@ -28,6 +28,7 @@ See `docs/handoff-20260804.md` for the current state and
 | Router (GL-MT6000 "Flint 2") | <http://192.168.9.1> (password not in this repo) |
 | Media container | `pct exec 105 -- bash` on pve-01 (CT has no SSH — disabled on purpose) |
 | Stack home | `/srv/media-core` inside CT 105 |
+| **Deploy this stack yourself** | `docs/deploy-your-own-stack.md` — a prompt for a fresh Claude Code session |
 | CT 112 Jellyfin (NextPVR stack) | <http://192.168.9.219:8096> |
 | DVR dashboard (games, recordings, keep-awake) | <http://100.125.154.95:8099> — auth in `/etc/dvr-dashboard.auth` |
 | Grafana | <http://pve-01.tail8f3e6.ts.net:3000> — reachable across the tailnet |
