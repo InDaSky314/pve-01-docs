@@ -1,3 +1,9 @@
+> Filed 2026-08-04 as https://github.com/nk-sys-ops/wholphin/issues/1
+>
+> Ruled out as a fork regression: the three custom commits touch only
+> PlayerFactory.kt and the experimental-settings toggle, and the crash
+> stack contains no frames from com.github.damontecres.wholphin.
+
 ## Wholphin crashes when a Live TV recording is started (NextPVR backend)
 
 **Build:** `Wholphin Custom 1.0.5-0-gcaf61d30`
