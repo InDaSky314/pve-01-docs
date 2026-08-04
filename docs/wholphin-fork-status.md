@@ -22,7 +22,7 @@ justification was a root cause that has since been disproven.)
 | | |
 |---|---|
 | Working repo | `/srv/media-core/wholphin` on **pve-01** (the host, not CT 105) |
-| Intended GitHub remote | `git@github.com:nk-sys-ops/wholphin.git` (private) |
+| Intended GitHub remote | `git@github.com:nk-sys-ops/wholphin.git` — **PUBLIC**, not private as this row claimed until 2026-08-04. Verified with `gh repo view`. Anything filed there is world-readable. |
 | Upstream | `https://github.com/damontecres/wholphin.git` |
 | Branch pushed locally | `iptv-audio-fix` in `/root/wholphin` |
 
