@@ -18,7 +18,32 @@ BATCH=4
 TOTAL=$(/usr/sbin/pct exec 105 -- sh -c 'wc -l < /root/recheck-names.txt' 2>/dev/null | tr -d '\r ')
 [ -z "$TOTAL" ] && { echo "cannot read the channel list — skipping"; exit 0; }
 
-safe() { [ -x "$GUARD" ] && "$GUARD" --restart-ok >/dev/null 2>&1; }
+# check-iptv-stream.sh only knows about CT 105: router conntrack for the
+# Chromecast, Threadfin's streams, Jellyfin's timers. It is blind to CT 112,
+# where NextPVR serves Live TV -- verified 2026-08-04, the guard reported
+# "idle" while the owner was watching through NextPVR. That is the same class
+# of bug lessons-learned already records: automation written for one backend
+# breaks when a second appears.
+#
+# NextPVR writes a growing live-*.ts timeshift buffer while anything is
+# watching, so growth over a few seconds is the signal.
+nextpvr_busy() {
+    local a b
+    a=$(/usr/sbin/pct exec 112 -- sh -c \
+        'cat /srv/shared-recordings/nextpvr/live-*.ts 2>/dev/null | wc -c' 2>/dev/null)
+    [ -z "$a" ] && return 0        # cannot measure -> treat as busy
+    sleep 6
+    b=$(/usr/sbin/pct exec 112 -- sh -c \
+        'cat /srv/shared-recordings/nextpvr/live-*.ts 2>/dev/null | wc -c' 2>/dev/null)
+    [ -z "$b" ] && return 0
+    [ "$a" != "$b" ]               # grew -> busy
+}
+
+safe() {
+    [ -x "$GUARD" ] || return 1
+    "$GUARD" --restart-ok >/dev/null 2>&1 || return 1
+    ! nextpvr_busy
+}
 
 if ! safe; then
     echo "$(date -Is) SKIPPED — a stream is active, or the check could not be made"
