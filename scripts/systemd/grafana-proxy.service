@@ -1,0 +1,15 @@
+[Unit]
+Description=Grafana reachable over Tailscale (proxy to CT 107)
+Requires=grafana-proxy.socket
+After=grafana-proxy.socket
+
+[Service]
+# Forwards the tailnet listener to Grafana in CT 107. Deliberately a proxy
+# rather than a Tailscale node in the container or an advertised subnet
+# route: those change routing, and CT 105/111/112 must keep egressing via
+# Zurich (156.146.62.42) for the provider. A proxy cannot affect that.
+ExecStart=/lib/systemd/systemd-socket-proxyd --exit-idle-time=30min 192.168.9.164:3000
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes

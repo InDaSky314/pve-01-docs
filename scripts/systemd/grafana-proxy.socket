@@ -1,0 +1,12 @@
+[Unit]
+Description=Grafana reachable over Tailscale (listener)
+Documentation=file:///root/pve-01-docs/docs/lineup-runbook.md
+
+[Socket]
+# Bound to the Tailscale address ONLY. Not 0.0.0.0: this must not widen
+# Grafana's exposure on the LAN or to the WAN, only to the tailnet.
+ListenStream=100.125.154.95:3000
+BindIPv6Only=both
+
+[Install]
+WantedBy=sockets.target
