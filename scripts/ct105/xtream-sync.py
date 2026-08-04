@@ -40,6 +40,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import loki_alert
+import channel_naming            # display-name rules, shared with the tooling
 
 BASE_DIR = Path("/srv/media-core")
 ENV_FILE = BASE_DIR / ".env"
@@ -167,6 +168,23 @@ def api(base, user, pw, action):
     return data
 
 
+# Channel names as the provider ships them carry its grouping tag ("US:",
+# "GO:", "DE:") and are entirely uppercase. modernise_name() strips the tag,
+# applies Title Case and corrects renamed brands -- see channel_naming.py.
+#
+# Gated on config so it can be turned off without editing code, and so the
+# change is visible in the config diff rather than buried here. Applied only
+# to provider-derived names: curated names from config.json and event-slot
+# names are already in house style and are passed through untouched.
+def modernise_name(name):
+    if not CFG_CACHE.get("modernise_names", True):
+        return name
+    return channel_naming.modernise(name)
+
+
+CFG_CACHE = {}
+
+
 def clean_channel_name(name):
     name = DECOR.sub("", name or "")
     name = name.replace(",", " ")
@@ -281,9 +299,12 @@ def build_playlist(base, user, pw, cfg):
                 raw = s.get("name") or ""
                 sname = slot and slot_display(raw, slot)
                 if isinstance(sel["ids"], dict):
+                    # curated name from config.json — already in house style
                     disp = sel["ids"][sid]
+                elif sname:
+                    disp = sname          # event-slot name, e.g. "Soccer PPV 01"
                 else:
-                    disp = sname or clean_channel_name(raw)
+                    disp = modernise_name(clean_channel_name(raw))
                 if (sel["group"], disp) in seen_names:
                     continue
                 seen_ids.add(s["stream_id"])
@@ -320,7 +341,7 @@ def build_playlist(base, user, pw, cfg):
                 if nexc_rx and nexc_rx.search(raw):
                     continue
                 sname = slot and slot_display(raw, slot)
-                disp = sname or clean_channel_name(raw)
+                disp = sname or modernise_name(clean_channel_name(raw))
                 if (sel["group"], disp) in seen_names:
                     continue
                 seen_ids.add(s["stream_id"])
@@ -1063,6 +1084,7 @@ def main():
         base = env["XTREAM_BASE"].rstrip("/")
         user, pw = env["XTREAM_USER"], env["XTREAM_PASS"]
         cfg = json.loads(CONFIG_FILE.read_text())
+        CFG_CACHE.update(cfg)      # gates modernise_name()
         chosen = build_playlist(base, user, pw, cfg)
         build_epg(base, user, pw, cfg, chosen)
         build_vod(base, user, pw, cfg)

@@ -337,6 +337,117 @@ correctness.
 
 ---
 
+## Channel naming — how names are made, and how to change them
+
+The provider ships names like `US: BALLY SPORTS WISCONSIN HD`: a grouping tag
+it uses internally, then the name in block capitals. Neither belongs on
+screen. As of 2026-08-04 the estate publishes `Milwaukee Bucks HD` instead,
+and the transform runs automatically for every channel the provider ever adds.
+
+### Where a display name comes from
+
+Three sources, and only one of them is transformed:
+
+| Source | Example | Transformed? |
+|---|---|---|
+| curated name in `config.json` (dict form) | `"633369": "Milwaukee Bucks HD"` | no — already house style |
+| event-slot name from `slot_display()` | `Soccer PPV 01` | no — already clean |
+| the provider, via `clean_channel_name()` | `US: A&E HD` | **yes** |
+
+The transform lives in **`/srv/media-core/sync/channel_naming.py`** and is
+applied by `xtream-sync` at the single point where a provider name becomes a
+display name. Putting it there rather than in the config is what makes it
+cover the **category-driven groups** — the 108 German channels have no id list
+at all, so nothing config-based can reach them.
+
+Gated by `"modernise_names": true` in `config.json`. Set it false and the next
+sync republishes the provider's names verbatim.
+
+### The rules
+
+1. Drop the group tag — `US:`, `GO:`, `PRIME:`, `DE:`, `UK:`, `TUBI:`, `RK:`.
+2. Keep a market prefix — `Green Bay:` identifies the feed, `US:` does not.
+3. Correct renamed brands from `BRAND_FIX` (verified per entry — see
+   `lineup-accuracy-audit-20260803.md`).
+4. Title Case, keeping the quality suffix (`HD`, `4K`).
+
+`modernise()` is **idempotent** — running it on its own output is a no-op.
+That matters because sync runs daily and must not drift.
+
+### Three traps, each of which cost a cycle
+
+**The source is entirely uppercase, so capitalisation carries no information.**
+A first attempt detected acronyms and call signs by pattern and produced
+`National Geographic WILD` and `Animal Planet WEST` — `WILD` and `WEST` match
+any call-sign shape. Acronyms now come from an explicit list, and a call sign
+is recognised only by being **parenthesised**, which is positional and
+therefore reliable.
+
+**Word-initial matching must be Unicode-aware.** `[A-Za-z]` turned `KÖLN` into
+`KÖLn`: the umlaut is not an ASCII letter, so the lookbehind saw `LN` as a
+fresh word. Use `[^\W\d_]`.
+
+**Dropping the tag can collide two channels.** `DE: MTV HD` and `US: MTV HD`
+both become `MTV HD`, and Threadfin keys on `tvg-name`, so the two would
+become one. `FULL_NAME_OVERRIDES` is checked against the **full** provider
+name, before the tag is stripped, and names the German one
+`MTV HD (Germany)`.
+
+### Changing the rules
+
+1. Edit `channel_naming.py`. Preview with
+   `scripts/build-rename-map.py --sample <lo> <hi>` — it imports the same
+   module, so what it prints is what sync will publish.
+2. `pct exec 105 -- systemctl start media-core-sync.service`
+3. **Check for collisions and lost channels** — this is the step that catches
+   a bad rule:
+
+   ```bash
+   pct exec 105 -- python3 - <<'PY'
+   import re, collections
+   n=[m.group(1) for l in open('/srv/media-core/threadfin/conf/playlist.m3u')
+      for m in [re.search(r'tvg-name="([^"]+)"', l)] if m]
+   print('channels:', len(n))
+   print('prefixed:', len([x for x in n if re.match(r'^(US|GO|PRIME|DE|UK|TUBI|RK):', x)]))
+   print('duplicates:', [k for k,v in collections.Counter(n).items() if v>1])
+   PY
+   ```
+
+   Expect the channel count to hold, `prefixed: 0`, `duplicates: []`. A drop in
+   count means two names converged and sync deduped one away.
+
+4. **Re-key the artwork** — renaming orphans every icon, because the icon host
+   is name-keyed. Coverage fell 995 → 523 the first time this ran:
+
+   ```bash
+   python3 scripts/rekey-icon-host.py          # dry run
+   python3 scripts/rekey-icon-host.py --apply
+   pct exec 105 -- systemctl start media-core-sync.service   # picks up the new keys
+   ```
+
+   The old and new keys cannot be mapped from the filenames alone — the colon
+   is already stripped, so `DE ARD HD` no longer looks prefixed. The script
+   bridges through the provider catalogue, which still holds `DE: ARD HD`.
+
+5. `media-core-xepg` **twice** — renamed channels arrive in Threadfin with
+   `x-active=False`, and the first run reports "all channels active, nothing
+   to do" because activation happens before the new entries are added.
+6. Clear **all four** Jellyfin caches and run one guide refresh — see
+   `lessons-learned.md`. Missing the tuner-channel cache leaves Jellyfin
+   serving the old names indefinitely.
+7. Verify at the layer the user sees, then look at a contact sheet.
+
+### What is deliberately not renamed
+
+* **Event-slot names** (`Soccer PPV 42`, `UEFA 16`, `NBA 07`). `ppv-refresh`
+  rewrites their ids hourly and the provider name is fixture-derived, so any
+  name written would be stale within the hour — and the catalogue carries the
+  same fixture twice, so forcing names onto them collides.
+* **Curated names in `config.json`.** If a name needs to be exact, put it in
+  the dict form and it is passed through untouched.
+
+---
+
 ## Adding a channel
 
 1. Find its stream id — the weekly `lineup-watch` mail lists new ones, or

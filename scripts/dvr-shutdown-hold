@@ -1,0 +1,39 @@
+#!/bin/bash
+# Suspend or resume the nightly clean shutdown, safely.
+#
+# Do NOT do this by stopping dvr-clean-shutdown.timer. On 2026-08-04 a
+# re-arm that ran "systemctl start dvr-clean-shutdown.timer" was followed
+# four seconds later by the service executing and powering the host off at
+# 08:02 — during a work session, with the mains timer already bypassed.
+# The timer had not fired (LastTriggerUSec was empty); starting it was
+# enough.
+#
+# Masking the SERVICE removes the whole class of failure: a masked unit
+# cannot be started by anything, the timer may fire harmlessly, and
+# unmasking never triggers a run.
+#
+#   dvr-shutdown-hold on [reason]   suspend tonight's shutdown
+#   dvr-shutdown-hold off           restore it
+#   dvr-shutdown-hold status
+set -euo pipefail
+UNIT=dvr-clean-shutdown.service
+
+case "${1:-status}" in
+  on)
+    systemctl mask "$UNIT"
+    echo "held: $UNIT is masked${2:+ ($2)}. The host will NOT shut down tonight."
+    echo "run 'dvr-shutdown-hold off' when finished."
+    ;;
+  off)
+    systemctl unmask "$UNIT"
+    systemctl is-active --quiet dvr-clean-shutdown.timer || systemctl start dvr-clean-shutdown.timer
+    echo "restored. next shutdown check:"
+    systemctl show dvr-clean-shutdown.timer -p NextElapseUSecRealtime --value
+    ;;
+  status)
+    state=$(systemctl is-enabled "$UNIT" 2>/dev/null || true)
+    if [ "$state" = "masked" ]; then echo "HELD — no shutdown will run"
+    else echo "armed — next: $(systemctl show dvr-clean-shutdown.timer -p NextElapseUSecRealtime --value)"; fi
+    ;;
+  *) echo "usage: dvr-shutdown-hold on|off|status" >&2; exit 2 ;;
+esac
