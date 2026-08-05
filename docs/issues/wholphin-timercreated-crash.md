@@ -92,3 +92,34 @@ same class of bug on `SearchHint.matchedTerm`, fixed per-field in 2024.
 watching a channel that is recording still resumes from the moment the
 recording began. So that behaviour is *not* caused by the shared directory,
 and the cause is still unknown. Do not repeat that hypothesis.
+
+---
+
+## Closed out, 2026-08-05 — do not re-file
+
+`jellyfin/jellyfin-sdk-kotlin#1263` was **closed as invalid**. The maintainer's
+position: `TimerEventInfo.Id` is not optional and must be set.
+
+**They are right that the spec argument was wrong.** The filing leaned on
+`TimerEventInfo` having no `required[]` array. That inference does not hold
+here: only 11 of 357 schemas in Jellyfin's OpenAPI document declare
+`required[]` at all, so its absence expresses nothing. Requiredness in that
+document is carried by the presence or absence of `nullable: true`. A second
+model (gemini-3.1-pro-high) was asked to assess this independently and reached
+the same conclusion I originally did — but never engaged with the 11-of-357
+figure it was given. Two analyses agreeing while both skip the same
+disconfirming fact is not corroboration.
+
+What still stands, and needs no spec interpretation:
+`LiveTvManager.CreateTimer` leaves `newTimerId` null unless the service
+implements `ISupportsNewTimerIds`; `jellyfin-plugin-nextpvr` implements only
+`ILiveTvService`; so the server emits `TimerCreated` with a null `Id` on every
+recording. That contradicts the maintainer's own statement.
+
+**The owner decided on 2026-08-05 not to file this anywhere.** Respect that.
+Do not open a follow-up issue on `jellyfin/jellyfin`, the plugin, or the SDK
+without asking first.
+
+Practical position: the crash is cosmetic in effect — the recording always
+succeeds, only the notification kills the app. Workaround is to start
+recordings from the web client at `http://192.168.9.219:8096`.
