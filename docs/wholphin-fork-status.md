@@ -362,66 +362,65 @@ toggle that `282a4eae` fixed for exactly this reason. Next: build
 `consolidate-debug-fixes` (prefer the 01:00-05:00 maintenance window per
 the build-host notes above), verify, merge to `main`, push to `github`.
 
-### NextPVR recording crash — root cause found (agy, 2026-08-05), NOT yet on Custom
+### NextPVR recording crash — full history already in `docs/issues/wholphin-timercreated-crash.md`, read that first
 
-Reported live by the owner 2026-08-06: starting a recording on the
-NextPVR ecosystem in Custom **crashes** every time. Afterward the app
-shows the recording as still in progress (NextPVR's own
-`recording.list?filter=inprogress` was empty when checked after the
-fact — looks like stale **client-side** state, not a real server-side
-stuck recording, but not caught live). Watching the same live channel
-afterward (single NextPVR tuner, so it's the same stream) plays back
-with **audio/video out of sync and repeating** segments — not yet
-explained, needs a live capture.
+Reported live by the owner again 2026-08-06, same symptom as below.
+**Correcting my own first pass at this entry** (this doc, a few commits
+back) — I wrote it from `wholphin-issue-validation.md` alone, which
+argued the server was at fault because `TimerEventInfo` has no
+`required[]` array in the OpenAPI spec. **That argument was wrong and
+was already corrected in-repo on 2026-08-05**: only 11 of 357 schemas in
+Jellyfin's OpenAPI doc use `required[]` at all, so its absence carries no
+signal — requiredness there is expressed via `nullable`, and on that
+basis the upstream maintainer's "Id is not optional" was right. Issue
+`jellyfin/jellyfin-sdk-kotlin#1263` was closed as invalid, correctly, and
+**the owner decided 2026-08-05 not to file this anywhere else — do not
+re-open or re-file it.**
 
-**The crash itself was already root-caused by agy on 2026-08-05**
-(`/root/agy-reports/wholphin-issue-validation.md`,
-`/root/agy-wholphin-fix.md`, `/root/agy-reports/20260805T094357Z-wholphin-fix.md`)
-and the description matches the owner's report exactly: starting a Live TV
-recording crashes the app every time; the recording itself succeeds
-server-side, only the client dies. Chain, with primary fault on the
-server side:
+None of that changes the crash mechanism or the fix. What still stands,
+no spec interpretation needed: `LiveTvManager.CreateTimer` leaves
+`newTimerId` null unless the service implements `ISupportsNewTimerIds`;
+`jellyfin-plugin-nextpvr` implements only the legacy `ILiveTvService`, not
+that interface; so the server emits `TimerCreated` over the WebSocket with
+the `Id` key missing entirely on every NextPVR recording. The SDK's
+generated `TimerEventInfo.id: String` has no default, so
+`kotlinx.serialization` throws `MissingFieldException` uncaught on
+`Dispatchers.IO`, and ACRA kills the process — **reproduced twice already,
+2026-08-04, directly on Custom** (`Wholphin Custom 1.0.5-0-gcaf61d30`, full
+ACRA logs on disk at
+`jellyfin/config/log/upload_Wholphin Custom_...20260804*.log`). This is
+NextPVR-specific — Threadfin's Jellyfin-DVR path doesn't go through
+`ILiveTvService`/`ISupportsNewTimerIds` the same way — matching the owner
+hitting this only on the NextPVR ecosystem.
 
-1. `jellyfin-plugin-nextpvr`'s `LiveTvService` implements the legacy
-   `ILiveTvService.CreateTimerAsync` (returns `Task`, not `Task<string>`),
-   **not** `ISupportsNewTimerIds`.
-2. Jellyfin core (`LiveTvManager.cs`) checks `service is ISupportsNewTimerIds`;
-   false for NextPVR, so `newTimerId` stays `null`.
-3. Jellyfin broadcasts `TimerCreated` over the WebSocket with that null id
-   omitted entirely: `{"Data":{"ProgramId":"..."},"MessageType":"TimerCreated"}`,
-   no `"Id"` key at all.
-4. The server's own OpenAPI spec for `TimerEventInfo` never lists `Id` under
-   `required`, so `Id` is optional per spec — but `jellyfin-sdk-kotlin`'s
-   generated model has `val id: String` with no default, i.e. treats it as
-   mandatory. `kotlinx.serialization` throws `MissingFieldException` the
-   moment this message arrives, uncaught, on `Dispatchers.IO` — ACRA kills
-   the process.
-5. **This is specific to NextPVR** (Threadfin's Jellyfin-DVR path doesn't
-   go through `ILiveTvService`/`ISupportsNewTimerIds` the same way) — matches
-   the owner hitting this only on the NextPVR ecosystem.
-6. Upstream Jellyfin declined to change server behavior, so the fix has to
-   be client-side: catch the bad message instead of crashing on it.
+**Important practical point already on record: the crash is cosmetic in
+effect.** The recording always succeeds server-side; only the
+post-recording notification kills the app. Documented workaround until
+this is fixed: **start recordings from the web client at
+`http://192.168.9.219:8096` instead of Wholphin** — the recording itself
+is unaffected either way.
 
 **Fix already exists**: `SafeSocketConnection` in `CoroutineContextApiClient.kt`,
 commit `0d12249b` in `/root/wholphin` (`iptv-audio-fix` branch) — filters
 any socket message that fails `ApiSerializer.decodeSocketMessage` instead
 of letting the exception propagate. Built and installed 2026-08-05 as
-`.debug` on the Chromecast (APK
-`Wholphin-default-debug-1.0.3-29-g0d12249b-54.apk`) but **agy could not
-drive the TV remote to actually trigger a recording, so this was never
-verified against a real recording attempt** — only confirmed the app
+`.debug` on the Chromecast but **never verified against a real recording
+attempt** (agy could not drive the TV remote) — only confirmed the app
 launches cleanly. **This fix was NOT on Custom until tonight** — it's one
 of the two commits ported onto `consolidate-debug-fixes` above (`000a79f3`).
 Building and installing that branch as Custom, then testing an actual
-NextPVR recording, is the highest-value next step: it directly addresses
-what the owner is hitting live, tonight.
+NextPVR recording, is the highest-value next step.
 
-The AV-desync-and-repeat symptom on the *following* live playback is a
-separate, still-open question — plausibly the crash leaves Wholphin's
-local recording/timer cache out of sync with the server (see NextPVR
-`inprogress` being empty above), and reopening playback lands on
-something other than a clean live edge. Needs a real repro with logcat
-once the crash itself is fixed and doesn't cut the session short first.
+**The AV-desync-and-repeat symptom on the following live playback is a
+separate, already-partially-investigated bug, not a fresh one**: the
+2026-08-04 follow-up notes record that watching a channel currently being
+recorded "resumes from the moment the recording began" instead of the live
+edge — matches "out of sync and repeats" exactly. Pointing
+`LiveTVBufferDirectory` at a dedicated `/buffer` mount (instead of sharing
+the recordings directory) was tried and **did not fix it** — that change
+was still correct to make, but the loop-back has some other cause, not yet
+found. Do not re-try the shared-buffer-directory hypothesis; needs a fresh
+angle.
 
 ### CT 113 (`android-emulator`, 192.168.9.204) — agy built it, it was badly broken
 
