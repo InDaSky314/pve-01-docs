@@ -555,4 +555,60 @@ power-off window).
 But **verify its claims against the system, not its report.** It has
 asserted numbers that could not be reproduced (a "420 channel" figure), and
 its bulk rename introduced the unescaped-`&` bug that broke all guide data.
+
+## Host stability
+
+**A `socat ... TCP:127.0.0.1:PORT` forwarder must never listen on that same
+`PORT`.** On 2026-08-06 agy built CT 113 (`android-emulator`) with
+`adb-forward.service`: `socat TCP-LISTEN:5555,fork,reuseaddr
+TCP:127.0.0.1:5555`. Forwarding a port to itself means every accepted
+connection opens a new outbound connection back into the same listener,
+which `fork` accepts as another connection, forever — a fork bomb with no
+external trigger required, armed the moment the unit starts. Compounded by
+`Restart=always`: stopping the runaway process without also disabling the
+unit just lets systemd relaunch it. It took the host (4 cores) to a load
+average of **2484** within 5 seconds of CT 113 booting, and pushed the
+process table from ~460 to ~24,000. Production on the same 4 cores
+(CT 105/112 Jellyfin) stayed up throughout both incidents, purely by luck
+of scheduling, not by design — this was one save away from taking the
+whole host down.
+
+**Diagnose fork bombs by process count and parent chain, not load average
+alone.** Load average is a lagging, smoothed signal — it kept climbing for
+minutes after the causing process was already dead, and stayed elevated for
+~15 minutes after the fix. `ps -e | wc -l` and `ps -eo pid,ppid,cmd` (look
+for one PPID with thousands of sequential-PID children) gave an immediate,
+unambiguous read in both directions: confirmed the explosion, and confirmed
+the fix.
+
+**`pct exec` into a wedged container hangs, and the orphaned command keeps
+running inside it after the caller times out.** Wrapping `pct exec` in an
+outer `timeout` does not clean up: `timeout` kills its direct child (the
+`pct exec`/`lxc-attach` client) but the command already running inside the
+container's PID namespace gets reparented to the container's init and
+keeps going. Repeated timed-out diagnostic attempts are themselves a
+process-leak source, not a neutral no-op — this is how agy's own
+`systemctl status android-emulator` retry loops (each wrapped in a Python
+`for i in range(10): ... time.sleep(2)`, itself apparently blocked on the
+one `lxc-attach` call per iteration rather than the sleep) piled up for
+1h45m without exiting. Prefer `pct exec 113 -- true &` + explicit `wait`
+with your own timeout and an explicit `kill` of the PID you started, over
+bare `timeout N pct exec ...`.
+
+**A `pct reboot`/`pct stop` interrupted mid-flight leaves
+`/run/lock/lxc/pve-config-<vmid>.lock` held by the PVE backend task
+(`UPID:...:vzreboot:...`), not by the CLI process you can see and kill.**
+`fuser -v` on the lock file names the real holder; killing the `pct`/perl
+CLI invocation is not enough, the `task UPID:...` process must be killed
+too or every subsequent `pct stop`/`start`/`reboot` on that container times
+out on the lock indefinitely.
+
+**Container-lifecycle commands (`pct stop`/`start`/`reboot`) and `kill -9`
+on host processes are blocked by this environment's auto-mode permission
+classifier by default**, regardless of how isolated/reversible the target
+container is. Don't spend time working around a classifier block — stop
+and ask the owner for an explicit go-ahead or a standing permission rule
+for that command class. See [[pve01-usage-limit-handling]] pattern of not
+making the owner babysit — same principle applies to permission blocks: hand
+back a clear, specific ask rather than grinding on denials.
 Give it the known traps up front, and check the artefacts afterwards.

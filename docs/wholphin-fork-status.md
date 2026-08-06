@@ -325,3 +325,127 @@ whenever the experimental master switch was off (i.e. on any fresh install)
 - **WireGuard keys in Loki history** (MEDIUM). Present from before the
   2026-07-25 redaction fix; LAN-only, ~30-day retention. Options:
   accept retention / purge via Loki delete API / rotate.
+
+---
+
+## Update 2026-08-06: two repos diverged; NextPVR recording crash is the priority now
+
+**The owner is now watching live TV through Custom on the NextPVR
+ecosystem daily and has no audio problems on it.** NextPVR is no longer
+"parked" — see the top of this doc's own advice to leave it alone; that is
+superseded. **Custom (`/srv/media-core/wholphin`,
+`com.github.damontecres.wholphin.custom`) is the sole base going
+forward.** Do not keep developing `/root/wholphin` (`.debug`,
+versionCode 60) — it forked off this repo around 2026-07-25 and both
+sides independently re-implemented overlapping fixes without either
+knowing about the other's branch. Diff the two before assuming either is
+current.
+
+**What Custom has that Debug was missing** (now also true of Debug, but
+Debug was untested with these in): `6321365d` (don't send `mediaSourceId`
+for Live TV — the actual NoCompatibleStream root cause, verified "channel
+100 plays" 2026-07-25) and `3cc2e7db`/`99f0b692` (`AacAwareHlsExtractorFactory`
+— the in-band-AAC fix, **commit message says "UNVERIFIED ON DEVICE" and
+nothing since confirms it**, though the owner's live report of no audio
+problems on Custom is the closest thing to field verification it's had).
+
+**What Debug had that Custom was missing, now ported to branch
+`consolidate-debug-fixes`** (commits `000a79f3`, `719d3d42`, on top of
+`origin/main` at `caf61d30`, not yet merged/pushed — build not yet
+verified, host was too loaded tonight): the `SafeSocketConnection`
+malformed-WebSocket-message guard, and a real fix for `getAVCMainLevel()`
+returning 0 on Chromecast (queries `MediaCodecList` for the decoder's
+actual max level instead of giving up). Deliberately **not** ported:
+Debug's uncommitted `val iptvRecovery = true` hardcode in `PlayerFactory.kt`
+— it bypasses the Settings → Experimental → IPTV Audio Track Recovery
+toggle that `282a4eae` fixed for exactly this reason. Next: build
+`consolidate-debug-fixes` (prefer the 01:00-05:00 maintenance window per
+the build-host notes above), verify, merge to `main`, push to `github`.
+
+### NextPVR recording crash — root cause found (agy, 2026-08-05), NOT yet on Custom
+
+Reported live by the owner 2026-08-06: starting a recording on the
+NextPVR ecosystem in Custom **crashes** every time. Afterward the app
+shows the recording as still in progress (NextPVR's own
+`recording.list?filter=inprogress` was empty when checked after the
+fact — looks like stale **client-side** state, not a real server-side
+stuck recording, but not caught live). Watching the same live channel
+afterward (single NextPVR tuner, so it's the same stream) plays back
+with **audio/video out of sync and repeating** segments — not yet
+explained, needs a live capture.
+
+**The crash itself was already root-caused by agy on 2026-08-05**
+(`/root/agy-reports/wholphin-issue-validation.md`,
+`/root/agy-wholphin-fix.md`, `/root/agy-reports/20260805T094357Z-wholphin-fix.md`)
+and the description matches the owner's report exactly: starting a Live TV
+recording crashes the app every time; the recording itself succeeds
+server-side, only the client dies. Chain, with primary fault on the
+server side:
+
+1. `jellyfin-plugin-nextpvr`'s `LiveTvService` implements the legacy
+   `ILiveTvService.CreateTimerAsync` (returns `Task`, not `Task<string>`),
+   **not** `ISupportsNewTimerIds`.
+2. Jellyfin core (`LiveTvManager.cs`) checks `service is ISupportsNewTimerIds`;
+   false for NextPVR, so `newTimerId` stays `null`.
+3. Jellyfin broadcasts `TimerCreated` over the WebSocket with that null id
+   omitted entirely: `{"Data":{"ProgramId":"..."},"MessageType":"TimerCreated"}`,
+   no `"Id"` key at all.
+4. The server's own OpenAPI spec for `TimerEventInfo` never lists `Id` under
+   `required`, so `Id` is optional per spec — but `jellyfin-sdk-kotlin`'s
+   generated model has `val id: String` with no default, i.e. treats it as
+   mandatory. `kotlinx.serialization` throws `MissingFieldException` the
+   moment this message arrives, uncaught, on `Dispatchers.IO` — ACRA kills
+   the process.
+5. **This is specific to NextPVR** (Threadfin's Jellyfin-DVR path doesn't
+   go through `ILiveTvService`/`ISupportsNewTimerIds` the same way) — matches
+   the owner hitting this only on the NextPVR ecosystem.
+6. Upstream Jellyfin declined to change server behavior, so the fix has to
+   be client-side: catch the bad message instead of crashing on it.
+
+**Fix already exists**: `SafeSocketConnection` in `CoroutineContextApiClient.kt`,
+commit `0d12249b` in `/root/wholphin` (`iptv-audio-fix` branch) — filters
+any socket message that fails `ApiSerializer.decodeSocketMessage` instead
+of letting the exception propagate. Built and installed 2026-08-05 as
+`.debug` on the Chromecast (APK
+`Wholphin-default-debug-1.0.3-29-g0d12249b-54.apk`) but **agy could not
+drive the TV remote to actually trigger a recording, so this was never
+verified against a real recording attempt** — only confirmed the app
+launches cleanly. **This fix was NOT on Custom until tonight** — it's one
+of the two commits ported onto `consolidate-debug-fixes` above (`000a79f3`).
+Building and installing that branch as Custom, then testing an actual
+NextPVR recording, is the highest-value next step: it directly addresses
+what the owner is hitting live, tonight.
+
+The AV-desync-and-repeat symptom on the *following* live playback is a
+separate, still-open question — plausibly the crash leaves Wholphin's
+local recording/timer cache out of sync with the server (see NextPVR
+`inprogress` being empty above), and reopening playback lands on
+something other than a clean live edge. Needs a real repro with logcat
+once the crash itself is fixed and doesn't cut the session short first.
+
+### CT 113 (`android-emulator`, 192.168.9.204) — agy built it, it was badly broken
+
+Found wedged 2026-08-06 ~21:30: `adb-forward.service`
+(`socat TCP-LISTEN:5555,fork,reuseaddr TCP:127.0.0.1:5555` — forwards
+port 5555 to itself) is a self-triggering fork bomb baked into the unit
+file, `Restart=always` on top. Took the host to load average **2484**
+within 5 seconds of CT 113 booting; process table hit ~24,000 on a 4-core
+box. Full mechanism and remediation steps in `lessons-learned.md` under
+"Host stability" — read that before touching CT 113 again. **Fix applied:
+`adb-forward.service` masked** (symlinked to `/dev/null` in
+`/etc/systemd/system/`) inside CT 113's rootfs. Not yet re-validated
+whether ADB/VNC actually work once that's out of the way, or whether
+`android-emulator.service` (`emulator -avd android_tv -no-audio -gpu off
+-accel on -vnc 0.0.0.0:1`) even starts successfully — no qemu process was
+ever observed running despite ~2 hours of agy retry loops polling for it.
+An agy diagnose task (`android-emulator-diagnose`,
+`/root/agy-reports/20260806T200615Z-android-emulator-diagnose.md`) was
+dispatched to assess this read-only, without starting the container, given
+the fresh damage. **Do not trust agy's earlier claim that it could push
+builds and test without independently confirming an actual adb connection
+and a running emulator first.**
+
+No agy report from the original CT 113 build session exists anywhere
+(`agy-task.sh list --since 2d` returns nothing) — it was run outside the
+normal `agy-task.sh` dispatch/report pipeline, which is likely part of why
+this bug was never caught before boot.
