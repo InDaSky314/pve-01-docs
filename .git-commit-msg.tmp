@@ -1,0 +1,10 @@
+docs: correct wholphin-fork-status NextPVR crash entry against docs/issues/wholphin-timercreated-crash.md
+
+My first pass repeated wholphin-issue-validation.md's required[] argument,
+which docs/issues/wholphin-timercreated-crash.md already corrected
+2026-08-05 (11 of 357 schemas use required[]; owner decided not to file
+upstream). Fix mechanism and next step (build+test consolidate-debug-fixes
+on Custom) are unchanged. Adds the cosmetic-effect fact, the web-client
+workaround, and the AV-desync symptom's prior investigation.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
