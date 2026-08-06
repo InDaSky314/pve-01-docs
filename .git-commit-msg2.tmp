@@ -1,0 +1,11 @@
+docs: CT113 fully working end to end, NextPVR segmenter lead for AV-desync bug
+
+- CT113: full fix chain documented (DNS, locks, libs, flags, gpu mode).
+  qemu running, VNC confirmed reachable, Custom APK installed and
+  launches clean on the emulator (no crash). Login step needs the owner
+  (real Jellyfin credentials, not guessed/stored here).
+- NextPVR: ChannelsUseSegmenter=False vs RecordingsUseSegmenter=True is
+  a real, unproven-but-well-evidenced lead for the watch-while-recording
+  desync/repeat bug. Next session should try toggling it first.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
