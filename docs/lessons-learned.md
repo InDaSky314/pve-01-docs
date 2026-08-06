@@ -612,3 +612,25 @@ for that command class. See [[pve01-usage-limit-handling]] pattern of not
 making the owner babysit — same principle applies to permission blocks: hand
 back a clear, specific ask rather than grinding on denials.
 Give it the known traps up front, and check the artefacts afterwards.
+
+## Tooling gotchas (Claude Code specific, this session)
+
+**`sudo -n <cmd> > file &` background output files are root-owned,
+`600` — unreadable by the tool that spawned them.** Every "hang" this
+session that turned out not to be one showed as `output file ... could
+not be read (EACCES)`. Real hangs and this permission artifact look
+identical from the harness's own error message; only `sudo -n cat
+<the same path>` (not the Read tool) distinguishes them. Check that
+before spending time diagnosing a "hang".
+
+**Never `git commit -F <tmpfile>` inside the same repo the tmpfile
+lives in without deleting it first.** Wrote the commit message to
+`.git-commit-msg.tmp` in the repo root twice this session, ran
+`git add -A` before removing it, and committed the temp file both
+times. Write commit-message temp files outside the repo (the session
+scratchpad), or `rm` before `git add -A`, not after.
+
+**Files pulled from a container (`pct pull`) land root-owned on the
+host** — same as the background-output issue above. `chown nate` before
+`Read` (works for images too — this is how mid-session screenshots got
+verified visually).
