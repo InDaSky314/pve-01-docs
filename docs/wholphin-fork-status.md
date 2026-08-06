@@ -434,6 +434,28 @@ buffer/timeshift config further tonight, but that's the
 architecturally-correct place to look next for the desync-and-repeat
 symptom, not Jellyfin's own LiveTv options.
 
+**Follow-up, later the same night: found it.** Logged in with NextPVR's
+service PIN (`0000` — already used by `/usr/local/bin/dvr-clean-shutdown`,
+same MD5-challenge handshake, not a new credential) and queried
+`setting.list` on CT 112:
+
+```
+ChannelsUseSegmenter: False
+RecordingsUseSegmenter: True
+```
+
+This is a real, well-evidenced lead for the desync-and-repeat bug: live
+channel playback and recording use **different** streaming mechanisms in
+NextPVR. If watching a channel that's simultaneously recording ends up
+routed onto the recording's (segmented, file-backed, non-live) stream
+rather than a true live tap — plausible if they share the same underlying
+tuner output — that would produce exactly "resumes from the moment the
+recording began" / desync / repeat. **Not yet proven** — would need to
+toggle `ChannelsUseSegmenter` to `True` (NextPVR Settings → General, or
+via `setting.update`) and reproduce with an actual concurrent
+watch+record to confirm or rule this out. Next session: try that toggle
+first, before any other theory.
+
 ### CT 113 (`android-emulator`, 192.168.9.204) — agy built it, it was badly broken
 
 Found wedged 2026-08-06 ~21:30: `adb-forward.service`
@@ -460,3 +482,74 @@ No agy report from the original CT 113 build session exists anywhere
 (`agy-task.sh list --since 2d` returns nothing) — it was run outside the
 normal `agy-task.sh` dispatch/report pipeline, which is likely part of why
 this bug was never caught before boot.
+
+**Update, same night: CT 113 is fully working.** Full chain of fixes
+after the fork-bomb mask above, each one uncovering the next:
+
+1. `adb-forward.service`: masking replaced with the real fix —
+   `bind=192.168.9.204` added to the socat listener (agy's diagnosis —
+   was binding `0.0.0.0` and forwarding to itself).
+2. DNS: `pct set 113 --nameserver 192.168.9.1 --searchdomain
+   tail8f3e6.ts.net` — was inheriting the host's Tailscale MagicDNS
+   resolver (`100.100.100.100`), unreachable since CT 113 doesn't run
+   tailscaled. This alone was adding a real 10-20s glibc resolver
+   timeout to every `pct exec`/`lxc-attach`, which looked exactly like a
+   hang and cost real time misdiagnosing it as one.
+3. Cleared stale `hardware-qemu.ini.lock` / `multiinstance.lock` /
+   `debug.keystore.lock` under `/root/.android/`, left behind by the
+   ungraceful kills during the fork-bomb.
+4. `libpulse0` then `libxkbfile1`: both hard `DT_NEEDED` shared-library
+   dependencies of `qemu-system-x86_64`, missing on this base image.
+   Install non-interactively: `DEBIAN_FRONTEND=noninteractive apt-get
+   install -y -o Dpkg::Options::=--force-confdef -o
+   Dpkg::Options::=--force-confold <pkg>`.
+5. Removed `-netsim=false` from the unit's `ExecStart` — not a valid
+   flag on emulator 37.1.11.0 (`ANDROID_EMU_NETSIM=0` env var already
+   does the same job).
+6. Added `-no-window` — without it the Qt frontend tries to open a real
+   window (defaults to the `xcb` platform plugin) even when you only
+   want qemu's own `-vnc`; crashed with SIGABRT trying to init a display
+   that doesn't exist in a headless container.
+7. `hw.gpu.mode` in `/root/.android/avd/android_tv.avd/config.ini`
+   changed to `auto` (agy, `android-emulator-gpu-fix` task) — whatever
+   it was set to before conflicted with `-gpu guest`, which QEMU's VNC
+   display requires (`qemu-system-x86_64-headless: VNC supports only
+   guest GPU, add "-gpu guest" option`). agy's own report for this step
+   never got written (task hit its 20m timeout mid-loop) — the fix was
+   verified directly (`pgrep qemu-system-x86_64`, `ss -tlnp`), not from
+   agy's report.
+
+**Confirmed working end to end**: `qemu-system-x86_64` running stably.
+VNC listening on `0.0.0.0:5901`, reachable from the host —
+`vnc://192.168.9.204:5901` from the owner's MacBook should work with any
+VNC client (Screen Sharing, RealVNC, TigerVNC), no extra server needed.
+Pushed the `consolidate-debug-fixes` build (universal APK, all ABIs —
+this is an **x86** emulator, `sdk_google_atv_amati_x86`, so the
+`armeabi-v7a` split built for the physical Chromecast will NOT run here,
+use the no-suffix universal APK) via `pct push 113 <apk> /tmp/...` +
+`adb -s emulator-5554 install -r`, launched it
+(`com.github.damontecres.wholphin.custom`, versionCode 57) — **no
+crash, no FATAL in logcat, `ActivityTaskManager: Displayed ... +6s`**.
+Screenshots via `adb shell screencap` + `pct pull` (files land
+root-owned on the host, `chown` before `Read`) work fine for headless
+visual verification.
+
+**One caveat worth knowing**: external `adb connect
+192.168.9.204:5555` (from the host or a future laptop) sits at
+`unauthorized` even after boot completes — this is a secure/production
+build (`adb root` refused: "adbd cannot run as root in production
+builds"), so it needs the on-screen RSA-key authorization dialog
+accepted once, which needs VNC + a mouse click, not just `adb connect`.
+**Workaround that doesn't need that**: `pct push`/`pct pull` for
+files, and `adb -s emulator-5554 ...` (the local console connection,
+run via `pct exec 113`) for install/shell/logcat/screenshots — that
+path is always trusted, no key dance needed. Full external `adb connect`
+from a laptop still needs that one manual VNC-and-click the first time.
+
+**Stopped here, needs the owner**: got as far as the app's fresh-install
+"Select Server" screen. Did not attempt to log in — that needs the
+owner's actual Jellyfin credentials, which aren't and shouldn't be
+guessed or stored in this repo. Next step for whoever picks this up:
+either VNC in and log in by hand (fast, since the emulator's already
+running and the APK's already installed), or share credentials for a
+scripted `adb shell input` walkthrough.
