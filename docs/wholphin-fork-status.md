@@ -422,6 +422,18 @@ was still correct to make, but the loop-back has some other cause, not yet
 found. Do not re-try the shared-buffer-directory hypothesis; needs a fresh
 angle.
 
+**That prior test was on CT 105/Threadfin — it does not transfer to
+CT 112/NextPVR, checked 2026-08-06.** CT 112's `system.xml` has no
+`LiveTvBufferDirectory`/`RecordingPath` entries at all; NextPVR owns its
+own timeshift/buffer storage independently of Jellyfin's DVR options,
+which Threadfin goes through directly. The disproven-on-CT105 hypothesis
+was never actually tested against the code path the owner is hitting.
+NextPVR's own `setting.list` API needs a session (unlike `recording.list`,
+which tolerates unauthenticated reads) — didn't chase the NextPVR-side
+buffer/timeshift config further tonight, but that's the
+architecturally-correct place to look next for the desync-and-repeat
+symptom, not Jellyfin's own LiveTv options.
+
 ### CT 113 (`android-emulator`, 192.168.9.204) — agy built it, it was badly broken
 
 Found wedged 2026-08-06 ~21:30: `adb-forward.service`
