@@ -634,3 +634,19 @@ scratchpad), or `rm` before `git add -A`, not after.
 host** — same as the background-output issue above. `chown nate` before
 `Read` (works for images too — this is how mid-session screenshots got
 verified visually).
+
+**Never start a real recording/stream/test on shared live infrastructure
+(Threadfin, NextPVR) without checking the owner isn't actively watching
+TV through it right now.** Started a test recording on the Threadfin
+production channel the owner was concurrently watching live, without
+asking first — even though the actual test ran on the CT113 emulator,
+not their physical Chromecast, the recording itself and the emulator's
+own live-tap consumed real concurrent-connection capacity on the same
+shared IPTV source the owner's TV was pulling from. This is *especially*
+relevant right after a session spent proving IPTV providers can have
+hard concurrent-connection limits (see the NextPVR AV-desync root-cause
+work, 2026-08-07) — any test that opens an additional stream is exactly
+the kind of action that can degrade or interrupt someone else's real
+viewing. Ask first, every time, before creating a timer or opening a
+live tap on shared infra, regardless of which device the test itself
+targets.
