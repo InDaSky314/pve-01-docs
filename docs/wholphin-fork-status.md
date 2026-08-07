@@ -553,3 +553,121 @@ guessed or stored in this repo. Next step for whoever picks this up:
 either VNC in and log in by hand (fast, since the emulator's already
 running and the APK's already installed), or share credentials for a
 scripted `adb shell input` walkthrough.
+
+---
+
+## Update 2026-08-07 morning: crash fix verified end to end on both ecosystems
+
+Owner logged in that morning, asked one important question first: **is the
+websocket crash guard related to `jellyfin-sdk-kotlin#1263`, which was
+closed as invalid?** Checked the actual upstream issue, not just our own
+notes. Answer: related but not the same fix. #1263 asked upstream to make
+`TimerEventInfo.id` nullable in the SDK's generated model — that got
+closed "not planned." What's actually merged (`SafeSocketConnection`,
+`0d12249b`) is a different, more general fix entirely inside Wholphin: it
+catches *any* socket message that fails to deserialize and drops it with
+a log warning instead of crashing. It never touches the SDK model, so
+upstream's rejection doesn't affect it — the fix doesn't need upstream's
+cooperation at all, and structurally cannot regress anything, since valid
+messages pass through completely unchanged and only already-crashing
+messages get the new behavior (dropped + logged instead of taking the
+app down).
+
+Owner also flagged: **"the NoCompatibleStream issue was only on the
+debug version."** Correct, and worth being precise about — there were two
+separate fixes in play. Custom already had the real one (`mediaSourceId`
+omission for Live TV, from the original July 25 investigation). The one
+ported from Debug the night before (`getDecoderMaxLevel` fallback,
+Chromecast's `AVCProfileMain` reporting 0) was diagnosed specifically
+against Debug/Chromecast — porting it into Custom was speculative, not
+confirmed necessary. Still safe regardless: it can only report a decoder
+level equal to or *higher* than before, never lower, so it cannot newly
+reject a stream that wasn't already being rejected. Worst case a no-op
+on Custom.
+
+Owner then gave real credentials (`family`/NextPVR and `Family`/Threadfin)
+and asked for both ecosystems to be tested directly, self-service, not
+just built. Full results:
+
+### NextPVR (CT 112, `family` login) — crash fix confirmed working, live
+
+Logged into the CT113 emulator as `family`, live-guide loaded (997
+channels, real EPG data, no crash). Selected "Inside Edition" (5:36 AM,
+live) → **Record Series** → NextPVR confirmed a real timer server-side
+(id 858, recurring, status Pending). **App did not crash.** Pulled full
+logcat and found the exact trigger, timestamped:
+
+```
+06:13:41.479  Receiving (raw) message {"MessageId":"...","Data":{"ProgramId":"..."},"MessageType":"SeriesTimerCreated"}
+06:13:41.494  W SafeSocketConnection...: Dropping malformed socket message: {...}
+06:13:41.494  W SafeSocketConnection...: kotlinx.serialization.MissingFieldException: Field 'Id' is required ... but it was missing
+```
+
+This is the exact crash from `docs/issues/wholphin-timercreated-crash.md`,
+reproduced live, caught by the fix, logged, dropped — app kept running
+(WebSocket keepalives continued 15+ minutes afterward, no restart). As
+definitive a confirmation as this gets without the owner's own device.
+
+Also tested live playback on NextPVR: video renders correctly. Audio
+failed with a `c2.android.aac.decoder` error — this is the CT113
+emulator's `-no-audio` flag (no real audio device configured for the
+qemu launch), not a server or app bug. The physical Chromecast has a
+real decoder path and should not hit this. Worth confirming once the
+owner tests on-device, but not something to chase further on the
+emulator.
+
+### Threadfin (CT105 media-core, `Family` login) — confirmed unaffected, working
+
+`media-core` server has a large aggregated VOD library (Amazon/Apple
+TV+/Netflix/Paramount+/etc. via `.strm` files) — Live TV isn't a
+top-level sidebar item the way it is on the NextPVR server, buried or
+routed differently. Rather than keep hunting UI, authenticated directly
+against the Jellyfin API (`family`/`tv4mepls` → access token) and used
+Wholphin's own `VIEW` intent (`Intents.md`) to jump straight to a live
+program (`Wake Up Wisconsin: 4:30 Edition`, Madison ABC 27) — confirmed
+this is a supported, documented feature of the app, not a workaround
+outside it. Playback started immediately, video rendered correctly
+(same emulator audio-decoder caveat as above).
+
+Created a real timer via `POST /LiveTv/Timers` (the exact same effect as
+tapping Record in the UI) and checked the resulting WebSocket message:
+
+```
+10:31:36.738  Receiving (raw) message {"MessageId":"...","Data":{"Id":"f6f6f064ca0b436e807f3b8f0dd8dcf0","ProgramId":"..."},"MessageType":"TimerCreated"}
+```
+
+**`Id` is present.** No `MissingFieldException`, no drop, no crash risk
+at all — because Threadfin's Live TV goes through Jellyfin's own native
+DVR (`DefaultLiveTvService`), which correctly implements
+`ISupportsNewTimerIds`, unlike the third-party NextPVR plugin. **This
+confirms the crash was NextPVR-specific from the start, not a general
+Live-TV-recording bug** — Threadfin was never at risk.
+
+Both test recordings (NextPVR series id 858/recurring 62, Threadfin
+timer 42ab936e...) were cancelled/deleted after verification — nothing
+left scheduled on either server.
+
+**Bonus**: while backing out of the player, an "Allow USB debugging?"
+prompt surfaced on CT113 (triggered by an earlier `adb connect` attempt)
+and was accepted with "always allow from this computer" — external
+`adb connect 192.168.9.204:5555` from the host (and presumably a future
+laptop on the same network) should now authorize without the on-screen
+prompt going forward.
+
+### Still not pushed to GitHub
+
+Owner explicit: **do not push to the public repo until the issues are
+worked out** — citing the earlier `nk-sys-ops/wholphin` visibility
+mis-fire as the reason to be cautious this time. The
+`consolidate-debug-fixes` merge (`a6de7386`) stays local-only until
+told otherwise.
+
+### Still open
+
+- **AV-desync-and-repeat bug**: not tested this session — the
+  `ChannelsUseSegmenter` toggle (see entry above) is a NextPVR *server*
+  setting change affecting all live playback on that box, not a
+  client-side thing to just try solo. Recommend confirming with the
+  owner before flipping it, even though CT 112 is low-traffic.
+- Confirm the emulator's audio-decoder limitation doesn't apply on the
+  physical Chromecast (expected: it won't, different decoder path).
