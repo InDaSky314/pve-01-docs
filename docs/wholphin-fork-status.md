@@ -811,3 +811,87 @@ fixes and the AV-desync non-repro are good news, but "no crash today on
 this test path" isn't the same bar as "known worked out," so this stays
 local (`/srv/media-core/wholphin`, branch `fix/jellyfin-live-tv-ts-transcode`)
 until owner says otherwise.
+
+## Update 2026-08-07 evening: AV-desync DID reproduce on the real Chromecast — root cause found, it's a NextPVR architecture limit, not a Wholphin bug
+
+Correction to the "did not reproduce" finding above: that was only true on
+the emulator with direct-play. The owner sideloaded today's build onto
+the **physical Chromecast** (`192.168.9.203`, in-place update over the old
+`693c0e3c` install; the stale `.debug` app was uninstalled to free space —
+device was at 95% full) and immediately hit the crash-guard for real (see
+below), then scheduled a real recording and hit genuine "weird loop and
+misaligned audio" on live playback of the same channel while it recorded.
+
+**The crash guard fired for real, on hardware, first try.** Scheduling
+recording 861 sent a `TimerCreated` message missing `Id` (same root cause
+as always), and `SafeSocketConnection` dropped it instead of crashing —
+confirmed via `adb logcat` on the physical device, not the emulator.
+
+**The AV-desync bug is real and 100% reproducible — root cause isolated
+tonight, confirmed architectural, not a settings fix:**
+
+1. Chromecast's device profile makes Jellyfin **remux** the NextPVR feed
+   (`TranscodeReasons: ContainerNotSupported`) rather than direct-play —
+   different code path than the emulator tests earlier today, which is
+   why those didn't catch it.
+2. Jellyfin's own `FFmpeg.Remux-*.log` showed continuous **non-monotonic
+   DTS** on both audio and video, jumping backward ~500-600ms repeatedly.
+3. Isolated further by bypassing Jellyfin entirely — pulled NextPVR's raw
+   `/live?channeloid=` endpoint directly with `ffmpeg -c copy`:
+   - **Two plain concurrent live pulls, no recording:** 0 decode errors. Clean.
+   - **One real recording + one live pull, same channel:** **238
+     `decode_slice_header error` / `non-existing PPS 0 referenced`
+     errors in 10 seconds.** Reproduces every time.
+4. This proves the corruption happens **inside NextPVR itself**, before
+   Jellyfin or Wholphin/ExoPlayer ever touch the stream.
+
+**Both proposed settings fixes are dead ends, confirmed not theoretical:**
+- `ChannelsUseSegmenter`: not a real setting. `setting.update` accepts
+  the request (logged server-side) but never changes the value — it's a
+  hardcoded/reported-only capability flag in NextPVR 7.1.1, doesn't
+  appear in `config.xml` at all.
+- `CacheInLiveTVBuffer`: a real, persisted `config.xml` setting, flipped
+  `false→true`, container restarted healthy — but zero effect on the
+  corruption. Reverted back to `false` afterward (no reason to keep an
+  unexplained change with no benefit).
+
+**agy's deep research** (`avdesync-deepresearch`, ~4min runtime, report:
+`/root/agy-reports/20260807T172331Z-avdesync-deepresearch.md`) confirms
+this matches known NextPVR IPTV architecture: NextPVR taps the *existing*
+recording's stream for a concurrent live request instead of opening a
+second connection, and IPTV feeds (unlike broadcast tuners) typically only
+send H.264 SPS/PPS headers once at connection start, not repeated — so the
+tapped live stream starts mid-GOP with no valid headers. Per forum
+research, NextPVR's maintainer treats this as expected pass-through
+behavior, not a bug; no version fixes it.
+
+**Options, most to least practical for this setup:**
+1. **Watch the in-progress recording instead of live-tapping** — the
+   recording's own `.ts` file has valid headers from connection start, so
+   playing that file while it grows avoids the problem entirely. Would be
+   a Wholphin-side UX change: offer "watch recording" instead of "watch
+   live" when the selected channel is already recording.
+2. **Register the IPTV playlist twice as two NextPVR "devices"** — if the
+   provider allows 2+ concurrent connections, this lets NextPVR route the
+   live request to a fresh connection. Cheapest fix *if* the provider's
+   connection limit allows it — not yet checked, don't want to guess and
+   risk the account getting flagged.
+3. **IPTV proxy in front of NextPVR** — Threadfin already does this job
+   reliably for the other ecosystem; bigger architectural change, not a
+   quick toggle.
+4. **Switch to an HLS-based provider URL** if available — segment
+   boundaries carry their own headers, sidesteps the mid-GOP tap issue by
+   design.
+
+**Owner is leaning toward option 1**, and is switching to test the
+Threadfin ecosystem now (never affected by any of this — different DVR
+mechanism entirely, goes through Jellyfin's native `DefaultLiveTvService`,
+not NextPVR's shared IPTV tap) to help decide direction. Recording 861,
+862, and the ad-hoc raw-pull test recording (863) were all stopped and
+cleaned up; NextPVR at 0 recordings, `CacheInLiveTVBuffer` reverted to its
+original `false`.
+
+**This is the strongest signal yet that Threadfin is the more solid
+ecosystem long-term** — never hit the crash, the audio issue, or this
+desync bug, because it doesn't share NextPVR's IPTV-tap architecture at
+all.
