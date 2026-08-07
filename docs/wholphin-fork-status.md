@@ -664,10 +664,150 @@ told otherwise.
 
 ### Still open
 
-- **AV-desync-and-repeat bug**: not tested this session — the
-  `ChannelsUseSegmenter` toggle (see entry above) is a NextPVR *server*
-  setting change affecting all live playback on that box, not a
-  client-side thing to just try solo. Recommend confirming with the
-  owner before flipping it, even though CT 112 is low-traffic.
 - Confirm the emulator's audio-decoder limitation doesn't apply on the
   physical Chromecast (expected: it won't, different decoder path).
+
+## Update 2026-08-07 afternoon: full record→playback tests on both ecosystems, AV-desync did not reproduce, CT111 VOD outage fixed
+
+Owner came home, gave three follow-ups: (1) don't let the host shut down
+tonight, (2) actually record-to-completion and play back on both
+ecosystems before pushing to the physical Chromecast, (3) how's the
+agy collaboration going. Then, before I could report, owner sent a
+fourth message on the way out the door: asked about stale NextPVR
+listings, forwarded a Grafana `jellyfin-vod` down alert, asked for a VOD
+health check, asked to clean up test recordings on both ecosystems, and
+asked whether NextPVR's Recordings screen even has a delete function.
+All of the below happened in that gap.
+
+### Host shutdown
+
+Override renewed, confirmed good until **2026-08-08T15:40 local** via
+`GET /api/status` on the dashboard (`dvr-dashboard.service`, port 8099,
+Basic auth from `/etc/dvr-dashboard.auth`) — no action needed, already
+comfortably past tonight.
+
+### CT111 `jellyfin-vod` production outage — root-caused and fixed
+
+The forwarded Grafana alert was real, not something this session broke.
+`docker logs` showed the container crash-looping on
+`System.InvalidOperationException: insufficient free space` (72MB free,
+2GB required). `/srv/jellyfin-vod/jellyfin/config/metadata/` had grown to
+71GB on a 79GB root disk — 50GB `library/` (expected) + **20GB
+`People/`** (pure re-fetchable actor-photo cache, confirmed by structure
+— `People/<letter>/<name>/folder.jpg` — before touching it). Deleted
+`People/` entirely, restarted the container, watched it for 60s via
+Monitor (`restarts=0` throughout, HTTP 200 on `/health`). Stable.
+
+### Stale NextPVR listings — not a real issue, was my own query bug
+
+Owner asked "are the stale listings an issue?" Root cause: my own
+diagnostic `channel.listings&start=&end=` calls earlier this session
+passed **milliseconds** where NextPVR's API wants **epoch seconds**,
+which made the guide data I was reading look wrong/stale. Re-queried
+with `date +%s` (seconds) and NextPVR's actual guide data is accurate.
+No product issue, no owner-visible bug — just my query.
+
+### NextPVR Recordings screen — confirmed no delete function exists
+
+Read `CollectionFolderRecordings.kt` (43 lines) end to end: its
+`onClickItem` only navigates, no `ContextMenuProvider` wired in at all
+(compare `ContextMenuUtils.kt`'s `canDelete`/`deleteItem`, which *is*
+wired into `HomeRowGrid.kt`, `CollectionFolderView.kt`, `ItemGrid.kt`,
+`SearchPage.kt`, just not this screen). Confirmed at the code level, not
+just "didn't see a button": **there is no delete function in the NextPVR
+Recordings browse screen today.** Deletions have to go through the
+NextPVR web UI or the API directly (which is what I used for cleanup
+below). Worth a small follow-up PR once we're pushing again.
+
+### Leftover recordings cleanup
+
+4 old NextPVR recordings (854–857, predating this session, from Aug 4)
+and 2 old Threadfin recordings that a prior "cleanup" missed — found and
+deleted via `recording.delete` / `DELETE /Items/{id}`. Both ecosystems
+verified at **0 recordings** before starting today's fresh record tests.
+
+### NextPVR — full record → complete → playback test, PASSED
+
+Created a real one-off timer (`POST /LiveTv/Timers`, channel 100 "Good
+Morning America"), confirmed via NextPVR's own `recording.list&filter=inprogress`
+it was actively recording (id 860). **While it was still recording**,
+jumped to the same channel live in the app (`VIEW` intent → Select
+Server → `family` → Live TV → Guide → center on the now-current program
+→ "Watch live"): video showed genuinely current programming (`Live with
+Kelly and Mark`, correct `27 abc WKOW` bug), not a repeat of the
+recording's start. The recording finished on its own 57s later (program
+block ended — `status: Ready`, 46MB). Jumped straight to the finished
+recording via its Jellyfin item ID (`VIEW` intent) and played it back:
+renders correctly from the top of the recorded segment (weather
+graphics), no crash. Deleted recording 860 afterward, verified 0
+NextPVR recordings remain.
+
+### Threadfin — full record → complete → playback test, PASSED
+
+Same channel (Madison ABC 27/WKOW) for a direct comparison. Created a
+real timer via `POST /LiveTv/Timers` for the currently-airing "Live with
+Kelly and Mark," confirmed `InProgress` via `GET /LiveTv/Timers`. **While
+it was still recording**, jumped to the same live channel in the app
+(sidebar `Live TV` on `media-core` is buried alphabetically under the
+huge aggregated VOD library — between "James Bond 007" and "Marvel
+Movies" — found it via a `uiautomator dump`, not guesswork) → Guide →
+center on channel 100 → "Watch live": video showed a **live commercial
+break** (a Care.com ad), which is exactly what genuine live broadcast
+looks like and is the opposite of the desync/repeat symptom (a repeat
+would still be showing the interview segment from recording-start).
+Cancelled the timer (`DELETE /LiveTv/Timers/{id}`) after ~45s to finalize
+a short recording, jumped to it via its item ID, pressed Play: plays
+back correctly (720p H264, English AAC stereo), no crash. Deleted the
+recording afterward, verified 0 Threadfin recordings remain.
+
+### AV-desync-and-repeat bug — did NOT reproduce in either ecosystem today
+
+This is the important one. Two independent concurrent watch+record tests
+(NextPVR and Threadfin, same channel, both using the app's real "Watch
+live" path while a real recording was actively in progress on that exact
+channel) both showed **correct, current, live-edge content** — no
+desync, no repeat-from-recording-start. This doesn't prove the bug is
+gone (intermittent bugs don't disprove that easily, and I didn't test
+every trigger path — e.g. switching *into* live from an already-open
+player rather than a fresh navigation, or a session that was already
+mid-playback when the recording started), but it's a real, honest data
+point that the straightforward "record + watch live on same channel"
+scenario is currently clean on both ecosystems as of this build.
+
+**agy's parallel research** (`avdesync-research`, diagnose mode, ~6min
+runtime, finished 13:48Z) independently dug into the
+`ChannelsUseSegmenter=False` / `RecordingsUseSegmenter=True` split and
+came back with a specific, code-evidenced theory: NextPVR's capture
+source reuse may route a concurrent live-watch request for a
+currently-recording channel onto the recording's own growing-file HLS
+segmenter (`SegmenterThread`, seeking from byte/segment 0), rather than
+a true live tap — which would produce exactly the reported symptom if it
+triggers. Full writeup: agy's report
+`/root/agy-reports/20260807T134145Z-avdesync-research.md`. agy proposed
+non-destructive next steps (compare `PlaybackInfo` idle vs. recording,
+watch `nrecord.log` for `SegmenterThread starting` / `growing=true`) if
+we ever do reproduce it.
+
+**Net: given it didn't reproduce today, the `ChannelsUseSegmenter`
+toggle is not being flipped** — that's a NextPVR *server-wide* setting
+change, and there's no live symptom right now to justify touching it.
+Held for an explicit owner go-ahead if/when the bug resurfaces, per the
+prior session's decision.
+
+### agy collaboration
+
+Working well as a second perspective, not just a task runner — this
+session used it for both build tasks (CT113 GPU fix) and pure research
+(the segmenter theory above), and its report was substantive and
+independently useful even where my own empirical test came back
+differently (no repro) — that's a healthy signal for a second-opinion
+partner, not a conflict to resolve. Kept it in the loop via this shared
+doc and dispatches through `agy-task.sh`; nothing owed to it right now.
+
+### Still local-only, not pushed to GitHub
+
+Unchanged from this morning — owner's explicit hold stands. Both crash
+fixes and the AV-desync non-repro are good news, but "no crash today on
+this test path" isn't the same bar as "known worked out," so this stays
+local (`/srv/media-core/wholphin`, branch `fix/jellyfin-live-tv-ts-transcode`)
+until owner says otherwise.
