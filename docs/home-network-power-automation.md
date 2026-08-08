@@ -263,4 +263,40 @@ either way.
 - [ ] Clarify whether the kids'-floor and owner's-floor TVs need Chromecasts acquired, or already have
       them
 - [ ] (Unrelated to this thread, tracked separately in the Wholphin work) `NoCompatibleStream` bug fix
-      for in-progress-recording playback, and reviewing agy's sports-auto-record draft
+      for in-progress-recording playback
+- [ ] Decide whether to actually enable `sports_dvr_auto_v2.py` on a live systemd timer (not yet
+      scheduled — the dashboard toggles exist and work, but nothing is auto-scheduling recordings
+      from them yet; deserves its own explicit go-ahead before flipping on)
+
+## Sports auto-recorder dashboard (deployed 2026-08-08)
+
+Per-team on/off toggles for the sports auto-recording system, built by agy (build-mode dispatch,
+`gemini-3.6-flash-high`) after Claude Code laid out the brief, then independently reviewed and merged
+into the live dashboard by Claude Code.
+
+- **Default state**: Packers, Badgers Football, Badgers Basketball, and Bucks default **ON**;
+  **Brewers defaults OFF** (per owner request — too many games in a season to auto-record by default).
+- **State file**: `/var/lib/dvr-dashboard/sports-config.json`, per-team boolean, atomic writes
+  (`.tmp` + `os.replace`). Designed to extend cleanly to a future `plug-config.json` once the smart
+  plugs are in place.
+- **API**: `GET`/`POST /api/sports-config` on the existing dashboard service (same Basic Auth as
+  every other endpoint), mirroring the existing `/api/override` pattern.
+- **UI**: new "Sports auto-recorder" card between "Server power" and "Scheduled recordings", with
+  accessible toggle switches; games for a toggled-off team show an "auto off" pill in the schedule.
+
+**Build/merge process, for the record**: agy's build was done against the dashboard file *before*
+the day-of-week shutdown fix (above) had landed, so its file could not be deployed wholesale without
+regressing that fix. Claude Code instead surgically extracted agy's feature (backend routes, CSS,
+HTML, JS) and merged it into the already-fixed live file, then — per the owner's explicit ask for a
+second opinion — had agy independently review the merged result before deploying. agy's review
+(`/root/agy-reports/20260808T153753Z-sports-dashboard-merge-review.md`) confirmed the sports feature
+and the shutdown fix were both fully intact, and caught two small JS wiring gaps (the "auto off" pill
+not appearing until the next 60s refresh on first page load; toggles from another tab/device not
+syncing until refresh). Both were fixed before deploy. Live-verified after deploy: `/api/status` and
+`/api/sports-config` both correct, toggle round-tripped through the real POST endpoint with disk
+persistence confirmed, then restored to the Brewers-off default.
+
+**Not yet done**: `sports_dvr_auto_v2.py` (the script that actually reads this state file to decide
+whether to auto-schedule a recording) is built but **not yet wired to any systemd timer** — the
+toggles currently only affect what the dashboard *displays*, not yet real auto-scheduling. Tracked
+above as an open item.
