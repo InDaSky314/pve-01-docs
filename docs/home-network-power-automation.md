@@ -502,3 +502,12 @@ entire dead NextPVR block from `recordings()`, dropped `channel_names()`'s now-u
 cleaned up the resulting dead code (`NEXTPVR` constant, `npvr_start()` parsing helper, the `hashlib` import
 that only existed for NextPVR's session-auth MD5 hash — all now fully unused). Live-verified clean after:
 `problems: []`, channel name still resolves correctly via Jellyfin.
+
+## Dashboard "Links" tab had a dead link (2026-08-08)
+
+Owner asked directly whether the Links tab needed fixing after the NextPVR removal above — it did: a
+"NextPVR - production" entry pointed at `http://192.168.9.50:8866`, CT105's now-gone container. Removed
+it and renamed the remaining "NextPVR - live" entry to plain "NextPVR" (nothing left to disambiguate it
+from). Verified the other two links on that same host (`192.168.9.50:8096` Jellyfin, `:34400` Threadfin)
+are still genuinely alive — different services, unaffected by the NextPVR removal, confirmed rather than
+assumed.
