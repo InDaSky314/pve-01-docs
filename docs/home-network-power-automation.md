@@ -264,9 +264,9 @@ either way.
       them
 - [ ] (Unrelated to this thread, tracked separately in the Wholphin work) `NoCompatibleStream` bug fix
       for in-progress-recording playback
-- [ ] Decide whether to actually enable `sports_dvr_auto_v2.py` on a live systemd timer (not yet
-      scheduled — the dashboard toggles exist and work, but nothing is auto-scheduling recordings
-      from them yet; deserves its own explicit go-ahead before flipping on)
+- [ ] Design/build a per-game "record just this one" dashboard button (today: use Jellyfin's own
+      guide → Record for a genuine one-off, e.g. a single Brewers game while the team toggle stays off
+      — this already works, no new code; a dashboard button would just make it more convenient)
 
 ## Sports auto-recorder dashboard (deployed 2026-08-08)
 
@@ -296,7 +296,80 @@ syncing until refresh). Both were fixed before deploy. Live-verified after deplo
 `/api/sports-config` both correct, toggle round-tripped through the real POST endpoint with disk
 persistence confirmed, then restored to the Brewers-off default.
 
-**Not yet done**: `sports_dvr_auto_v2.py` (the script that actually reads this state file to decide
-whether to auto-schedule a recording) is built but **not yet wired to any systemd timer** — the
-toggles currently only affect what the dashboard *displays*, not yet real auto-scheduling. Tracked
-above as an open item.
+## Sports auto-recorder: live, enabled, three real bugs found and fixed (2026-08-08)
+
+Per the owner's go-ahead ("Go ahead and have it start the automated recordings"), `sports_dvr_auto_v2.py`
+went from built-but-idle to actually creating real recordings on a 10-minute systemd timer
+(`sports-dvr-auto.timer` → `sports-dvr-auto.service`, `/usr/local/bin/sports-dvr-auto`, runs on the
+pve-01 **host**, not inside CT105). Before enabling it unattended, live pre-flight testing (dry-run,
+then one real `--apply` run creating and verifying an actual timer, then cleaning that test timer up)
+turned up three real, would-have-been-silent bugs, all fixed and re-verified against live CT105/Jellyfin
+before the timer was turned on:
+
+1. **Config file host/container split.** The script's `SPORTS_CONFIG_FILE` path
+   (`/var/lib/dvr-dashboard/sports-config.json`) looks identical whether run on the pve-01 host or inside
+   CT105, but CT105's mount points are LVM-backed, not host-visible directories — running the script
+   *inside* CT105 (as agy's own design doc recommended, for direct `127.0.0.1:8096` Jellyfin access) would
+   silently read/write a **completely disconnected private copy** of the file, with zero effect from the
+   dashboard's own toggles. Confirmed via device+inode comparison (different on both counts). Fixed by
+   running the script on the **host** instead, with a `pct exec 105` fallback added to `get_jf_token()` for
+   reading CT105's Jellyfin API key (the local key-file paths don't exist on the host).
+2. **Timer creation needs the real Jellyfin GUID channel id, not the `hdhr_<number>` shape every existing
+   timer shows on disk.** That `hdhr_126`-style string is what Jellyfin *resolves the GUID down to and
+   stores* after creation — not what creation itself expects as input. POSTing that string directly fails
+   validation (`ChannelId` is schema'd as `format: uuid`). This one initially pointed toward "NextPVR must
+   be the real backend" (its historical association with `hdhr_`-numbered channels), a wrong turn the owner
+   caught and corrected — CT105's NextPVR container turned out to have only **2** leftover/test channels
+   configured, uninvolved in the real Threadfin→Jellyfin path.
+3. **Missing `ServiceName` → real HTTP 500.** Even with the correct GUID, timer creation kept failing.
+   Root cause found via Jellyfin's own server logs after two real failed test POSTs:
+   `Jellyfin.LiveTv.LiveTvManager.CreateTimer` requires a `ServiceName` field — this instance has exactly
+   one registered service, literally named `"Emby"` (the built-in M3U/tuner backend, name retained from the
+   Emby fork lineage, which is what Threadfin's feed actually runs through). Without it, Jellyfin throws
+   `KeyNotFoundException: No service with the name ''`. With both the GUID `ChannelId` and
+   `ServiceName: "Emby"` in place, timer creation returned a clean `204` and the timer appeared correctly
+   with `Status: "New"`.
+
+Confirmed as a byproduct: CT105's NextPVR container has only **2** leftover/test channels configured —
+it is not a live parallel tuner for this stack the way `channel_names()` (below) assumed, and is not
+involved in the real Threadfin→Jellyfin recording path at all, exactly as the owner said.
+
+Also fixed while investigating #3: the **dashboard's own channel-name display** (`channel_names()` in
+`dvr-dashboard`) was resolving channel numbers via that same near-empty NextPVR instance and silently
+falling back to `"ch <n>"` for almost everything — a pre-existing bug, not caused by tonight's work, just
+never visible before because there was nothing live and pending to show it. Switched it to query
+Jellyfin's own `/emby/LiveTv/Channels` instead (the actually-authoritative source); live-verified showing
+the real name (`"NFL Network HD"`) instead of `"ch 126"`.
+
+All of this was tested against a **real** recording along the way: a genuine upcoming Packers preseason
+game (Aug 13, already correctly resolved to NFL Network HD) was used as the live test case throughout,
+including one real create → verify → delete cycle before the final, correctly-named timer was created for
+real by the fixed, deployed script on its first live timer-triggered run — confirmed idempotent (a second
+run correctly detected the overlap and skipped re-creating it).
+
+**Cadence**: every 10 minutes (`OnUnitActiveSec=10min`) — frequent enough that the live-game extender
+(extends a timer's `EndDate` by 20 min whenever a game is still "in progress" with under 15 min left on the
+recording) always gets at least one check inside that window, so a close or extra-innings game doesn't get
+cut off waiting for the next tick.
+
+## Override redesign: "Keep awake tonight" now targets the real cutoff, not a flat guess (2026-08-08)
+
+The override button used to always request a flat `+12 hours` from the moment it was pressed. Per the
+owner's question about whether it'd make more sense to tie it to the actual schedule: it now computes the
+real next scheduled cutoff (`next_shutdown_cutoff()`, walking forward day-by-day using the same
+`POWER_OFF_NORMAL`/`POWER_OFF_LATE`/`LATE_NIGHT_WEEKDAYS` constants as the day-of-week shutdown fix) and
+sets the override to expire exactly then, instead of an arbitrary number of hours that might over- or
+under-shoot depending on what time the button happens to be pressed.
+
+Worth noting for the record, since it came up directly while verifying this: **there was never actually
+a risk of the server shutting down mid-day/during normal operating hours from an override expiring** —
+`dvr-clean-shutdown` only ever runs at the two fixed daily `OnCalendar` times, never triggered by an
+override file going stale, so an override quietly expiring at, say, 2pm does nothing on its own. The one
+place override state *does* trigger an immediate action is the "Cancel override" button, and that already
+only re-runs the shutdown check if `now` is already at-or-past the real cutoff — cancelling early is a
+no-op until the real scheduled time, exactly as it should be.
+
+One live side-effect from testing this, corrected immediately: verifying the new override endpoint
+against the running dashboard overwrote the override the owner had manually set earlier tonight
+(`until 2026-08-09T16:53`) with the new tonight-only value. Caught and restored to the original value
+right away — flagged here in case the timing looks odd in hindsight.
