@@ -511,3 +511,57 @@ it and renamed the remaining "NextPVR - live" entry to plain "NextPVR" (nothing 
 from). Verified the other two links on that same host (`192.168.9.50:8096` Jellyfin, `:34400` Threadfin)
 are still genuinely alive — different services, unaffected by the NextPVR removal, confirmed rather than
 assumed.
+
+## Dashboard "Links" tab: live status indicator, and a real CT111 disk-full incident (2026-08-08)
+
+Owner asked to check every link on the tab and specifically flagged VOD as unreachable, then asked for a
+general way to show when a linked container is powered off (rather than silently removing dead links).
+
+**Built**: `LINKS` is now a Python data structure (label/url/host/port, grouped) instead of static HTML.
+`check_link()` does a plain TCP connect (cheap, no CORS/mixed-content issues since it runs server-side, and
+doesn't care whether a service wants a redirect/auth/particular path) with a 1.5s timeout. New
+`GET /api/links` endpoint returns each link plus a live `up` bool. Frontend re-checks every time the Links
+tab is opened (not cached — the whole point is "right now"), rendering a small colored dot (reusing the
+existing `.dot` class from the power-status indicator) next to each entry. CT110's two links are
+deliberately kept in the list even though it's stopped — the dot shows that plainly instead of hiding it.
+
+**What checking VOD actually uncovered** — far more than a stale link:
+
+1. CT111's address had drifted (`.134`, unclaimed per ARP) to a real current one. Fixing the link
+   surfaced that the real address kept *actively churning* — five different IPs within about 20 minutes
+   while investigating.
+2. First theory (wrong, corrected after the owner pushed back on it): a second/rogue DHCP server on the
+   LAN. Ruled out via `dhclient`'s own logs — every single offer genuinely came `from 192.168.9.1`, the
+   real router. The earlier "empty grep of 9.1's lease file for this MAC" that suggested a rogue server
+   was a red herring: 9.1 never persists a lease to its lease *file* while the client keeps declining it.
+3. Real mechanism: `dhclient` was accepting each offer, then issuing `DHCPDECLINE` almost immediately —
+   traced to `dhclient-script` itself failing with `echo: I/O error` while writing a temp `resolv.conf`,
+   which made `dhclient` treat the lease as unusable and restart the whole cycle.
+4. Real root cause of *that*: CT111's root filesystem was **100% full** (76G/79G, 57M free). The I/O
+   error wasn't DHCP-specific at all — it was any write failing. Docker's own container registration was
+   failing with the identical `no space left on device` error in its logs, which is what actually pinned
+   this down (found while trying to recover Docker after a `pct reboot` — none of its containers survived
+   the reboot, and re-registering them hit the same disk-full wall).
+5. What was actually consuming the space: `/srv/jellyfin-vod/jellyfin/config/metadata/library` alone was
+   **67GB** — Jellyfin's own VOD poster/backdrop metadata cache. This is a different thing from the
+   `metadata/livetv` orphan problem `prune-jellyfin-orphan-metadata.py` already handles for CT105/CT112
+   (that script is Live-TV-specific and CT111 has no Live TV at all) — deliberately did **not** run a
+   deletion pass against library metadata for a VOD instance with this many separate media categories
+   without understanding what's legitimate vs. orphaned first; treated as a capacity problem, not a mess
+   to clean up.
+
+**Fix applied**: grew CT111's root disk 80G → 180G (`pct resize 111 rootfs +100G`; `local-lvm` had ~1.4TB
+free, trivial). Full `pct reboot 111` to clear the accumulated secondary IP addresses that repeated failed
+renewals had stacked onto the interface. Docker's containers didn't survive the reboot and needed a manual
+`docker compose up -d` (one stale container reference per service had to be `docker rm -f`'d individually —
+containerd's own internal state was inconsistent post-crash, resolved container-by-container). Verified
+stable afterward: single clean address (`.171`), zero decline events, `alloy` and `jellyfin-vod` both
+`Up ... (healthy)`, real HTTP 302 from Jellyfin. DHCP host reservation on `9.1` pinned to `.171` once
+confirmed stable (an earlier reservation attempt at `.166`, made before the disk-full root cause was found,
+was superseded — updating a `uci` host reservation's `ip` field is a normal, low-risk change, done twice
+here as the picture became clearer). Dashboard's `LINKS` entry updated to match.
+
+**Open, not addressed**: whether 67GB of VOD metadata is proportionate for this library's actual size, or
+whether some of it actually is orphaned (renamed/removed titles, duplicate refreshes) the way CT112's
+Live TV metadata was — worth a proper look with more time, since 180G gives headroom now but the same
+library will keep growing.
