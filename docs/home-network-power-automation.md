@@ -464,3 +464,41 @@ deleted the matching rows from `CHANNEL` (2), `CHANNEL_MAPPING` (2), and `EPG_EV
 entries for those 2 channels), copied the edited DB back in, and restarted the `nextpvr` container.
 Verified after restart: `channel.list` now correctly returns 0 channels, container logs clean, both real
 channels (100, 102) still present and correct via the actual Jellyfin/Threadfin lineup.
+
+## CT105's own NextPVR container removed entirely (2026-08-08)
+
+Owner asked, given CT112's dedicated `nextpvr-live` container is the real, tested NextPVR backend, whether
+CT105's own separate `nextpvr` container still served any purpose. Investigated before touching anything:
+
+- Not registered as a Jellyfin LiveTv service (`/LiveTv/Info` shows exactly one service, `"Emby"` — the
+  native M3U/Threadfin path)
+- 0 real recordings, ever (`recording.list&filter=all` → 0; the configured recordings directory has been
+  empty since it was created)
+- The only two channels it had were the leftover test channels removed earlier this same session
+- Trivial resource footprint (71MB RAM, ~0% CPU) — this was about complexity, not resources
+
+Checked every script/service on the host and inside CT105 for any reference to it. `icon-verify`,
+`icon-archive`, `epg-sync-ct112`, and `jellyfin-metadata-prune.service` all exclusively target CT112's
+`nextpvr-live` — unaffected either way. Two things did still check CT105's own copy every run, both purely
+as dead weight (always nothing to find): `dvr-clean-shutdown`'s nightly `STACKS` entry, and
+`dvr-power-reminder`'s equivalent per-stack config. Updated both (CT105's `nextpvr` flag → `False`/`None`,
+matching how CT110 — which also has no NextPVR — was already handled) and verified each ran clean
+(`--dry-run` for the shutdown guard; the reminder script has no dry-run flag, so verified it by shadowing
+`mail` in `PATH` for one run rather than risking a real, unplanned email) *before* touching the container.
+
+NextPVR itself lived in its own isolated `docker-compose.yml`
+(`/srv/media-core/nextpvr/docker-compose.yml`, separate from the main `jellyfin`+`threadfin` compose file)
+— `docker compose down` in that directory removed cleanly with zero effect on the rest of the stack.
+Database backup from earlier in the session (`npvr.db3.bak-20260808T182435Z`) was left in place on disk
+for safety even though the whole container is gone.
+
+**Caught and fixed a real regression this surfaced**: `dvr-dashboard`'s own `recordings()` function still
+had its *own*, separate, unconditional NextPVR session-auth + `recording.list` check for CT105 — a piece
+the `channel_names()` fix earlier today hadn't touched (`channel_names()` itself was already switched to
+Jellyfin, but was still being called with a `sid` obtained from that same now-broken NextPVR auth call,
+coupling two things that should never have been coupled). Once the container was removed, this started
+correctly failing and showing a bogus `NextPVR unreachable` problem banner on every page load. Removed the
+entire dead NextPVR block from `recordings()`, dropped `channel_names()`'s now-unused `sid` parameter, and
+cleaned up the resulting dead code (`NEXTPVR` constant, `npvr_start()` parsing helper, the `hashlib` import
+that only existed for NextPVR's session-auth MD5 hash — all now fully unused). Live-verified clean after:
+`problems: []`, channel name still resolves correctly via Jellyfin.
