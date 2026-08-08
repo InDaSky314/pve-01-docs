@@ -209,6 +209,30 @@ output *during* an active buffering moment, plus a fresh conntrack snapshot, rat
    tunnel (would break Tailscale/local reachability while active) versus a split tunnel — not yet
    checked for any of them.
 
+## Full household playback device inventory (owner-provided, 2026-08-08 night)
+
+Not previously documented — worth having in one place:
+
+- **Living room (same room as pve-01/9.1/1.1/2.1/3.1)**: the main TV, currently has **two
+  Chromecasts, one of which is powered down** (not yet investigated why — spare/leftover from earlier
+  testing phases, or intentional redundancy; worth asking rather than assuming). A **Google TV
+  Streamer has been ordered** (shipping from the US, ~1-2 weeks out) and will be **wired directly into
+  `9.1`** (physically right under this TV) once it arrives — see the trade-off discussion above
+  (rock-solid for local Jellyfin/DVR playback, but won't have access to the geo-VPN tunnels the way
+  the Chromecast does unless separately VLAN-tagged).
+- **Basement**: a TV (Hisense, Google TV built-in) behind `Basement-Express` (UniFi mesh) and a
+  powerline adapter. Also has **its own separate GL-MT2500** ("Basement Brume" — this is the
+  `basement-brume` Tailscale peer seen much earlier in this session with no context at the time;
+  now explained) — a second, independent unit from `2.1`, dedicated to running a **US-exit VPN
+  tunnel** so the basement TV can watch US-based content over a reliable wired connection. Not part
+  of the four-router chain documented above; a self-contained setup.
+- **Kids' floor**: has a TV that needs a Chromecast (behind `Mid-Express` + the AP on that floor).
+- **Owner's floor (top floor)**: has a TV that needs a Chromecast (behind `U6 Lite`).
+
+Not yet clear whether "needs a Chromecast" means these TVs currently lack one and need one acquired,
+or already have one and this is just describing the existing setup — worth clarifying before assuming
+either way.
+
 ## Open items carried from this thread
 
 - [ ] Owner to purchase 2x smart plugs (Shelly Plug S Gen3/Gen4 recommended)
@@ -217,5 +241,10 @@ output *during* an active buffering moment, plus a fresh conntrack snapshot, rat
 - [ ] Tailscale audit — device inventory cleanup, R2D2's broken Tailscale specifically, subnet route
       decision, investigate the IOT-network buffering symptom
 - [ ] Check full-tunnel vs split-tunnel behavior on each per-content VPN network
+- [ ] Google TV Streamer arriving in ~1-2 weeks — wire into `9.1` once it's here (physically located
+      right under the living room TV, no cabling run needed)
+- [ ] Ask why the living room's second Chromecast is powered down — spare, or safe to remove/repurpose?
+- [ ] Clarify whether the kids'-floor and owner's-floor TVs need Chromecasts acquired, or already have
+      them
 - [ ] (Unrelated to this thread, tracked separately in the Wholphin work) `NoCompatibleStream` bug fix
       for in-progress-recording playback, and reviewing agy's sports-auto-record draft
