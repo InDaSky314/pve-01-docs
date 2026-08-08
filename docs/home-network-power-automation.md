@@ -428,3 +428,39 @@ while ESPN reports a game `state: "in"` and its Jellyfin timer has under 15 minu
 minutes from now. This has been **code-reviewed and is live**, but no followed team has actually been
 mid-game since it was deployed (2026-08-08 evening), so the extend/trim behavior itself hasn't been
 observed firing for real yet — worth a deliberate check next time a game is actually on.
+
+## RSN EPG data (Brewers/Bucks channels) and NextPVR cleanup (2026-08-08)
+
+**EPG timezone question.** Checked the real guide data behind "Milwaukee Brewers HD" (channel 121) and
+"Milwaukee Bucks HD" (channel 120) directly via Jellyfin's `/LiveTv/Programs`. The underlying data is
+correct, proper UTC ISO8601 timestamps — Jellyfin's own web UI localizes these to whatever timezone the
+browser itself is set to, so a real game block does render at the actual correct local time, not stuck in
+Central or Eastern. Confirmed for real: the Aug 8 Twins @ Brewers game shows as a distinct program block
+`2026-08-08T23:10Z → 2026-08-09T02:10Z` (the real ESPN game time), immediately followed by a
+`... possible Extra Innings` buffer block, exactly matching what `sports_dvr_auto` schedules against.
+
+The confusing part, and probably why it "doesn't look right": between real games, both channels are filled
+with a repeating generic **filler block** (a fixed multi-hour window, same content repeated back-to-back)
+whose *title text* is a hardcoded string like `"Next game: ... at 07:10 PM (US/Eastern)"` — that's a plain
+string baked into the program title by the IPTV provider's feed, not a real timezone-aware field, so it
+will always show "(US/Eastern)" regardless of local settings; only the actual game-time block itself is
+timezone-correct. For Bucks specifically, since the NBA season doesn't start until October, literally
+*every* block through mid-August is this same filler, pointing at the Oct 11 opener — normal for
+off-season, not a bug. Brewers, mid-season, shows the real per-game blocks correctly interspersed with
+filler between games. Nothing to fix here technically; this is the provider's own feed behavior. Worth
+knowing: if the guide *looks* empty for one of these channels, it's very likely just landed on a filler
+block rather than actually missing data — worth checking a specific known game's exact local time
+directly rather than skimming.
+
+**NextPVR cleanup — done.** The two leftover/test channels identified earlier (`oid` 7148 "Madison: ABC 27
+(WKOW)" #100, `oid` 7149 "Madison: FOX 47 (WMSN)" #102) were confirmed sourced from a file literally named
+`/config/test-channels.m3u` inside the `nextpvr` container — self-evidently scratch data from an earlier
+setup/testing phase, unrelated to the real Threadfin-fed lineup. Both channel names/numbers were confirmed
+still present in the real Jellyfin channel list before removing anything. No `channel.delete` exists in
+NextPVR's HTTP API (confirmed via the same UI-source-grep technique as `nextpvr-cli.md`), so this needed
+direct SQLite work on `npvr.db3` inside the `nextpvr` container: backed up the live DB first
+(`/config/npvr.db3.bak-20260808T182435Z`, alongside an older pre-existing backup from 2026-07-30), then
+deleted the matching rows from `CHANNEL` (2), `CHANNEL_MAPPING` (2), and `EPG_EVENT` (231 stale guide
+entries for those 2 channels), copied the edited DB back in, and restarted the `nextpvr` container.
+Verified after restart: `channel.list` now correctly returns 0 channels, container logs clean, both real
+channels (100, 102) still present and correct via the actual Jellyfin/Threadfin lineup.
