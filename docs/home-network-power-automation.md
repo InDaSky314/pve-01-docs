@@ -267,6 +267,10 @@ either way.
 - [ ] Design/build a per-game "record just this one" dashboard button (today: use Jellyfin's own
       guide → Record for a genuine one-off, e.g. a single Brewers game while the team toggle stays off
       — this already works, no new code; a dashboard button would just make it more convenient)
+- [ ] Metadata proportionality audit — is CT111's 67GB and CT105's 133GB of `metadata/library`+`People`
+      genuinely proportionate to library size, or is some of it orphaned the way CT112's `livetv`
+      metadata was (see the CT111 disk-full incident below)? Not urgent for CT105 (793GB free) or CT111
+      (95GB free post-resize), but worth a proper read-only audit before either fills up again
 
 ## Sports auto-recorder dashboard (deployed 2026-08-08)
 
@@ -565,3 +569,19 @@ here as the picture became clearer). Dashboard's `LINKS` entry updated to match.
 whether some of it actually is orphaned (renamed/removed titles, duplicate refreshes) the way CT112's
 Live TV metadata was — worth a proper look with more time, since 180G gives headroom now but the same
 library will keep growing.
+
+## Two follow-up questions, answered directly (2026-08-08)
+
+**Does live-game auto-extend apply to a manually-recorded one-off game?** Yes. Re-checked
+`run_live_extender()`'s actual matching logic to confirm rather than assume: it pulls ESPN's schedule for
+all 5 tracked teams regardless of each team's on/off toggle (that toggle only gates *auto-scheduling*, a
+separate function), and matches any *existing* Jellyfin timer to a game purely by time overlap — it does
+not care who or what created the timer. A manually-recorded Brewers game via Jellyfin's own guide will get
+picked up and extended/trimmed exactly like an auto-created one.
+
+**Is production (CT105) accumulating Jellyfin metadata the same way VOD (CT111) was?** Checked directly:
+yes, actually more — `metadata/library` is 96GB (vs VOD's 67GB) plus another 25GB in `metadata/People`,
+133GB total in CT105's Jellyfin config. But CT105's Jellyfin config lives on `/srv/media-core`, its own
+dedicated 1000G volume (`mp0`), not the small 32G root disk — currently 16% used with 793GB free. VOD had
+no such separation, which is exactly why the same style of growth was able to fill its whole root disk.
+Same underlying growth pattern on both, very different risk profile today. Added to the open items above.
