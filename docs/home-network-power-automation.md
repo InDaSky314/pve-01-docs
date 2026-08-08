@@ -374,6 +374,29 @@ against the running dashboard overwrote the override the owner had manually set 
 (`until 2026-08-09T16:53`) with the new tonight-only value. Caught and restored to the original value
 right away — flagged here in case the timing looks odd in hindsight.
 
+### Follow-up same evening: skip past an already-late cutoff to the *following* night
+
+The owner then actually pressed the new button and got back "Override until Sun, Aug 9, 01:00 AM" —
+correct per the logic above (Saturday is a late night, so the very next software shutdown check is at
+00:45 Sunday, ahead of the 01:00 physical cutoff), but not what was wanted: on a night that's already
+late, that cutoff is the trivial, immediate one, and pressing the button to get *only* that far doesn't
+add anything obviously new on top of what the schedule already does. Asked the owner directly which
+behavior they wanted; picked: skip past every *consecutive* late cutoff (Fri→Sat→Sun is the longest run)
+to land on the first genuinely *normal* cutoff instead, so one press covers the whole stretch through the
+following night too.
+
+Implemented as `keep_awake_cutoff()`, layered on top of `next_shutdown_cutoff()` rather than changing it
+(that function is also used for display/status elsewhere and its "return the very next one" behavior is
+correct there). This does not open any protection gap — a later expiry timestamp still covers every
+earlier shutdown check along the way, it just also covers the later one. Verified against all four shapes
+by hand before deploying: an ordinary night (unchanged, still that night's own cutoff), a single late
+night (Sat evening → Sun 22:25, skipping the trivial Sun 01:00), the Fri+Sat double-late chain (Fri
+evening → Sun 22:25, skipping *both* Sat 01:00 and Sun 01:00), and the early-morning tail case (Sun 02:00
+→ Sun 22:25). Live-verified against the real running dashboard (Sat evening test → correctly returned
+`2026-08-09T22:25:00+02:00`), then the owner's own most-recent override (from their real button press,
+`until 01:00 AM`) was re-applied with the fixed logic so it reflects what they actually asked for
+(`until 22:25`), rather than leaving the stale pre-fix value in place.
+
 ## "Brewers game recording" false alarm — schedule-tab UX fix (2026-08-08)
 
 Owner reported an Aug 14 Brewers @ Dodgers game showing as recording despite Brewers being toggled off.
