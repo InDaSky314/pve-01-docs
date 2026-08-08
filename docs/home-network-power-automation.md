@@ -209,6 +209,22 @@ output *during* an active buffering moment, plus a fresh conntrack snapshot, rat
    tunnel (would break Tailscale/local reachability while active) versus a split tunnel — not yet
    checked for any of them.
 
+## Software shutdown schedule fixed to match the real physical timer (2026-08-08, done)
+
+Both `/usr/local/bin/dvr-clean-shutdown` and `/usr/local/bin/dvr-dashboard` previously assumed a flat
+single daily cutoff (~22:24, `POWER_ON` also slightly off at 04:57). Real physical timer (confirmed
+directly by the owner) restores power at 05:05 every day and cuts at 22:25 on Sun/Mon/Tue/Wed/Thu
+nights, but stays on until ~01:00 the *following* calendar day on Fri/Sat nights. Fixed both files to
+be day-of-week aware:
+- `dvr-clean-shutdown.timer` now has two `OnCalendar` lines (22:10 on Sun–Thu, 00:45 on Sat/Sun) instead
+  of one flat daily trigger.
+- `dvr-dashboard` gained `is_powered()` / `todays_power_off()` helpers used by both `outside_window()`
+  (the "does this game need a manual power override" check) and the displayed power window — this was
+  a real live bug: games airing 22:25–01:00 on Fri/Sat nights were being wrongly flagged as needing an
+  override even though the real timer already covers them.
+- Verified with 10 test scenarios (including both early-morning tail-end edge cases) before deploying,
+  all passing; confirmed live afterward (`powerOff: 01:00 (+1d)` correctly shown on a Saturday).
+
 ## Full household playback device inventory (owner-provided, 2026-08-08 night)
 
 Not previously documented — worth having in one place:
