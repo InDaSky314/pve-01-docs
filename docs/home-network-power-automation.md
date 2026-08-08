@@ -373,3 +373,35 @@ One live side-effect from testing this, corrected immediately: verifying the new
 against the running dashboard overwrote the override the owner had manually set earlier tonight
 (`until 2026-08-09T16:53`) with the new tonight-only value. Caught and restored to the original value
 right away — flagged here in case the timing looks odd in hindsight.
+
+## "Brewers game recording" false alarm — schedule-tab UX fix (2026-08-08)
+
+Owner reported an Aug 14 Brewers @ Dodgers game showing as recording despite Brewers being toggled off.
+Investigated against live state: **nothing was actually wrong** — `sports-config.json` still had
+`Brewers: false`, and the live Jellyfin API showed exactly one real timer (the Packers game). The real
+cause: `tag_recordings()` matches games to recordings by **time overlap only**, not by team or channel —
+by design, since one DVR timer records a channel for a span, not "a team's game". The Packers recording's
+padded window (`22:50–05:30` local, after its 5 min pre/30 min post padding) coincidentally overlaps the
+Brewers/Dodgers game (`04:10–07:25` local) by about 80 minutes, on a completely different channel. The
+"recording" pill was technically correct (an overlap exists) but read as "this game is recording", which
+it isn't.
+
+Fixed in `pills()`: the pill now only says **"recording"** when the overlapping timer's name actually
+starts with this game's own team (matching `schedule_game_timer`'s `"{team}: {name}"` naming); otherwise
+it says **"other recording overlaps"**, with the real overlapping recording's name still available on
+hover either way. Live-verified against the actual Aug 14 Brewers/Dodgers entry before deploying.
+
+Also added while in there, per a separate ask: the Schedule tab was rendering every past game inline,
+mixed into the month grouping with only a dim "past" style — no way to collapse them. Past games (relative
+to each team filter) are now collapsed behind a **"Show N past games"** toggle button at the top of the
+list; upcoming games render as before, un-collapsed, right below it.
+
+## Live-game auto-extension — deployed and running, not yet observed against a real live game
+
+The extend/trim piece (`run_live_extender()`) is part of every 10-minute `sports-dvr-auto.service` run —
+confirmed via logs, `=== Starting Live Game Auto-Extender ===` fires every cycle with no errors. Logic:
+while ESPN reports a game `state: "in"` and its Jellyfin timer has under 15 minutes left, extend
+`EndDate` by 20 minutes; once ESPN reports `state: "post"`/`completed`, trim the timer down to end 5
+minutes from now. This has been **code-reviewed and is live**, but no followed team has actually been
+mid-game since it was deployed (2026-08-08 evening), so the extend/trim behavior itself hasn't been
+observed firing for real yet — worth a deliberate check next time a game is actually on.
