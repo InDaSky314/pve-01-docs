@@ -68,6 +68,21 @@ DSL ─▶ 3.1 (Flint 3, proposed new head-end)
 2.1 (GL-MT2500) — role TBD
 ```
 
+## Tailscale status (updated 2026-08-09)
+
+3.1's Tailscale had expired/logged-out (found during the 2026-08-08 Tailscale
+audit, `tailscale-audit-findings.md`). Re-authenticated 2026-08-09 —
+confirmed online (`GL-BE9300` / `big-big-gl.tail8f3e6.ts.net`,
+`100.82.158.23`, already advertising `192.168.3.0/24`). Requested
+non-expiring key given its candidacy as the new head-end; not verifiable
+remotely (Tailscale's device-status JSON doesn't expose key-expiry state) —
+confirm in the admin console if this matters later.
+
+Also fixed same day: R2D2 (1.1)'s Tailscale, dead since 2025-04-24 —
+`/data/tailscale/manage.sh` didn't recognize UniFi OS v5. One-line fix
+(added `'5'` to the version check at line 32), verified online with a
+direct-path ping from pve-01.
+
 ## 3.1 (GL-BE9300) capability notes, gathered for this evaluation
 
 Confirmed live via SSH, relevant to the proposed head-end swap:
