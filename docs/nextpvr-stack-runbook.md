@@ -12,6 +12,43 @@ Written 2026-08-03, after repairing 997 channels' artwork end to end.
 
 ---
 
+## STOPPED 2026-08-09 — read this first
+
+**CT112 is shut down** (`pct shutdown 112`), not deleted — all state (997
+channels, artwork, NextPVR config, `npvr.db3`) is intact and untouched, this
+is a pause, not a teardown. Restart with `pct start 112` whenever the A/B
+comparison is picked back up; nothing below needs to be redone first.
+
+**Two dependent timers were also disabled** (`systemctl disable --now`), not
+just left to fail against a stopped container:
+- `epg-sync-ct112.timer` — daily XMLTV guide propagation from CT105 to CT112.
+- `jellyfin-metadata-prune.timer` — **covers CT105's own orphan-metadata
+  pruning too, not just CT112's** — disabling it means CT105 also lost its
+  periodic prune. Low-stakes for now (the 2026-08-08 audit found ~0% orphan
+  rate on CT105), but re-enable this one specifically if that matters later,
+  independent of whether CT112 comes back.
+
+Re-enable both with `systemctl enable --now <unit>` if CT112 restarts.
+
+**Why:** CT112 was a bake-off/test rig (see "What is different about this
+stack" below), not a second production system — nothing currently depends
+on it running. Stopping it removed a real, observed source of host-wide
+load: on 2026-08-09 both Jellyfin instances (CT105 and CT112) were
+independently running heavy scheduled tasks (guide refresh, library scan)
+at the same time, driving the shared pve-01 host's load average to ~47 —
+LXC containers report host-wide load, not their own isolated number, so
+this is a real shared-host cost, not two coincidental separate problems.
+
+**Known gap, still open, not the reason it was stopped:** Bug 2 in
+`livetv-custom-build-and-updates-20260726.md` §14 — DirectPlay of a
+NextPVR-plugin-sourced channel returns HTTP 500 (`Unrecognized Guid format`,
+NextPVR's MediaSource Id is a bare integer, Jellyfin's `Guid.Parse` rejects
+it), forcing a stall-then-transcode fallback instead of efficient DirectPlay.
+Confirmed still live as of that doc's last status check. Not yet reported
+upstream (see that doc's §16 pick-up list, item 2).
+
+---
+
 ## What is different about this stack
 
 | | Production (CT 105) | NextPVR (CT 112) |
