@@ -585,3 +585,48 @@ yes, actually more — `metadata/library` is 96GB (vs VOD's 67GB) plus another 2
 dedicated 1000G volume (`mp0`), not the small 32G root disk — currently 16% used with 793GB free. VOD had
 no such separation, which is exactly why the same style of growth was able to fill its whole root disk.
 Same underlying growth pattern on both, very different risk profile today. Added to the open items above.
+
+## Smart plug recommendation for the two power segments (2026-08-09, research/shopping item)
+
+Recommended, not yet purchased — owner still doing shopping research. Captured here so
+the reasoning isn't lost.
+
+**Two Shelly smart plugs**, one per existing power segment, replacing the current dumb
+timers (not the power strips themselves — those stay exactly as wired):
+- Plug 1 → Segment A's strip (`1.1` UDR + `2.1` GL-MT2500 + `3.1` GL-BE9300 — the
+  internet-path segment)
+- Plug 2 → Segment B's strip (`9.1` GL-MT6000 + pve-01 — the server-path segment)
+
+**Why Shelly specifically**: exposes its own local WiFi HTTP API directly — no hub,
+bridge, or Thread border router needed in the path. pve-01's automation talks straight
+to the plug. (A Google TV Streamer's own Thread radio was considered as a bridge option
+but isn't needed for this — one less moving part to depend on.)
+
+**Why two plugs, not one**: the two segments already map cleanly onto "must stay
+locally reachable" (Segment B — the Chromecast talks to pve-01 entirely within this
+segment, same subnet, never touches Segment A) vs. "must stay up for internet"
+(Segment A — only needed to actually pull the IPTV stream). No topology change needed;
+the existing physical split already matches what the automation needs.
+
+**The point of doing this at all**: today's sports-recording automation (auto-schedule,
+live-extend, and now stall-detect/restore) can already decide a game needs to keep
+recording past the household's normal bedtime power-down — but a *software* decision to
+keep recording is worthless if the *physical* mains timer cuts power to the gear
+regardless. Smart plugs let that same automation hold both segments' power open when a
+tracked game is still live near the scheduled cutoff (Segment A has to stay up too,
+since Segment B's internet path depends on it), and release them once the game's
+actually over — replacing the current fixed dumb-timer schedule with one the
+automation can actually override.
+
+**Schedule to replicate** (matching what the physical timers already do, before any
+override logic):
+
+| Night | Off | On |
+|---|---|---|
+| Sun/Mon/Tue/Wed/Thu | 22:25 | 05:05 |
+| Fri/Sat | 01:00 | 05:05 |
+
+**Designed to extend, not built yet**: same `sports-config.json`-style shared-state
+pattern already used for the per-team auto-record toggles would apply cleanly to a
+`plug-config.json` + a matching dashboard section, once there's actual hardware to
+control. Not built now — no plugs on hand yet.
