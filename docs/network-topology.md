@@ -73,10 +73,14 @@ DSL ─▶ 3.1 (Flint 3, proposed new head-end)
 3.1's Tailscale had expired/logged-out (found during the 2026-08-08 Tailscale
 audit, `tailscale-audit-findings.md`). Re-authenticated 2026-08-09 —
 confirmed online (`GL-BE9300` / `big-big-gl.tail8f3e6.ts.net`,
-`100.82.158.23`, already advertising `192.168.3.0/24`). Requested
-non-expiring key given its candidacy as the new head-end; not verifiable
-remotely (Tailscale's device-status JSON doesn't expose key-expiry state) —
-confirm in the admin console if this matters later.
+`100.82.158.23`, already advertising `192.168.3.0/24`). Confirmed
+**"Expiry disabled"** in the Tailscale admin console (owner-verified
+screenshot), given its candidacy as the new head-end.
+
+Noted in passing: 9.1 (`big-gl`) does **not** have expiry disabled (dated
+expiry, 2027-01-21 per the 2026-08-08 audit) — worth doing the same
+regardless of how the head-end decision lands, since it stays core
+infrastructure either way. Not yet done.
 
 Also fixed same day: R2D2 (1.1)'s Tailscale, dead since 2025-04-24 —
 `/data/tailscale/manage.sh` didn't recognize UniFi OS v5. One-line fix
