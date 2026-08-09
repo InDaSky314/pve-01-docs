@@ -6,15 +6,18 @@ the ruled-out list.
 
 ---
 
-## START HERE — current state (2026-07-31)
+## START HERE — current state (2026-08-09)
 
 This doc grew by accretion and several sections each read as "the
-current state". They are not. Read this section, then §17. Everything
+current state". They are not. Read this section, then §18. Everything
 between is history, useful for *why* but not for *what is true now*.
 
-**Everything works**: recordings play, Live TV plays on both the
-Threadfin and NextPVR copies of ch100/102, both have guide data, and
-recordings can be deleted from the TV.
+**Everything works, including in-progress recording playback now**:
+recordings play (finished and in-progress), Live TV plays on both the
+Threadfin and NextPVR copies of ch100/102, both have guide data,
+recordings can be deleted from the TV, and DVR Schedule / the
+Recordings library both load correctly. See `handoff-20260809.md` for
+that day's full narrative.
 
 | Section | Status |
 |---|---|
@@ -24,7 +27,8 @@ recordings can be deleted from the TV.
 | §14 | still accurate; Bug 2 is still live on Jellyfin 10.11.9 |
 | §15, §16 | **the recordings hypothesis in these sections is disproved** — see §17.1 |
 | §16 ADB note | **wrong** — see §17.6, rediscovery is trivial and now automated |
-| §17 | current: four new bugs, the NextPVR guide chain, the noon schedule, power management |
+| §17 | four new bugs, the NextPVR guide chain, the noon schedule, power management (2026-07-30/31) |
+| §18 | current: NoCompatibleStream fixed for in-progress recordings, and five real bugs in DVR Schedule / the Recordings library, all found live against real household data (2026-08-09) |
 
 ---
 
@@ -1205,3 +1209,106 @@ their unit files, and every timer drop-in for both host and CT105. Before
 this they existed only in `/usr/local/bin` and `/etc/systemd/system`, so a
 dead boot disk would have taken them with it. Copies here are the source of
 truth; re-deploy with `install -m 755 scripts/<name> /usr/local/bin/`.
+
+## 18. NoCompatibleStream fixed for in-progress recordings, and five DVR Schedule / Recordings bugs (2026-08-09)
+
+Full session narrative in `handoff-20260809.md`. This section is the technical
+reference for the bug family itself, for whoever hits something in this area next.
+
+### 18.1 NoCompatibleStream still fired for the one case it was meant to fix
+
+The original `PlaybackViewModel.kt` fix (this doc's §1, Bug A) checked
+`item.type == TV_CHANNEL || mediaSource.isInfiniteStream`. `isInfiniteStream` is
+**only ever `true` for a live-tuner Channel source, never for a Recording, in-progress
+or not** — confirmed via direct `GET /Items/{id}` comparison of an in-progress vs
+finished Recording. So the fix never covered the actual "watch recording in progress"
+path added later (§17's `ProgramDialog.kt` addition). Added a third condition,
+`isInProgressRecording`: `item.type == RECORDING` and (`status == "InProgress"` or
+`timerId != null` or `runTimeTicks == null` — unset while still growing, populated
+once finalized). Commit `5d55fae2`.
+
+### 18.2 Recordings library hang: `EnableUserData=true` is pathological for this one folder
+
+`CollectionFolderView.kt`'s `createGetItemsRequest` (used by every library browse
+screen) never set `enableUserData` explicitly, so it inherited the API default
+(`true`). For the Recordings folder specifically — `CollectionType == null`, unlike
+every typed `movies`/`tvshows` library — this triggers an expensive recursive
+`GetUnplayedItemCount` evaluation server-side against the household's full 550k+
+item database. Measured directly: **40.67s with it on, 16ms with it off**, for a
+folder with 10 actual items in it. Not query complexity (stripped to bare
+`?ParentId=X`, still hung), not a real slow SQL query (the folder has zero indexed
+child rows — `SELECT COUNT(*) FROM BaseItems WHERE ParentId = '<recordings-guid>'`
+returns 0), not host load (reproduced identically at load average 8.5 and 47).
+Fixed by explicitly setting `enableUserData = false` when `collectionType == null`
+— scoped narrowly so typed libraries keep their watched/favorite indicators. Commit
+`ea7c7b14`.
+
+### 18.3 DvrSchedule.kt crashed the whole screen on any ad-hoc timer
+
+`DvrScheduleViewModel.init()` force-unwrapped `timer.programInfo!!` when building the
+scheduled list. Any Timer created by channel+time rather than by EPG `ProgramId` —
+which is *every* timer this household's own `sports-dvr-auto` and the dashboard's
+Record button create, both deliberately — has `programInfo: null`. One bad timer
+crashed the list for every timer, not just itself. Confirmed live: real Brewers and
+Packers timers both had `ProgramInfo: null`. Fixed with a fallback `BaseItemDto`
+built from the Timer's own fields (`name`/`channelId`/`startDate`/`endDate`, plus
+`timerId` — see 18.4) via `it.id?.toUUID()` (note: `TimerInfoDto.id` is a bare
+32-char hex string, not dashed — `UUID.fromString()` throws on it, use the SDK's
+`org.jellyfin.sdk.model.serializer.toUUID()` extension instead, found from the
+existing `AppDatabase.kt` usage). Commit `ea7c7b14`.
+
+### 18.4 Cancel Recording missing `timerId`, and both button rows gated by stale `endDate`
+
+Two related bugs in `ProgramDialog.kt`, both found live:
+
+- The 18.3 fallback item didn't set `timerId`, so `isRecording =
+  dto.timerId.isNotNullOrBlank()` was false for ad-hoc timers even though they were
+  genuinely already scheduled — the dialog offered "Record Program" again instead of
+  "Cancel Recording". Fixed by setting `timerId = it.id` on the fallback.
+- Both the Watch Live/Watch-recording-in-progress row and the Record/Cancel row are
+  gated by `dto.endDate?.isAfter(now)` — correct for a live guide program, wrong for
+  anything reached via "Active Recordings", where being in that list already means
+  it's genuinely still `InProgress` server-side and can legitimately run past its
+  originally-scheduled end. Caught live against a real recording ("Weather AM") that
+  was still actively growing ~75 minutes after its nominal end — confirmed via real
+  file-size growth (632MB → 640MB over 17s), not just timer status, before treating
+  it as a genuine ongoing recording rather than a stuck one. Both gates now also fire
+  whenever `isRecording` is true, regardless of `endDate`. Commit `918fa129`.
+
+### 18.5 "Unsupported item type: Recording"
+
+`DestinationContent.kt`'s central item-type router had no `BaseItemKind.RECORDING`
+case at all — fell through to the generic `else`, showing the literal error text.
+Added it alongside `VIDEO`/`MUSIC_VIDEO` in the existing `MovieDetails` case: a
+Recording (finished or in-progress) behaves the same as any other playable video
+here, and `MovieDetails`' own Play button already routes through
+`Destination.Playback` → `PlaybackViewModel`, which already correctly detects the
+in-progress case (18.1). Verified end-to-end, not just visually — actually deleted a
+real test recording through this path and confirmed both the file and the library
+entry were gone afterward. Commit `918fa129`.
+
+### 18.6 "Watch recording in progress" from DVR Schedule did nothing
+
+`DvrScheduleViewModel.watchRecordingInProgress()` (a separate copy of the same-named
+method in `LiveTvViewModel`, which is called from a different context — the Guide's
+program dialog, where the clicked item is a Program and the Recording genuinely does
+need to be looked up by channel) redundantly re-queried `/LiveTv/Recordings` filtered
+by channel, for an item that was **already** the real Recording — it came straight
+from `DvrScheduleViewModel`'s own `active` list. Confirmed live: that filtered query
+returns empty even for a timer showing `Status: InProgress` with a real `ChannelId` —
+so `recordings.items.firstOrNull()` was always null and the function silently did
+nothing (or, depending on which guard was hit, threw inside an
+`ExceptionHandler(autoToast = true)` that's easy to miss). Simplified to navigate
+directly with the item already in hand — no re-fetch needed. Commit `918fa129`. Not
+yet re-confirmed on-device after this exact commit (see `handoff-20260809.md` Open) —
+code-reviewed and high-confidence (pure simplification onto an independently-proven
+path), not eyeballed working.
+
+### 18.7 Reference: reproducing an in-progress-recording test correctly
+
+An ad-hoc timer (channel+time range, the `sports-dvr-auto` pattern) never links a
+`ProgramId`, so it never shows "Watch recording in progress" in the Guide's dialog at
+all — that's a test-setup gotcha, not a bug. To reproduce the in-progress-recording UI
+path specifically, use the real Record Program flow: `GET
+/LiveTv/Timers/Defaults?programId=<id>` then `POST` that payload back, matching what
+the app's own "Record Program" button does.
