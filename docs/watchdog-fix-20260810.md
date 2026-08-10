@@ -73,3 +73,41 @@ Verified before and after deploy:
   the provider offers one) or just deleted.
 - Once the E2E re-run confirms clean, safe to consider re-enabling Brewers
   auto-record in `sports-config.json` (currently `false`).
+
+## Update — first fix deployed but E2E re-test still FAILED; second, deeper bug found and fixed
+
+The E2E re-run against the first fix (InProgress via API + disk-enrichment
+fallback) **still failed**: `recording-stall-state.json` stayed `{}` through
+the whole test window despite six clean watchdog ticks. Investigated rather
+than assumed success.
+
+**Root cause #2, confirmed by direct live testing (not guessed):**
+`get_existing_timers()`'s API DTO for an `InProgress` timer has **no
+`RecordingPath` field at all** — confirmed by calling it live against the
+actual running test timer and dumping the full raw JSON (field is absent,
+not null). And the on-disk `timers.json` fallback (`disk_map`) **doesn't
+contain the timer either while it's active** — confirmed directly: a live
+InProgress timer's Id has zero match in `read_live_timers()`'s output, since
+Jellyfin only writes a timer to disk once it reaches a terminal state. So
+the first fix's enrichment path had nothing to enrich from for a timer that
+was, by definition, still actively recording.
+
+**Fix #2**: added `resolve_active_recording_path()` — when the API timer has
+no `RecordingPath`, searches `/media/recordings` directly (via `pct exec 105
+-- find`, glob on the timer's `Name` with `:` treated as a wildcard, since
+Jellyfin's folder naming replaces `:` with a space and exact spacing isn't
+worth depending on; picks the most-recently-modified match if more than one
+turns up). Verified directly against two real recordings before deploying
+(the just-completed E2E test folder, and the still-on-disk original Aug 9
+Brewers incident folder) — both resolved to the exact correct path.
+
+Backup before this second change:
+`/root/agy-reports/sports-dvr-auto-pre-pathresolve-fix-20260810.bak`.
+Deployed, syntax-checked, and confirmed clean via a real systemd run
+(exit 0/SUCCESS) before re-running the E2E test a second time.
+
+**Lesson for next time**: don't declare a fix confirmed off a single
+plausible-sounding root cause, even a well-evidenced one — the E2E harness
+existing at all is what caught that the first fix was incomplete. Re-running
+the *same* independent test after every change, not just after the first
+one, is what actually surfaced this.
