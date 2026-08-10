@@ -608,3 +608,134 @@ service for remote management. Worth a deliberate decision with the owner
 on whether to keep, since it's a standing remote-admin surface on top of
 the router's own LAN/Tailscale access — flagging here rather than touching
 it, since disabling it is a settings change on shared infra.
+
+## Pushing past the gaps on purpose (2026-08-10) — associating a whole VLAN/SSID with a VPN tunnel
+
+Explicitly requested: try to bind an entire VLAN (and by extension whatever SSID
+ends up on it) to a specific VPN tunnel wholesale, rather than GL.iNet's GUI-only
+per-device MAC list — via CLI/LuCI, even where there's no GUI option, specifically
+to characterize the limitation rather than just read about it. Backed up
+`route_policy` (`uci export route_policy`) and took a full `sysupgrade -b` config
+backup before touching anything; all changes below were additive/reversible and
+the three production tunnels (Swiss, WALDO, GIOT) were re-verified intact
+afterward.
+
+**Attempt 1 — ask GL.iNet's own `route_policy` engine to do it (failed cleanly, no
+crash, just a silent no-op).** The existing UCI schema already has a `from_type`
+field with more than one observed value: `ipset` (what every real tunnel rule
+uses — a MAC-list-backed ipset), plus `device` and `process_gid` seen on
+GL.iNet's own built-in default/system rules (`@default[0]`, `gl_process`,
+`gl_process_vpn`). Since `device` sounded like exactly "a whole
+interface/VLAN," a new test rule was added (`from_type='device'`, `from='vlan12'`,
+`via='wgclient2'`, its own unused `tunnel_id`/`mark`, additive — didn't touch the
+existing rules) and applied via the correct path, `/usr/bin/rtp2.sh apply`
+(per the standing lesson — never `/etc/init.d/network reload`).
+
+Result: **UCI accepted it uncritically (no schema validation at that layer), and
+`rtp2.sh apply` exited 0 with zero errors logged anywhere — but produced no
+effect at all.** No ipset created, no `ip rule` entry, nothing in `nft list
+ruleset` referencing the new mark. **`from_type=device`/`process_gid` are
+reserved for GL.iNet's own hardcoded internal rules and are not wired into the
+apply logic for user-created ones** — only `ipset` (i.e. only the MAC-list path)
+actually does anything when a user (or the API) creates a rule. This is the
+precise, verified shape of the limitation: not a crash, not a validation error,
+just a silent no-op — the same "fails quietly, not loudly" pattern already seen
+elsewhere in this stack. Test rule removed and `rtp2.sh apply` re-run to confirm
+clean state after.
+
+**Attempt 2 — bypass GL.iNet's abstraction entirely, raw Linux policy routing
+(worked).** Every VPN client already gets its own real routing table
+(`ip route show table all`, e.g. WALDO's `wgclient2` → table `1002`, with its own
+`default dev wgclient2`). GL.iNet's per-MAC rules are just `ip rule` entries
+pointing `fwmark X/0xf000 → lookup <table>` at priority `6000`. Nothing stops a
+plain **source-subnet-based** `ip rule` from pointing at the same table, with no
+mark/ipset/MAC list involved at all:
+
+```bash
+ip rule add from 192.168.12.0/24 lookup 1002 priority 5900
+```
+
+Verified with `ip route get 8.8.8.8 from 192.168.12.50 iif br-vlan12`:
+**before** the rule, this returned `RTNETLINK answers: Invalid argument` (see
+next paragraph for why); **after**, it cleanly resolved to
+`dev wgclient2 table 1002` — i.e. **every device on vlan12 would now ride
+WALDO's WireGuard tunnel automatically, with zero per-device configuration**,
+which is exactly the capability the GUI doesn't expose. Confirmed the rule
+survives a real `rtp2.sh apply` run (GL.iNet's script only manages its own
+rules, doesn't flush/rebuild the whole table) — so it's safe from being wiped
+by *other* future tunnel/VLAN edits made through the normal GUI/API.
+
+**Bonus finding, previously undocumented — vlan11/vlan12/iot/guest fail CLOSED
+by default, not open:** `ip rule show` on 3.1 has, at priority `9920`:
+`from all iif br-vlan12 blackhole` (and the same for `br-vlan11`, `br-iot`,
+`br-guest`). This is *why* the "before" `ip route get` above errored instead of
+returning a normal WAN route: **any device on these networks with no matching
+higher-priority rule (i.e. not yet assigned to a tunnel) gets its traffic
+silently blackholed, not leaked to the bare WAN.** This is the opposite of the
+`from_mac`-as-scalar failure mode documented in [[pve01-glinet-ui-vpn-sync]]
+(which was about 9.1, a different router/firmware moment, and was a real
+fail-open bug) — 3.1's current config for these specific subnets is fail-closed
+by design. Worth knowing either way before assuming a new VLAN's devices get
+default internet like normal LAN would.
+
+**Caveats before relying on this for real:**
+- The `ip rule add` above is **runtime-only** — it does not survive a reboot or
+  a full `/etc/init.d/network` restart. It's not written into any UCI config or
+  init/hotplug script. Making it permanent would mean adding a small custom
+  hotplug script (e.g. `/etc/hotplug.d/iface/`) — a standing boot-time change,
+  deliberately **not** done unilaterally this session since that's a persistent
+  config decision, not a reversible experiment. Left as a live, working,
+  easily-removed (`ip rule del from 192.168.12.0/24 lookup 1002 priority 5900`)
+  proof-of-concept — say the word if you want it made permanent.
+- No live client has actually ridden this path yet — WALDO's SSID still doesn't
+  exist (same GUI gap as GIOT before it was closed), so this is proven at the
+  routing-table level but not yet with real traffic. Once a wifi-iface gets
+  redirected onto `vlan12` the same way GIOT's was, this is ready to test for
+  real with a `curl ipify` comparison.
+- This is real GL.iNet-abstraction-bypass territory — future GUI/API-driven
+  tunnel or VLAN edits won't know this rule exists, won't remove it if the VLAN
+  itself is later deleted, and won't show it anywhere in the GUI. If this
+  becomes permanent, it needs to be documented wherever VLAN/tunnel lifecycle
+  changes get made, or it'll become an invisible landmine.
+
+## AstroMesh research (2026-08-10, via research subagent — see full report for citations)
+
+Asked specifically: what AstroMesh actually is, whether 9.1 (GL-MT6000/Flint 2,
+MediaTek) can get it despite not officially supporting it today, and whether
+it's worth pursuing over the current manual WiFi-as-WAN bridge.
+
+- **What it is**: GL.iNet's branded implementation of the Wi-Fi Alliance
+  **EasyMesh** standard for the local unified-SSID/roaming layer, plus a
+  separate proprietary remote-access layer (**AstroLink**, formerly
+  "AstroWarp") that tunnels a traveling node back to the home network.
+  Confirmed via a GL.iNet staff post, not just marketing copy.
+- **Model support today**: public beta on exactly two models, both
+  Qualcomm-based — **Flint 3 (GL-BE9300, i.e. 3.1)** and **Slate 7
+  (GL-BE3600)**, firmware v4.10+. **9.1 (GL-MT6000/Flint 2, MediaTek) is
+  explicitly on GL.iNet's own roadmap next** — a staff member named "Later
+  August" (2026) as the target, attributing the delay to MediaTek "WiFi driver
+  complexities," not a hardware wall. Given today is Aug 10, that window is
+  imminent — check `https://dl.gl-inet.com/?model=mt6000` and the beta thread
+  directly before doing anything else.
+- **DIY porting to 9.1 now: not worth attempting.** No forum/GitHub evidence
+  of anyone running AstroMesh or equivalent on MT6000 hardware. No standalone
+  `gl-mesh`/`astromesh` package found in GL.iNet's public GitHub — consistent
+  with it being baked into the Qualcomm (`qualcommax`) firmware image rather
+  than something extractable and side-loadable onto MediaTek's completely
+  different (`mediatek/filogic`) target and closed driver blobs. The rational
+  move is waiting weeks for the official build, not reverse-engineering it.
+- **No documented UCI schema.** 3.1 already has a `gl-mesh` config section
+  (`enabled='0'`, untouched, still on the first-run wizard) but nothing
+  publicly documents what a configured version should look like — GL.iNet's
+  own guide is GUI-wizard-only (Admin Panel → ASTROMESH → pairing
+  code/Wi-Fi scan). Not recommended to hand-edit this given zero confirmed
+  persistence/rollback behavior.
+- **Known beta gotchas (official)**: Router mode only (no AP mode); **LuCI is
+  disabled on a node once it's in Mesh Node mode**; enabling Tailscale or
+  ZeroTier disables Astro Node mode (conflicts with AstroLink's own tunnel);
+  mobile app doesn't support it yet; max 8 nodes, 1 Main Router.
+- **Verdict**: real upgrade once both ends support it (genuine unified
+  SSID/roaming vs. today's WISP-style bridge), but 9.1 isn't there yet through
+  no fault of ours — check GL.iNet's rollout before considering hardware
+  replacement (a second Flint 3 would be the like-for-like path if MediaTek
+  support slips indefinitely).
