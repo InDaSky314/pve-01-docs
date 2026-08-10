@@ -233,3 +233,32 @@ this is the target for whenever the actual physical relocation happens.
   ifaces API once its reliability is better understood).
 - Network dashboard (architecture plan dispatched to agy in parallel with
   this build — see separate report/handoff once it lands).
+
+## Native GL.iNet radio scheduling — confirmed via GUI (2026-08-10)
+
+Corrects an earlier session finding ("radio scheduling — no native
+feature") — that was wrong, or at least incomplete. Found via the SDK4
+GUI directly (owner logged in, walked the pages):
+**System → Scheduled Tasks** has a full per-band scheduling section,
+confirmed live on 3.1 (v4.10.0):
+
+- Separate cards for **MLO**, **6 GHz**, **5 GHz** (and presumably
+  2.4 GHz further down, not screenshotted).
+- Each card's "Wi-Fi Scheduled Mode" dropdown has exactly two options,
+  matching `gl_timer_control_wifi`'s two functions found earlier via the
+  binary/UCI:
+  - **Turn On/Off** — separate "Enable Main Wi-Fi Schedule" and "Enable
+    Guest Wi-Fi Schedule" toggles, each presumably opening day-of-week +
+    on-time/off-time fields once enabled (not expanded/screenshotted to
+    avoid changing live config).
+  - **Switch TX Power** — scheduled power-level changes (Max/High/Medium/
+    Low per the binary's usage string), same per-band structure.
+- Backed by real UCI (`gl_timer.*` sections, e.g. `gl_timer.6gwifi` with
+  `func`, `band`, `guest`, `turnon_hour/min`, `turnoff_hour/min`, `week`)
+  — currently all `enable='0'`, nothing scheduled yet.
+
+**Implication for the dashboard project**: don't build a custom
+scheduler — wrap this existing, already-shipped mechanism instead. Phase 1
+(agy building now) only *displays* current `gl_timer` state; the eventual
+write-capable version should be a form that writes this same UCI schema
+via the normal `uci set gl_timer.*` + reload path, not new logic.
