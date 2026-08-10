@@ -111,3 +111,40 @@ plausible-sounding root cause, even a well-evidenced one — the E2E harness
 existing at all is what caught that the first fix was incomplete. Re-running
 the *same* independent test after every change, not just after the first
 one, is what actually surfaced this.
+
+## Update — E2E re-test FAILED again, but this looks like a test-harness bug, not a watchdog bug
+
+Real, meaningful progress this run: `recording-stall-state.json` actually
+**tracked the test timer with a real byte-accurate size**
+(`534,484,052` bytes at `07:23:15Z`) — the first time it has ever tracked
+anything at all, confirming fix #1 + fix #2 together made the watchdog
+genuinely see and follow a live recording. This alone is proof both code
+fixes are doing what they were meant to.
+
+But the E2E test still reported FAIL (`Auto-restore did not trigger within
+30 minutes`). Investigated rather than assumed the watchdog itself is still
+broken: **the file kept growing substantially through the entire supposed
+stall window** — 534,484,052 bytes at 07:23:15Z, up to 885,456,352 bytes by
+07:36:13Z (checked right after the test's own cleanup removed the block).
+That's ~350MB of real growth during a window that was supposed to be fully
+network-blocked.
+
+Checked the block mechanism directly: `getent hosts cf.teltv.xyz` on CT105
+still resolves to exactly the two IPs the test blocked (no different
+Cloudflare edge IP appeared), and the real upstream URL (confirmed via
+`/root/playlist.m3u`) is plain HTTP on port 80, matching the test's
+`--dport 80` iptables rule exactly. So the simple "DNS moved" or "wrong
+port" explanations don't fit — something about *how* the block is applied
+(likely a Docker container networking/chain-scoping issue, given CT105 runs
+Jellyfin/Threadfin as Docker containers with their own network namespace)
+isn't actually reaching the real traffic. Dispatched agy (diagnose+plan,
+`e2e-block-reliability`) to pin down the actual mechanism and propose a
+fix to the *test script*, since this is a test-harness reliability question,
+not a change to the already-fixed watchdog code.
+
+**Net assessment**: the watchdog fix itself now has strong evidence of
+working (real tracking of a real recording, for the first time) — what's
+still unproven is the "detects an *actual* stall and triggers restore" step,
+because this test run's induced stall didn't hold. Not claiming full
+confirmation until either the test harness is fixed and passes cleanly, or
+a genuine real-world stall is observed and caught.
