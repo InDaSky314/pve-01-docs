@@ -90,3 +90,37 @@ affected devices had no internet for that period.
 - Agy's audit log entry for this action should probably be amended/annotated
   to reflect that `verified_result: false` understated what actually
   happened (a side effect occurred despite the "failure").
+
+## Second, unrelated bug found during the same verification pass
+
+While confirming the fix via `/metrics`, found a second, pre-existing bug
+in the blackhole-detection logic itself (`router-dashboard`, the network
+card / metrics builder) — unrelated to the incident above, but real and
+worth fixing since it would have been silently wrong indefinitely.
+
+**Bug**: `has_blackhole_rule = (blackhole_rule in ip_rules_31 and
+"blackhole" in ip_rules_31)` did a naive substring search across the
+*entire* `ip rule show` output blob. `main`'s check string
+(`"from all iif br-vlan1"`, itself wrong — main's real bridge is `br-lan`,
+not `br-vlan1`) is a **substring of** `"from all iif br-vlan11"` and
+`"from all iif br-vlan12"` — GIOT and WALDO's own *legitimate* blackhole
+rules. Net effect: `main` would always show as blackholed as long as any
+numbered VLAN's intentional blackhole rule existed, regardless of main's
+real state — a permanent false positive that predates today's incident
+entirely (would have been wrong from the moment Phase 2 shipped).
+
+**Fix**: exact per-line matching instead of blob-substring search, and a
+correct bridge-name map (`main`→`br-lan`, not a formula-guessed
+`br-vlan{vlan_id}`). Verified against real live data for all 5 networks
+before and after — now correctly shows `main: False`,
+`guest/iot/vlan11/vlan12: True` (their genuine, intentional fail-closed
+design).
+
+## Also disabled pending the safety-framework fix
+
+Pulled the port-reassignment control from both the dashboard UI (now shows
+a disabled state with a tooltip explaining why) and the backend endpoint
+(`POST /api/actions/reassign-port` now returns `503` unconditionally) —
+until the "Required follow-up" above (system-wide post-write verification)
+is actually built. A feature that already caused one real incident stays
+off until it's provably safe, not just "probably fine now."
