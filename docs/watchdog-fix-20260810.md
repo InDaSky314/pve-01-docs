@@ -148,3 +148,25 @@ still unproven is the "detects an *actual* stall and triggers restore" step,
 because this test run's induced stall didn't hold. Not claiming full
 confirmation until either the test harness is fixed and passes cleanly, or
 a genuine real-world stall is observed and caught.
+
+## Update — test-harness bug confirmed and fixed (Agy diagnose+plan, independently verified)
+
+Agy's root cause: Threadfin runs in the `media-core_default` Docker bridge
+network (not host mode) — confirmed independently via `docker inspect
+threadfin --format '{{.HostConfig.NetworkMode}}'` (`jellyfin` is `host`,
+`threadfin` is `media-core_default`). Bridge-network container egress
+traverses the `FORWARD` chain (specifically `DOCKER-USER`, which Docker
+wires at the head of `FORWARD`), never `OUTPUT` — so the test script's
+`OUTPUT`-only DROP rule never touched Threadfin's actual connection to the
+upstream CDN, explaining the ~350MB of "impossible" growth during the
+supposed block.
+
+Verified the fix live before trusting it or re-running the full 30-min test:
+manually added the `DOCKER-USER` DROP rules, confirmed `docker exec
+threadfin curl -I http://cf.teltv.xyz/` genuinely times out (curl exit 28),
+and confirmed the `DOCKER-USER` rule's packet/byte counters incremented (3
+packets each) — real proof the block now actually stops the traffic, not
+just a plausible-sounding theory. Cleaned up the manual test rules, deployed
+the fixed script (backup:
+`/root/agy-reports/test-watchdog-restore-stitch-e2e.sh.pre-dockeruser-fix-20260810.bak`),
+and launched a fresh E2E run.
