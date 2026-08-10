@@ -525,3 +525,86 @@ Never trust a `{"result":...}` success response alone. Same rule as always:
 compare real egress IP per tunnel against a bare-WAN reference, and confirm
 the UCI-level state actually changed (`uci show route_policy` / `wireguard` /
 `openvpn` on the router) before believing a change landed.
+
+## `repeater` module — the real mechanism behind "WiFi as WAN" (found while closing the incident above)
+
+Separate compiled ubus service, not a `gl-session`/Lua module — call it directly:
+`ubus call repeater <method> '<json>'`. This is what both the GUI's WiFi-as-WAN
+page and the 9.1 GIOT/apcli0 incident above actually ride on.
+
+```
+'repeater' methods:
+  scan {cached:Bool}            — site survey
+  surveys / disabled_bss / devices
+  connect {ssid, key, network, protocol, remember, manual, macaddr, bssid,
+           wds, netmask, gateway, dns, ip, mtu, hl, ttl, disguise,
+           auto_portal, identity, hostname, hl}
+  disconnect / reload / status / save_config
+  enter_bare_mode {client_macaddr} / exit_bare_mode / set_exit {exit:Bool}
+```
+
+Live `status` captured on 9.1 right after the incident's GUI-side fix
+(confirms the exact state a healthy link looks like):
+
+```json
+{
+  "state_s": "connected", "state": 2, "running": true,
+  "network": "wwan", "ssid": "Open-Fields", "bssid": "F2:8E:A5:8A:EA:19",
+  "connected": "11m,2s", "signal": -58, "channel": 6, "htmode": "HE40",
+  "ipv4": {"ip": "192.168.10.185/24", "gateway": "192.168.10.1",
+           "dns": ["192.168.10.1"]},
+  "config": {"ssid": "Open-Fields", "key": "goodlife", "remember": true,
+             "manual": false, "auto_portal": false, "protocol": "dhcp"}
+}
+```
+
+**`config.remember: true` matters** — it means this reconnect is saved to
+UCI/flash, not just a live association. It will survive a reboot of 9.1
+without needing to be re-clicked in the GUI. This resolves the earlier open
+question of whether a fresh GUI reconnect would need to be redone after a
+restart — it won't.
+
+`repeater.devices` lists the physical radios available for wifi-as-WAN use
+(band + `iface` + `phy`), useful for scripting a reconnect without the GUI
+if this ever needs automating:
+```json
+{"devices": [
+  {"sid": "mt798611", "band": "2g", "iface": "apcli0",  "phy": "ra0"},
+  {"sid": "mt798612", "band": "5g", "iface": "apclix0", "phy": "rax0"}
+]}
+```
+
+`repeater.status` on 3.1 itself (the AP side) is `"running": false,
+"state_s": "idle"` — expected, since 3.1 uses its own wired WAN and never
+acts as a wifi-as-WAN client.
+
+## Other top-level ubus services found (catalog, not yet deep-dived)
+
+Full `ubus list` on 3.1, minus `luci.*` and things already covered above:
+
+| service | maps to GUI section | notes |
+|---|---|---|
+| `gl-clients` | Clients page | `status`/`list`/`get_speed`/`get_wan_speed`; live: `{"wireless_total":1,"cable_total":0,"auto_remove_offline":false}` |
+| `gl-cloud` | Cloud Services (GoodCloud) | `bind`/`unbind`/`status`; live: `{"connected":"02:23:43"}` — 3.1 **is currently bound to GL.iNet's GoodCloud service**, worth a deliberate call on whether that's wanted on a homelab router (remote-management surface) rather than something to leave on by default |
+| `gl-dpi` | Flow Control / bandwidth-by-app | `get_dpi_status`/`enable_dpi_func`/`enable_dpi_base_service`; live: `{"status":"0","lib_version":"20260226_01"}` — DPI lib present but function disabled (status 0) |
+| `sms_manager` | Cellular SMS | `set_sms_log_level` only exposed; 3.1 has no cellular modem installed so mostly inert |
+| `cellular.*` (9 objects) | Cellular/Multi-WAN failover | not applicable — no modem in either router |
+| `container` | (LXC/Docker support, SDK4 feature) | not yet explored |
+
+`gl-session`'s own Lua module set (`/usr/lib/lua/gl/*.lua` +
+`/rom/usr/lib/lua/gl/*.lua`) is the smaller, complete list:
+`common`, `kmwan`, `reset_network_utils`, `validator`, `vlan_subnet`,
+`vpn_client`, `vpn_err_code`, `wg_client`, `wifi` — i.e. everything under
+`gl-session call` is one of these eight; `vlan_subnet` and `vpn_client` are
+the two already fully documented above. `kmwan.lua` is GL.iNet's multi-WAN
+manager (governs the `eth1` vs `apcli0` metric-1-vs-2 failover seen in the
+incident above) and `wifi.lua` is the module confirmed too limited to
+create new SSID-to-VLAN bindings (see the gap section above) — neither
+deep-dived further this session.
+
+**Flagged, not acted on:** the GoodCloud binding (`gl-cloud status` →
+`connected`) means 3.1 has an active outbound connection to GL.iNet's cloud
+service for remote management. Worth a deliberate decision with the owner
+on whether to keep, since it's a standing remote-admin surface on top of
+the router's own LAN/Tailscale access — flagging here rather than touching
+it, since disabling it is a settings change on shared infra.
