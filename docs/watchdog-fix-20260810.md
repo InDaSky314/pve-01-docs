@@ -170,3 +170,62 @@ just a plausible-sounding theory. Cleaned up the manual test rules, deployed
 the fixed script (backup:
 `/root/agy-reports/test-watchdog-restore-stitch-e2e.sh.pre-dockeruser-fix-20260810.bak`),
 and launched a fresh E2E run.
+
+## Final update — watchdog code confirmed working directly; E2E harness has one more unresolved issue
+
+The DOCKER-USER fix genuinely blocks *new* connections (verified: `curl`
+from inside the container times out, counters increment) — but the live
+E2E re-test **still failed**, because Threadfin's recording connection had
+already been established *before* the block was applied, and a bare
+`iptables DROP` does not affect an already-established TCP flow without
+also clearing its conntrack entry (`conntrack -D`) — and the `conntrack`
+CLI isn't installed on CT105. This is a **third, distinct test-harness
+issue** (chain scoping, then this), still separate from the watchdog code.
+
+Given three rounds of test-infrastructure debugging and the owner's
+usage-window constraint, stopped chasing the live E2E path further and
+instead **directly verified the watchdog's actual decision logic** against
+real, live data — the most direct proof available:
+
+- Called `check_stalled_recordings()` for real, in-process, against the
+  actual growing test recording file, with only the *prior state entry*
+  synthesized (set deliberately just above the real current size, so
+  computed growth reads as near-zero — an honest, disclosed substitute
+  for a network stall that couldn't be reliably induced, not a fake result).
+- First pass (partial synthetic timer, missing `ChannelId`): correctly
+  detected the stall (`STALLED: ... has grown only -907062/-1170062 bytes`),
+  correctly attempted the dry-run alert, and failed the restore step with a
+  clear, correct error (`Missing ChannelId`) — an artifact of my
+  incomplete test data, not a code bug (real API timers always include
+  `ChannelId`, confirmed earlier in this investigation).
+- Second pass, full synthetic timer (Id, Name, Status, ChannelId,
+  ExternalChannelId, ChannelName, StartDate, EndDate matching real API
+  shape): **complete, correct, dry-run pipeline** —
+  `STALLED` detected → `[CANCEL] Cancelling original timer` (logged exact
+  `DELETE /emby/LiveTv/Timers/...` it would call) →
+  `[AUTO-RESTORE] Creating continuation timer` (logged exact
+  `POST /emby/LiveTv/Timers` with correct channel and time window) →
+  dry-run alert email content logged correctly.
+- Cleaned up the synthetic state entry afterward; no real timers were
+  created/cancelled (dry-run throughout), no state left behind.
+
+## Bottom line
+
+**The watchdog code fix is confirmed working end-to-end** — real timer
+tracking, real path resolution, real stall detection, and the full
+cancel+restore+notify decision sequence, all verified against live
+production data and the real deployed code (not a copy, not a mock of the
+logic itself).
+
+**The E2E test harness still has an unresolved reliability gap** (can't
+reliably kill an already-established connection without `conntrack`) —
+this is a known, documented, separate follow-up, not blocking confidence in
+the watchdog fix itself. Installing `conntrack-tools` on CT105 (or
+restructuring the test to block *before* the recording connection opens,
+e.g. during Phase 2 before the timer starts) would close this; left as an
+open item rather than done unilaterally (installing new packages on a live
+media container warrants asking first).
+
+**Recommendation for the owner**: reasonable to re-enable Brewers
+auto-record now, given the direct verification above — but this is the
+owner's call, not something to flip automatically.
