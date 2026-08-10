@@ -124,3 +124,36 @@ a disabled state with a tooltip explaining why) and the backend endpoint
 until the "Required follow-up" above (system-wide post-write verification)
 is actually built. A feature that already caused one real incident stays
 off until it's provably safe, not just "probably fine now."
+
+## Resolution: safety framework hardened and independently verified (2026-08-10, ~17:41-17:56)
+
+Dispatched agy to build the system-wide verification described in "Required
+follow-up" above. Independently re-verified the result the same way every
+other claim this session has been checked — not trusted on the report alone:
+
+- **Read the actual deployed code** (`capture_system_health_snapshot`,
+  `diff_system_health_snapshots`, `execute_safe_action`): confirmed it
+  genuinely does what's claimed — captures blackhole rules, VLAN-tunnel
+  rules, bridge link membership, and tunnel status before and after every
+  write, runs the diff *regardless of whether the write itself reported
+  success or failure* (the exact gap that let the original incident
+  through), and exempts only the intended target interface from flagging.
+- **Confirmed real audit-log entries** exist matching the report's claims
+  exactly, including two **live re-tests against real 3.1 hardware**
+  (17:46:46 and 17:48:08) that reproduced the *exact same* `libcable`
+  timeout and `br-lan` collateral blackhole — and both times the framework
+  detected it and auto-reverted successfully, confirmed by real backup
+  files (`backup_3.1_20260810_174530.tar.gz`,
+  `backup_3.1_20260810_174653.tar.gz`) that actually exist on disk with
+  matching timestamps.
+- **Confirmed current live router state is genuinely clean**: correct
+  4-entry blackhole list (no `br-lan`), correct `br-lan` port list
+  (`eth1.1` only), all 3 tunnels up, all tri-band bridges correct.
+- **Confirmed the dashboard's own `/metrics` now correctly reflects this**:
+  `main` shows `blackhole_active=0`, the other four networks correctly
+  show their intentional `blackhole_active=1`.
+
+**Port reassignment has been re-enabled** (UI control and backend endpoint
+both restored) — this is now trusted, not just hoped to be fixed, since
+the hardening was proven against the actual real failure condition twice,
+not just a synthetic injected test.
