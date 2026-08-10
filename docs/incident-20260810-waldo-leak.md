@@ -112,3 +112,33 @@ feature — worth remembering that live traffic inspection
 strictly higher bar of evidence than routing-table simulation, and should
 be reached for earlier when something "should" be working but a real user
 reports it isn't.
+
+## Related, separate experiment: GIOT visibility — WPA3-SAE vs WPA2 test
+
+Not the leak above, but the same investigation session. Owner authorized
+testing whether GIOT's encryption mode is why it doesn't appear in scans
+(confirmed via native Android WiFi settings too, not just a 3rd-party
+scanner — genuinely invisible, not mislabeled: cross-checked the "hidden"
+MAC-only entries in the scan against GIOT's real current BSSIDs
+(`FE:A2:8B:24:F8:CE`, `1E:2E:AF:B5:B6:01`, `42:CF:09:A3:76:1D`) — none
+matched, ruling out "it's there but unresolved").
+
+Real structural difference found: GIOT was pure WPA3-SAE only
+(`encryption='ccmp'`, `sae='1'`) across all three MLO members, while
+WALDO — which *does* show up fine — is pure WPA2-PSK
+(`encryption='psk2+ccmp'`, no SAE at all). Not actually "mixed vs pure" as
+first assumed; two different pure modes.
+
+Changed all three GIOT MLO members (`wlanmld2g/5g/6g`) to match WALDO's
+exact working config (`psk2+ccmp`, SAE removed) as a clean single-variable
+A/B test. Applied via `wifi reload`, verified: `mld0`→`br-vlan11` and
+`mld1`→`br-iot` both correctly attached (mld1 briefly flapped mid-reload,
+same as previous reloads, settled correctly), all 3 GIOT hostapd instances
+confirmed live with correct SSID, wholesale routing rules and all 3
+tunnels unaffected.
+
+**Awaiting owner's re-scan to confirm whether this fixes visibility.** If
+it does, that isolates the cause to WPA3-SAE (possibly combined with MLO)
+specifically. If it doesn't, encryption mode is ruled out and the
+investigation needs to look elsewhere (e.g. a genuine MLO beacon/RNR
+parsing issue independent of security mode).
