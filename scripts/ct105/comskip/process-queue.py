@@ -121,10 +121,17 @@ def keep_segments(cuts, total):
 
 
 def output_path_for(host_path):
-    """.../recordings/Sports/Game/x.ts -> .../recordings/Sports (No Commercials)/Game/x.ts"""
+    """.../recordings/Sports/Game/x.ts -> .../recordings/Sports (No Commercials)/Game/x.mkv
+
+    Output is MKV, not TS: concatenating .ts keep-segments leaves timestamp
+    discontinuities at every splice, and probes that read stream timing (as
+    Jellyfin's does) report only the first segment's duration (~4 min on the
+    2026-08-15 Packers test). The MKV mux rebuilds a continuous timeline —
+    still pure stream copy, no re-encode."""
     rel = os.path.relpath(host_path, RECORDINGS)
     parts = rel.split(os.sep)
     parts[0] = parts[0] + NOCOM_SUFFIX
+    parts[-1] = os.path.splitext(parts[-1])[0] + ".mkv"
     return os.path.join(RECORDINGS, *parts)
 
 
@@ -209,10 +216,11 @@ def process_one(container_path):
         for seg in seg_files:
             f.write(f"file '{seg}'\n")
 
-    tmp_out = os.path.join(job_work, "output" + os.path.splitext(host_path)[1])
+    tmp_out = os.path.join(job_work, "output.mkv")
     r = run(["nice", "-n", "15", "docker", "run", "--rm", f"--cpus={CPUS}",
              "-v", f"{RECORDINGS}:/recordings", IMAGE,
-             "ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
+             "ffmpeg", "-y", "-v", "error", "-fflags", "+genpts",
+             "-f", "concat", "-safe", "0",
              "-i", f"/recordings/.postprocess/work/{os.path.basename(job_work)}/concat.txt",
              "-c", "copy",
              f"/recordings/.postprocess/work/{os.path.basename(job_work)}/{os.path.basename(tmp_out)}"],
