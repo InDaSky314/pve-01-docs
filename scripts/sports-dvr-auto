@@ -1,0 +1,1741 @@
+#!/usr/bin/env python3
+"""Automatic Sports-Game DVR Scheduler, Live-Aware Auto-Extender & Auto-Restore Stitcher (v3).
+
+Key features:
+1. Auto-schedules upcoming games for the 5 followed teams (Packers, Badgers FB/BB, Bucks, Brewers).
+2. Respects shared per-team on/off state file at /var/lib/dvr-dashboard/sports-config.json.
+3. Uses ESPN API to identify real broadcast networks and map them to local/RSN Jellyfin channels.
+4. Sets realistic per-sport baseline durations (Baseball: 3h15m, Football: 3h45m, Basketball: 2h45m).
+5. Safety net: checks existing timers to avoid duplicate recording schedules.
+6. Live-aware auto-extension: polls ESPN live status near estimated end time and extends Jellyfin
+   timer EndDate while game is 'in progress'. Trims timer when game becomes 'completed'.
+7. Stalled-recording watchdog: detects stream drops mid-recording when file stops growing.
+8. Auto-restore: on confirmed stall, automatically creates a continuation Jellyfin timer for the
+   remainder of the scheduled event to recover from transient stream drops.
+9. Auto-stitch: when restore timer completes, concatenates original and restored files into a
+   single stitched file using jellyfin-ffmpeg concat demuxer without modifying or deleting originals.
+
+Stdlib only -- no third party packages required.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import re
+import socket
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+# Configuration & Constants
+LOCAL_TZ = ZoneInfo("Europe/Berlin")
+# Runs on the pve-01 HOST (see get_jf_token()/SPORTS_CONFIG_FILE below), so the
+# LAN address is what actually resolves; 127.0.0.1 is kept as a harmless first
+# try in case this is ever run from inside CT105 directly.
+JF_URLS = ["http://192.168.9.50:8096", "http://127.0.0.1:8096"]
+JF_KEY_FILES = [
+    Path("/srv/media-core/.jellyfin_api_key"),
+    Path("/config/.jellyfin_api_key"),
+    Path("/var/lib/lxc/105/rootfs/srv/media-core/.jellyfin_api_key"),
+]
+
+# This is the pve-01 HOST path, and deliberately so: it is the exact same file
+# dvr-dashboard's sports-config toggles read and write.
+SPORTS_CONFIG_FILE = Path("/var/lib/dvr-dashboard/sports-config.json")
+
+# Stalled-recording watchdog & auto-restore state files.
+JELLYFIN_TIMERS_PATH = "/srv/media-core/jellyfin/config/data/livetv/timers.json"
+STALL_STATE_FILE = Path("/var/lib/dvr-dashboard/recording-stall-state.json")
+RESTORE_STATE_FILE = Path("/var/lib/dvr-dashboard/recording-restore-state.json")
+
+# Added 2026-08-11 per owner request: an append-only, permanent record of every
+# extend/trim/stall/restore/stitch decision these scripts make. STALL_STATE_FILE
+# and RESTORE_STATE_FILE are *working* state -- both get pruned/deleted once a
+# timer is no longer active (see check_stalled_recordings' `del state[tid]` for
+# anything not in seen_ids), so neither one answers "did this fire, historically,
+# for a game that's long since finished" -- the only prior way to answer that was
+# grepping the systemd journal by hand, which is slow and rotates out eventually.
+# This file is never pruned or rewritten, only appended to.
+EVENT_LOG_FILE = Path("/var/lib/dvr-dashboard/dvr-automation-events.jsonl")
+
+STALL_MIN_GROWTH_BYTES = 2_000_000
+# Paired with sports-dvr-auto.timer's 5-min OnUnitActiveSec (2026-08-09, was 10min/8min).
+# At a 10-min cadence this 8-min gap was inert -- elapsed-since-last-check was always
+# ~10min anyway, well over any 8-min floor, so it never actually skipped an evaluation.
+# Halving both together (rather than just the systemd cadence alone) is what actually
+# cuts worst-case detection latency roughly in half, down to ~10min worst case / ~5min
+# best case. Not free: a genuinely low-bitrate channel has less time to accumulate past
+# STALL_MIN_GROWTH_BYTES in a shorter window, so false-positive risk creeps up slightly
+# for any channel far slower than the ~30MB/min this was calibrated against -- untested
+# at this specific interval for that case.
+STALL_MIN_CHECK_GAP = timedelta(minutes=4)
+STALL_ALERT_COOLDOWN = timedelta(hours=3)  # don't re-mail every cycle for the same stall
+MAILTO = "nathan.karras@gmail.com"
+
+DEFAULT_SPORTS_CONFIG = {
+    "Packers": True,
+    "Badgers Football": True,
+    "Badgers Basketball": True,
+    "Bucks": True,
+    "Brewers": False,
+}
+
+# Baseline durations per sport
+DURATIONS = {
+    "baseball": timedelta(hours=3, minutes=15),
+    "football": timedelta(hours=3, minutes=45),
+    "basketball": timedelta(hours=2, minutes=45),
+}
+
+# The 5 teams followed by the owner
+TEAMS = [
+    ("Packers",            "football/nfl",                       "gb"),
+    ("Badgers Football",   "football/college-football",          "275"),
+    ("Badgers Basketball", "basketball/mens-college-basketball", "275"),
+    ("Bucks",              "basketball/nba",                     "mil"),
+    ("Brewers",            "baseball/mlb",                       "mil"),
+]
+
+# ESPN season types: Preseason=1, Regular=2, Postseason=3
+SEASON_TYPES = [1, 2, 3]
+
+# Static Channel Overrides (Name -> Preferred Market/Channel Name)
+NETWORK_CHANNEL_MAP = {
+    "CBS": "Madison: CBS 3 (WISC)",
+    "FOX": "Madison: Fox 47 (WMSN)",
+    "ABC": "Madison: ABC 27 (WKOW)",
+    "NBC": "Madison: NBC 15 (WMTV)",
+    "ESPN": "ESPN",
+    "ESPN2": "ESPN2",
+    "ESPNU": "ESPNU",
+    "ESPNEWS": "ESPNews",
+    "ESPNews": "ESPNews",
+    "BTN": "Big Ten",
+    "Big Ten Network": "Big Ten",
+    "Big Ten": "Big Ten",
+    "NFL Net": "NFL Network HD",
+    "NFLN": "NFL Network HD",
+    "NFL Network": "NFL Network HD",
+    "NBA TV": "NBA TV HD",
+    "NBATV": "NBA TV HD",
+    "MLB Net": "MLB Network",
+    "MLBN": "MLB Network",
+    "MLB Network": "MLB Network",
+    "ACCN": "ACC Network HD",
+    "ACC Network": "ACC Network HD",
+    "TBS": "TBS HD",
+    "TNT": "TNT West 4K",
+}
+
+RSN_DEFAULTS = {
+    "Brewers": "Milwaukee Brewers HD",
+    "Bucks": "Milwaukee Bucks HD",
+}
+
+# Bug found + fixed 2026-08-14 (owner report: a Packers @ Steelers recording
+# felt Pittsburgh-focused rather than the Green Bay broadcast). Packers
+# games don't have one fixed RSN the way Brewers/Bucks do -- they air on
+# whichever national partner has the game (FOX/CBS/NBC/ESPN/NFL Network),
+# so RSN_DEFAULTS' single-channel-name model doesn't fit them directly.
+# What the real channel lineup DOES have is genuine Green Bay market local
+# affiliates ("Green Bay: CBS 5 (WFRV)", "Fox 11", "NBC 26", "ABC 2") sitting
+# unused -- when a broadcast network has more than one matching channel
+# (e.g. a Green Bay CBS affiliate AND a Pittsburgh one both carry the same
+# national CBS broadcast), resolve_channel_id picked whichever came first in
+# an arbitrary dict order, with zero team-based preference. This doesn't
+# apply to every game -- the specific game reported only had one broadcast
+# option (national NFL Network, no local alternative) so it wasn't actually
+# affected -- but the underlying gap is real for any regular-season game
+# with a genuine market choice.
+LOCAL_MARKET_PREFERENCE = {
+    "Packers": "Green Bay",
+}
+
+STREAMING_NETWORKS = {"Peacock", "Netflix", "Prime Video", "Apple TV", "Hulu"}
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+
+def load_sports_config() -> dict[str, bool]:
+    """Read sports auto-record per-team config from shared state file."""
+    if not SPORTS_CONFIG_FILE.exists():
+        try:
+            SPORTS_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SPORTS_CONFIG_FILE.write_text(json.dumps(DEFAULT_SPORTS_CONFIG, indent=2) + "\n")
+            logging.info("Initialized default sports config at %s", SPORTS_CONFIG_FILE)
+            return dict(DEFAULT_SPORTS_CONFIG)
+        except Exception as exc:
+            logging.error("Failed to write sports config file %s: %s", SPORTS_CONFIG_FILE, exc)
+            return dict(DEFAULT_SPORTS_CONFIG)
+    try:
+        data = json.loads(SPORTS_CONFIG_FILE.read_text())
+        if isinstance(data, dict):
+            updated = False
+            for k, v in DEFAULT_SPORTS_CONFIG.items():
+                if k not in data:
+                    data[k] = v
+                    updated = True
+            if updated:
+                try:
+                    SPORTS_CONFIG_FILE.write_text(json.dumps(data, indent=2) + "\n")
+                except Exception:
+                    pass
+            return data
+    except Exception as exc:
+        logging.error("Failed reading sports config file %s: %s", SPORTS_CONFIG_FILE, exc)
+    return dict(DEFAULT_SPORTS_CONFIG)
+
+
+_jf_token_cache: str | None = None
+
+
+def get_jf_token() -> str:
+    """Read Jellyfin AccessToken from secret file, cached after the first read."""
+    global _jf_token_cache
+    if _jf_token_cache:
+        return _jf_token_cache
+    for key_file in JF_KEY_FILES:
+        if key_file.exists():
+            try:
+                tok = key_file.read_text().strip()
+                if tok:
+                    _jf_token_cache = tok
+                    return tok
+            except Exception as exc:
+                logging.error("Failed to read Jellyfin API key file %s: %s", key_file, exc)
+    try:
+        tok = subprocess.run(
+            ["/usr/sbin/pct", "exec", "105", "--", "cat", "/srv/media-core/.jellyfin_api_key"],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout.strip()
+        if tok:
+            _jf_token_cache = tok
+            return tok
+    except Exception as exc:
+        logging.error("Failed to read Jellyfin API key via pct exec into CT105: %s", exc)
+    logging.error("No valid Jellyfin API key found in %s or via pct exec", JF_KEY_FILES)
+    return ""
+
+
+def jf_request(endpoint: str, data: dict[str, Any] | None = None, method: str = "GET") -> Any:
+    """Execute HTTP request against Jellyfin API."""
+    token = get_jf_token()
+    if not token:
+        return None
+
+    headers = {
+        "Authorization": f'MediaBrowser Token="{token}"',
+        "Content-Type": "application/json",
+        "User-Agent": "SportsDVRAuto/1.0",
+    }
+    payload = json.dumps(data).encode("utf-8") if data is not None else None
+
+    for base_url in JF_URLS:
+        url = f"{base_url}{endpoint}"
+        req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                res_body = resp.read()
+                if not res_body:
+                    return {}
+                return json.loads(res_body)
+        except Exception:
+            continue
+
+    logging.error("Jellyfin API %s %s failed on all URLs: %s", method, endpoint, JF_URLS)
+    return None
+
+
+def fetch_espn_schedule() -> list[dict[str, Any]]:
+    """Fetch schedule for all 5 followed teams from ESPN API."""
+    games: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for team_label, sport_path, team_id in TEAMS:
+        kind = sport_path.split("/")[0]
+        for stype in SEASON_TYPES:
+            url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/teams/{team_id}/schedule?seasontype={stype}"
+            req = urllib.request.Request(url)
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.load(resp)
+            except Exception as exc:
+                logging.warning("ESPN API fetch failed for %s (seasontype=%d): %s", team_label, stype, exc)
+                continue
+
+            for event in data.get("events", []):
+                event_id = event.get("id")
+                if not event_id or event_id in seen_ids:
+                    continue
+                seen_ids.add(event_id)
+
+                try:
+                    start_dt = datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
+                except (KeyError, ValueError):
+                    continue
+
+                competitions = event.get("competitions") or [{}]
+                comp = competitions[0]
+                status_obj = comp.get("status") or {}
+                status_type = status_obj.get("type") or {}
+
+                broadcast_names: list[str] = []
+                for bc in comp.get("broadcasts") or []:
+                    m_short = (bc.get("media") or {}).get("shortName")
+                    if m_short:
+                        broadcast_names.append(m_short)
+                    for n in bc.get("names") or []:
+                        if n and n not in broadcast_names:
+                            broadcast_names.append(n)
+
+                duration = DURATIONS.get(kind, timedelta(hours=3))
+                end_dt = start_dt + duration
+
+                games.append({
+                    "id": event_id,
+                    "team": team_label,
+                    "kind": kind,
+                    "name": event.get("name") or event.get("shortName") or "Game",
+                    "shortName": event.get("shortName") or "",
+                    "start": start_dt,
+                    "end": end_dt,
+                    "broadcasts": broadcast_names,
+                    "state": status_type.get("state", "pre"),
+                    "completed": bool(status_type.get("completed", False)),
+                    "status_detail": status_type.get("detail") or status_type.get("shortDetail") or "",
+                })
+
+    games.sort(key=lambda g: g["start"])
+    return games
+
+
+def get_jellyfin_channels() -> dict[str, str]:
+    """Fetch channel list from Jellyfin API or fallback to Threadfin M3U."""
+    chans = jf_request("/emby/LiveTv/Channels")
+    mapping: dict[str, str] = {}
+
+    if chans and "Items" in chans:
+        for c in chans["Items"]:
+            cid = c.get("Id")
+            cname = c.get("Name", "")
+            if cid and cname:
+                mapping[cname] = cid
+                mapping[cname.lower()] = cid
+        return mapping
+
+    tf_urls = ["http://127.0.0.1:34400/m3u/threadfin.m3u", "http://192.168.9.50:34400/m3u/threadfin.m3u"]
+    for url in tf_urls:
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                m3u_text = resp.read().decode("utf-8", errors="ignore")
+                for line in m3u_text.splitlines():
+                    if line.startswith("#EXTINF"):
+                        parts = line.split(",")
+                        cname = parts[-1].strip() if len(parts) > 1 else ""
+                        header = parts[0]
+                        chno = ""
+                        if 'tvg-chno="' in header:
+                            chno = header.split('tvg-chno="')[1].split('"')[0]
+                        cid = f"hdhr_{chno}" if chno else cname
+                        if cname:
+                            mapping[cname] = cid
+                            mapping[cname.lower()] = cid
+                if mapping:
+                    logging.info("Loaded %d channels from Threadfin M3U fallback (%s)", len(mapping) // 2, url)
+                    return mapping
+        except Exception:
+            continue
+
+    logging.warning("Could not load channel lineup from Jellyfin API or Threadfin M3U.")
+    return mapping
+
+
+def resolve_channel_id(game: dict[str, Any], jf_channels: dict[str, str]) -> tuple[str | None, str]:
+    """Resolve ESPN broadcast network to Jellyfin channel ID and channel name."""
+    team = game["team"]
+    broadcasts = game["broadcasts"]
+
+    if team in RSN_DEFAULTS:
+        rsn_name = RSN_DEFAULTS[team]
+        if rsn_name in jf_channels or rsn_name.lower() in jf_channels:
+            cid = jf_channels.get(rsn_name) or jf_channels.get(rsn_name.lower())
+            if cid:
+                return cid, rsn_name
+
+    for bc in broadcasts:
+        if bc in STREAMING_NETWORKS:
+            return None, f"Streaming Exclusive ({bc})"
+
+        if "Brewers" in bc and "Milwaukee Brewers HD" in jf_channels:
+            return jf_channels["Milwaukee Brewers HD"], "Milwaukee Brewers HD"
+        if "Bucks" in bc and "Milwaukee Bucks HD" in jf_channels:
+            return jf_channels["Milwaukee Bucks HD"], "Milwaukee Bucks HD"
+
+        # Bug found + fixed 2026-08-14, same investigation as the
+        # LOCAL_MARKET_PREFERENCE fix below: NETWORK_CHANNEL_MAP hardcodes
+        # CBS/FOX/ABC/NBC to a single Madison affiliate for every team --
+        # checked below, before the market-aware match -- so it would have
+        # kept silently overriding the Green Bay preference for any Packers
+        # game on one of those networks (the majority of a real NFL season)
+        # even after adding LOCAL_MARKET_PREFERENCE. Check for a genuine
+        # local-market match FIRST; only fall through to the generic
+        # national mapping if this team has no preference or no match
+        # exists for it.
+        preferred_market = LOCAL_MARKET_PREFERENCE.get(team)
+        if preferred_market:
+            local_matches = [(cid, ch_name) for ch_name, cid in jf_channels.items()
+                             if bc.lower() in ch_name.lower() and preferred_market.lower() in ch_name.lower()]
+            if local_matches:
+                return local_matches[0]
+
+        mapped_name = NETWORK_CHANNEL_MAP.get(bc)
+        if mapped_name and (mapped_name in jf_channels or mapped_name.lower() in jf_channels):
+            cid = jf_channels.get(mapped_name) or jf_channels.get(mapped_name.lower())
+            if cid:
+                return cid, mapped_name
+
+        # Bug found + fixed 2026-08-14: this used to return on the FIRST
+        # channel whose name contained the broadcast network name, with no
+        # regard for which market it's from -- if both a Green Bay and a
+        # Pittsburgh affiliate carry the same national network, which one
+        # got picked was arbitrary (whatever order the channel dict happened
+        # to iterate in). Now collects every match and, if this team has a
+        # LOCAL_MARKET_PREFERENCE, prefers whichever match actually names
+        # that market; otherwise falls back to the first match exactly as
+        # before (unchanged behavior for teams without a defined preference).
+        matches = [(cid, ch_name) for ch_name, cid in jf_channels.items() if bc.lower() in ch_name.lower()]
+        if matches:
+            preferred_market = LOCAL_MARKET_PREFERENCE.get(team)
+            if preferred_market:
+                local_matches = [m for m in matches if preferred_market.lower() in m[1].lower()]
+                if local_matches:
+                    return local_matches[0]
+            return matches[0]
+
+    if team in RSN_DEFAULTS:
+        rsn_name = RSN_DEFAULTS[team]
+        cid = jf_channels.get(rsn_name) or jf_channels.get(rsn_name.lower())
+        if cid:
+            return cid, rsn_name
+
+    return None, f"Unmapped ({', '.join(broadcasts) if broadcasts else 'No Broadcast Info'})"
+
+
+def get_existing_timers() -> list[dict[str, Any]]:
+    """Fetch active Jellyfin LiveTv timers."""
+    res = jf_request("/emby/LiveTv/Timers")
+    return res.get("Items", []) if res else []
+
+
+def is_overlapping_timer(channel_id: str, start: datetime, end: datetime, existing_timers: list[dict[str, Any]]) -> bool:
+    """Check if an existing timer overlaps the given time range on the same channel."""
+    for t in existing_timers:
+        if t.get("Status") in ("Completed", "Cancelled", "Error"):
+            continue
+        t_cid = t.get("ChannelId")
+        if t_cid != channel_id:
+            continue
+        try:
+            t_start = datetime.fromisoformat(t["StartDate"].replace("Z", "+00:00"))
+            t_end = datetime.fromisoformat(t["EndDate"].replace("Z", "+00:00"))
+        except (KeyError, ValueError):
+            continue
+
+        if t_start < end and t_end > start:
+            return True
+    return False
+
+
+def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str, dry_run: bool = True) -> bool:
+    """Create a Jellyfin LiveTv timer for a game."""
+    start_iso = (game["start"] - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_iso = (game["end"] + timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    name = f"{game['team']}: {game['name']}"
+
+    logging.info("[SCHEDULE] Proposed timer: %s on %s (%s to %s)", name, channel_name, start_iso, end_iso)
+
+    if dry_run:
+        logging.info("  [DRY-RUN] Would call POST /emby/LiveTv/Timers")
+        return True
+
+    # Bug found + fixed 2026-08-13 (real incident: the Aug 12 evening
+    # Brewers @ Padres game -- a completely clean, single-segment recording
+    # with no restore chain involved at all -- still landed in "Other"
+    # instead of "Sports"). This is the ROOT of the categorization issue:
+    # trigger_auto_restore() got the same fix the night before, but THIS
+    # function is what creates the very first timer for every game,
+    # restored or not, and it never set IsSports either. Every sports
+    # recording this system has ever scheduled has been affected, not just
+    # ones that needed a restore -- that earlier fix only covered half the
+    # actual problem.
+    payload = {
+        "Type": "Timer",
+        "ChannelId": channel_id,
+        "ChannelName": channel_name,
+        "ServiceName": "Emby",
+        "Name": name,
+        "StartDate": start_iso,
+        "EndDate": end_iso,
+        "PrePaddingSeconds": 300,
+        "PostPaddingSeconds": 1800,
+        "IsSports": True,
+    }
+    res = jf_request("/emby/LiveTv/Timers", data=payload, method="POST")
+    if res is not None:
+        logging.info("  [SUCCESS] Timer created for %s", name)
+        return True
+    logging.error("  [FAILED] Could not create timer for %s", name)
+    return False
+
+
+def extend_active_timer(timer: dict[str, Any], new_end: datetime, dry_run: bool = True) -> bool:
+    """Update EndDate of an existing timer in Jellyfin."""
+    tid = timer["Id"]
+    new_end_iso = new_end.strftime("%Y-%m-%dT%H:%M:%SZ")
+    timer_name = timer.get("Name", "Timer")
+
+    logging.info("[EXTEND] Extending timer %s (%s) to %s", timer_name, tid, new_end_iso)
+
+    if dry_run:
+        logging.info("  [DRY-RUN] Would call POST /emby/LiveTv/Timers/%s", tid)
+        return True
+
+    updated_timer = dict(timer)
+    updated_timer["EndDate"] = new_end_iso
+
+    res = jf_request(f"/emby/LiveTv/Timers/{tid}", data=updated_timer, method="POST")
+    if res is not None:
+        logging.info("  [SUCCESS] Timer %s extended", tid)
+        return True
+    logging.error("  [FAILED] Could not extend timer %s", tid)
+    return False
+
+
+def run_auto_scheduler(dry_run: bool = True) -> None:
+    """Proactively schedule upcoming games, checking sports-config.json for per-team on/off state."""
+    logging.info("=== Starting Sports DVR Auto-Scheduler ===")
+    sports_config = load_sports_config()
+    logging.info("Active sports recording state: %s", sports_config)
+
+    games = fetch_espn_schedule()
+    jf_channels = get_jellyfin_channels()
+    existing_timers = get_existing_timers()
+
+    now = datetime.now(timezone.utc)
+    lookahead = now + timedelta(days=7)
+
+    upcoming = [g for g in games if now <= g["start"] <= lookahead]
+    logging.info("Found %d upcoming games in the next 7 days.", len(upcoming))
+
+    for game in upcoming:
+        team = game["team"]
+
+        if not sports_config.get(team, True):
+            logging.info("Skip %s (%s): Auto-record toggled OFF in %s", game["name"], team, SPORTS_CONFIG_FILE)
+            continue
+
+        cid, cname = resolve_channel_id(game, jf_channels)
+        if not cid:
+            logging.info("Skip %s (%s): %s", game["name"], game["team"], cname)
+            continue
+
+        if is_overlapping_timer(cid, game["start"], game["end"], existing_timers):
+            logging.info("Skip %s (%s): Overlapping timer already exists on %s", game["name"], game["team"], cname)
+            continue
+
+        schedule_game_timer(game, cid, cname, dry_run=dry_run)
+
+
+def run_live_extender(dry_run: bool = True) -> None:
+    """Check live games and auto-extend active Jellyfin timers."""
+    logging.info("=== Starting Live Game Auto-Extender ===")
+    games = fetch_espn_schedule()
+    timers = get_existing_timers()
+    now = datetime.now(timezone.utc)
+
+    for game in games:
+        if game["state"] not in ("in", "post") and not (game["start"] <= now <= game["end"] + timedelta(hours=2)):
+            continue
+
+        for timer in timers:
+            try:
+                t_start = datetime.fromisoformat(timer["StartDate"].replace("Z", "+00:00"))
+                t_end = datetime.fromisoformat(timer["EndDate"].replace("Z", "+00:00"))
+            except (KeyError, ValueError):
+                continue
+
+            if not (t_start <= game["end"] and t_end >= game["start"]):
+                continue
+
+            if game["state"] == "in" and not game["completed"]:
+                time_left = (t_end - now).total_seconds() / 60
+                if time_left < 15:
+                    new_end = t_end + timedelta(minutes=20)
+                    logging.info("Game '%s' is IN PROGRESS (%s). Timer has %.1f min left.",
+                                 game["name"], game["status_detail"], time_left)
+                    ok = extend_active_timer(timer, new_end, dry_run=dry_run)
+                    log_event("extend", timer.get("Id"), game["name"], {
+                        "success": ok, "game_status": game["status_detail"],
+                        "old_end": timer["EndDate"], "new_end": new_end.isoformat(),
+                        "minutes_left_before": round(time_left, 1),
+                    }, dry_run=dry_run)
+
+            elif game["state"] == "post" or game["completed"]:
+                time_left = (t_end - now).total_seconds() / 60
+                if time_left > 10:
+                    new_end = now + timedelta(minutes=5)
+                    logging.info("Game '%s' is FINAL (%s). Trimming remaining %.1f min timer.",
+                                 game["name"], game["status_detail"], time_left)
+                    ok = extend_active_timer(timer, new_end, dry_run=dry_run)
+                    log_event("trim", timer.get("Id"), game["name"], {
+                        "success": ok, "game_status": game["status_detail"],
+                        "old_end": timer["EndDate"], "new_end": new_end.isoformat(),
+                        "minutes_trimmed": round(time_left, 1),
+                    }, dry_run=dry_run)
+
+
+def read_live_timers() -> list[dict[str, Any]] | None:
+    """Jellyfin's own on-disk timers.json, straight off CT105."""
+    try:
+        raw = subprocess.run(
+            ["/usr/sbin/pct", "exec", "105", "--", "cat", JELLYFIN_TIMERS_PATH],
+            capture_output=True, text=True, timeout=20, check=True,
+        ).stdout
+        return json.loads(raw)
+    except Exception as exc:                                 # noqa: BLE001
+        logging.error("Could not read live timers.json for stall check: %s", exc)
+        return None
+
+
+def recording_file_size(recording_path: str) -> int | None:
+    """Stat the actual .ts file on CT105's own filesystem."""
+    if not recording_path.startswith("/media/recordings"):
+        return None
+    real_path = "/srv/media-core/media" + recording_path[len("/media"):]
+    try:
+        out = subprocess.run(
+            ["/usr/sbin/pct", "exec", "105", "--", "stat", "-c", "%s", real_path],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout.strip()
+        return int(out)
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+def load_stall_state() -> dict[str, Any]:
+    try:
+        return json.loads(STALL_STATE_FILE.read_text())
+    except Exception:                                         # noqa: BLE001
+        return {}
+
+
+def save_stall_state(state: dict[str, Any]) -> None:
+    try:
+        STALL_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STALL_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        tmp.replace(STALL_STATE_FILE)
+    except Exception as exc:                                  # noqa: BLE001
+        logging.error("Could not save stall-check state: %s", exc)
+
+
+def load_restore_state() -> dict[str, Any]:
+    try:
+        return json.loads(RESTORE_STATE_FILE.read_text())
+    except Exception:                                         # noqa: BLE001
+        return {}
+
+
+def save_restore_state(state: dict[str, Any]) -> None:
+    try:
+        RESTORE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = RESTORE_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        tmp.replace(RESTORE_STATE_FILE)
+    except Exception as exc:                                  # noqa: BLE001
+        logging.error("Could not save restore state: %s", exc)
+
+
+def file_exists_on_ct105(recording_path: str) -> bool:
+    """Check if a recording file exists on CT105's filesystem."""
+    if not recording_path or not recording_path.startswith("/media/recordings"):
+        return False
+    real_path = "/srv/media-core/media" + recording_path[len("/media"):]
+    try:
+        res = subprocess.run(
+            ["/usr/sbin/pct", "exec", "105", "--", "test", "-f", real_path],
+            timeout=15, check=False,
+        )
+        return res.returncode == 0
+    except Exception:                                         # noqa: BLE001
+        return False
+
+
+def derive_stitched_path(orig_path: str) -> str:
+    """Derive the stitched output filename alongside original."""
+    p = Path(orig_path)
+    return str(p.with_name(f"{p.stem} (stitched){p.suffix}"))
+
+
+# Added 2026-08-12 per owner request: after a chain stitches successfully,
+# the raw segment files used to sit right next to the combined file in the
+# same library folder, so browsing the DVR left you guessing which of N+1
+# entries was actually the real, complete recording. Jellyfin's Recordings
+# library only scans /media/recordings (confirmed live via
+# /Library/VirtualFolders -- no other library scans anywhere near this
+# path), so moving the raw segments out of /media/recordings entirely makes
+# them fully disappear from every DVR view while staying on disk, on the
+# same filesystem (an instant rename, not a multi-GB copy) -- nothing is
+# deleted.
+SEGMENT_ARCHIVE_DIR = "/media/segments-archive"
+
+
+def _real_path(jellyfin_path: str) -> str:
+    return "/srv/media-core/media" + jellyfin_path[len("/media"):]
+
+
+def _unique_dest(real_dest: str) -> str:
+    """Append a counter if real_dest already exists, rather than silently
+    overwriting or failing on a name collision."""
+    final_dest, n = real_dest, 1
+    while subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "test", "-e", final_dest],
+                          timeout=10, check=False).returncode == 0:
+        n += 1
+        stem = Path(real_dest)
+        final_dest = str(stem.with_name(f"{stem.stem} ({n}){stem.suffix}"))
+    return final_dest
+
+
+def archive_segments(segment_paths: list[str], root_path: str) -> tuple[list[str], list[str]]:
+    """Move raw segments out of /media/recordings into SEGMENT_ARCHIVE_DIR.
+
+    root_path (segment_paths[0], where derive_stitched_path also puts the
+    combined output) is special: its folder must NOT be moved wholesale --
+    the stitched file lives right there and needs to stay put for Jellyfin
+    to see it. Only the root's own raw .ts (and matching .nfo, if any) get
+    moved as individual files; every other segment has its own dedicated
+    folder from its own restore attempt and is safe to move whole.
+
+    Returns (archived_destination_paths, failed_source_paths)."""
+    archived, failed = [], []
+    mkdir_res = subprocess.run(
+        ["/usr/sbin/pct", "exec", "105", "--", "mkdir", "-p", _real_path(SEGMENT_ARCHIVE_DIR)],
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    if mkdir_res.returncode != 0:
+        return [], list(segment_paths)
+
+    for p in segment_paths:
+        if not p or not p.startswith("/media/recordings/"):
+            failed.append(p)
+            continue
+        try:
+            if p == root_path:
+                # Move just this file (+ its .nfo if present), not the folder.
+                real_src = _real_path(p)
+                real_dest = _unique_dest(f"{_real_path(SEGMENT_ARCHIVE_DIR)}/{Path(p).name}")
+                mv_res = subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "mv", real_src, real_dest],
+                                        capture_output=True, text=True, timeout=30, check=False)
+                if mv_res.returncode != 0:
+                    logging.error("archive_segments: mv failed for %s -> %s: %s", real_src, real_dest, mv_res.stderr)
+                    failed.append(p)
+                    continue
+                archived.append(real_dest)
+                nfo_src = str(Path(real_src).with_suffix(".nfo"))
+                if subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "test", "-f", nfo_src],
+                                  timeout=10, check=False).returncode == 0:
+                    subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "mv", nfo_src,
+                                   str(Path(real_dest).with_suffix(".nfo"))], timeout=15, check=False)
+            else:
+                real_folder = _real_path(str(Path(p).parent))
+                real_dest = _unique_dest(f"{_real_path(SEGMENT_ARCHIVE_DIR)}/{Path(real_folder).name}")
+                mv_res = subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "mv", real_folder, real_dest],
+                                        capture_output=True, text=True, timeout=30, check=False)
+                if mv_res.returncode == 0:
+                    archived.append(real_dest)
+                else:
+                    logging.error("archive_segments: mv failed for %s -> %s: %s", real_folder, real_dest, mv_res.stderr)
+                    failed.append(p)
+        except Exception as exc:                              # noqa: BLE001
+            logging.error("archive_segments: exception archiving %s: %s", p, exc)
+            failed.append(p)
+    return archived, failed
+
+
+def notify(subject: str, body: list[str]) -> None:
+    subprocess.run(["mail", "-s", subject, MAILTO],
+                   input="\n".join(body), text=True, check=False)
+
+
+def log_event(event: str, timer_id: str | None, name: str, detail: dict[str, Any], dry_run: bool = True) -> None:
+    """Append one line to the permanent automation event log.
+
+    Added 2026-08-11. Deliberately dumb and hard to break: best-effort, never
+    raises into the caller (a logging failure must not be able to abort a real
+    extend/restore action), append-only (no read-modify-write, so no risk of
+    corrupting or losing prior history), and records dry-run vs real so a test
+    run never gets mistaken for something that actually happened later.
+    """
+    try:
+        EVENT_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "timer_id": timer_id,
+            "name": name,
+            "dry_run": dry_run,
+            **detail,
+        }
+        with EVENT_LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except Exception as exc:                                      # noqa: BLE001
+        logging.error("log_event failed (event=%s, name=%s): %s", event, name, exc)
+
+
+THREADFIN_SOURCE_PLAYLIST = "/srv/media-core/threadfin/conf/playlist.m3u"
+
+
+def resolve_channel_stream_host(channel_id: str) -> str | None:
+    """Given a timer's ChannelId ('hdhr_121'), find the actual upstream streaming hostname."""
+    m = re.match(r"hdhr_(\d+)", channel_id or "")
+    if not m:
+        return None
+    chno = m.group(1)
+    try:
+        raw = subprocess.run(
+            ["/usr/sbin/pct", "exec", "105", "--", "grep", "-A1",
+             f'tvg-chno="{chno}"', THREADFIN_SOURCE_PLAYLIST],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout
+    except Exception:                                         # noqa: BLE001
+        return None
+    lines = raw.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("#EXTINF") and f'tvg-chno="{chno}"' in line and i + 1 < len(lines):
+            return urllib.parse.urlparse(lines[i + 1].strip()).hostname
+    return None
+
+
+def check_concurrent_stream(channel_id: str) -> str:
+    """Best-effort router-level check for another active connection to the same upstream provider."""
+    host = resolve_channel_stream_host(channel_id)
+    if not host:
+        return "(could not determine the upstream host to check for a concurrent stream)"
+    try:
+        ip = socket.gethostbyname(host)
+    except Exception:                                         # noqa: BLE001
+        return f"(could not resolve {host} to check for a concurrent stream)"
+    try:
+        out = subprocess.run(
+            ["ssh", "-F", "/root/.ssh/config", "glinet-9.1",
+             f"conntrack -L 2>/dev/null | grep 'dst={ip} ' | grep 'dport=80'"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+        count = len([ln for ln in out.splitlines() if ln.strip()])
+    except Exception as exc:                                  # noqa: BLE001
+        return f"(could not check the router for a concurrent stream: {exc})"
+    if count >= 2:
+        return (f"{count} connections matching {host} ({ip}:80) on the router right now -- "
+                "your provider only allows one stream at a time, so this COULD be why the "
+                "recording dropped (something else streaming from the same source), but this "
+                "IP is a shared Cloudflare edge and closed connections can briefly still show "
+                "up here, so it's a plausible lead, not confirmation -- worth a quick check of "
+                "what else in the house might be streaming.")
+    if count == 1:
+        return (f"Only 1 connection matching {host} ({ip}:80) right now -- doesn't suggest a "
+                "concurrent-stream conflict, but a real one on a different Cloudflare edge IP "
+                "would not show up here either, so this isn't confirmation of a clear signal.")
+    return (f"No connections matching {host} ({ip}:80) found right now -- inconclusive (a "
+            "since-resolved conflict, or a different edge IP for the same provider, "
+            "wouldn't show up here either way).")
+
+
+def cancel_live_timer(timer_id: str, dry_run: bool = True) -> tuple[bool, str]:
+    """Cancel/delete an active Jellyfin LiveTv timer via DELETE endpoint."""
+    logging.info("[CANCEL] Cancelling original timer %s", timer_id)
+    if dry_run:
+        logging.info("  [DRY-RUN] Would call DELETE /emby/LiveTv/Timers/%s", timer_id)
+        return True, f"[DRY-RUN] Would cancel timer {timer_id}"
+
+    # Resolve API Id if timer_id is ExternalId (from on-disk timers.json)
+    api_timer_id = timer_id
+    existing = get_existing_timers()
+    for t in (existing or []):
+        if t.get("ExternalId") == timer_id or t.get("Id") == timer_id:
+            api_timer_id = t.get("Id", timer_id)
+            break
+
+    res = jf_request(f"/emby/LiveTv/Timers/{api_timer_id}", method="DELETE")
+    if res is not None:
+        logging.info("  [SUCCESS] Original timer %s (API ID %s) cancelled", timer_id, api_timer_id)
+        return True, f"Original timer {timer_id} cancelled"
+
+    err = f"API error (DELETE /emby/LiveTv/Timers/{api_timer_id} failed)"
+    logging.error("  [FAILED] Could not cancel original timer %s: %s", timer_id, err)
+    return False, err
+
+
+def recording_file_mtime(recording_path: str) -> int | None:
+    """Stat the actual .ts file mtime (epoch seconds) on CT105's filesystem."""
+    if not recording_path or not recording_path.startswith("/media/recordings"):
+        return None
+    real_path = "/srv/media-core/media" + recording_path[len("/media"):]
+    try:
+        out = subprocess.run(
+            ["/usr/sbin/pct", "exec", "105", "--", "stat", "-c", "%Y", real_path],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout.strip()
+        return int(out)
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+def trigger_auto_restore(timer: dict[str, Any], dry_run: bool = True) -> tuple[bool, str, str | None, bool]:
+    """Cancel original timer and create a new Jellyfin timer starting now through original EndDate as continuation."""
+    orig_name = timer.get("Name", "recording")
+    orig_tid = timer.get("Id")
+    cid = timer.get("ChannelId")
+    cname = timer.get("ChannelName", "")
+    end_iso_raw = timer.get("EndDate")
+
+    if not cid or not end_iso_raw:
+        err = f"Missing ChannelId ({cid}) or EndDate ({end_iso_raw})"
+        logging.error("Auto-restore failed for '%s': %s", orig_name, err)
+        return False, f"channel unresolvable or missing EndDate ({err})", None, False
+
+    try:
+        end_dt = datetime.fromisoformat(end_iso_raw.replace("Z", "+00:00"))
+        end_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        end_iso = end_iso_raw
+
+    if not cname:
+        chans = get_jellyfin_channels()
+        for name, channel_id in chans.items():
+            if channel_id == cid and not name.islower():
+                cname = name
+                break
+
+    # Stop-A: Cancel original timer first
+    cancel_ok = False
+    cancel_msg = ""
+    if orig_tid:
+        cancel_ok, cancel_msg = cancel_live_timer(orig_tid, dry_run=dry_run)
+    else:
+        cancel_msg = "Original timer ID missing"
+
+    restore_name = f"{orig_name} (restored)"
+    now = datetime.now(timezone.utc)
+    start_iso = (now + timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    logging.info("[AUTO-RESTORE] Creating continuation timer '%s' on %s (%s to %s)",
+                 restore_name, cname or cid, start_iso, end_iso)
+
+    if dry_run:
+        logging.info("  [DRY-RUN] Would call POST /emby/LiveTv/Timers for '%s'", restore_name)
+        msg = f"[DRY-RUN] Would create replacement timer '{restore_name}'"
+        if not cancel_ok:
+            msg += f" (WARNING: original timer cancel failed: {cancel_msg})"
+        return True, msg, "dry-run-restore-id", cancel_ok
+
+    # Bug found + fixed 2026-08-12 (real incident: the Aug 12 Brewers @
+    # Padres restore chain landed in the "Other" library folder instead of
+    # "Sports"). This payload never carried IsSports/IsMovie/genre/priority
+    # from the original timer, so Jellyfin had nothing to categorize the
+    # restore recording by and defaulted it into a generic bucket. Copy the
+    # categorization fields straight from the original timer so a restored
+    # recording gets filed the same way the original would have.
+    payload = {
+        "Type": "Timer",
+        "ChannelId": cid,
+        "ChannelName": cname,
+        "ServiceName": "Emby",
+        "Name": restore_name,
+        "StartDate": start_iso,
+        "EndDate": end_iso,
+        "PrePaddingSeconds": 0,
+        "PostPaddingSeconds": 0,
+        "IsSports": timer.get("IsSports", False),
+        "IsMovie": timer.get("IsMovie", False),
+        "IsKids": timer.get("IsKids", False),
+        "IsNews": timer.get("IsNews", False),
+        "IsSeries": timer.get("IsSeries", False),
+        "Genres": timer.get("Genres", []),
+        "Priority": timer.get("Priority", 0),
+    }
+
+    res = jf_request("/emby/LiveTv/Timers", data=payload, method="POST")
+    if res is None:
+        err = "Jellyfin REST API error (POST /emby/LiveTv/Timers returned None)"
+        logging.error("  [FAILED] Auto-restore timer creation for '%s': %s", restore_name, err)
+        msg = f"API error ({err})"
+        if not cancel_ok:
+            msg += f". WARNING: Cancelling original timer {orig_tid} also failed ({cancel_msg}). Both timers may now be attempting to record simultaneously!"
+        return False, msg, None, cancel_ok
+
+    restore_tid = res.get("Id") if isinstance(res, dict) else None
+
+    # Bug found + fixed 2026-08-12 (real incident: this exact fallback
+    # captured the wrong timer ID during the Aug 12 Brewers @ Padres restore
+    # chain -- confirmed by direct evidence: the ID it logged,
+    # ec204d874da1dc90eefedbc1058482df, was never the one that actually
+    # recorded; the real segment was a completely different ID
+    # (bcc584d6ef134ad0bf117b24176d5601). Every one of the 9 automatic trim
+    # attempts that night dutifully "succeeded" (POST returned non-None)
+    # against that wrong ID, so the real, actively-recording segment never
+    # got the shorten-the-timer signal at all and ran to its full original
+    # scheduled end -- ~52 minutes of dead air after the game had already
+    # gone final, confirmed the next day from the stitched recording.
+    #
+    # Root cause: `break` on the FIRST name+channel match. During a rapid
+    # succession of stalls (this game restored 4 times in ~35 minutes),
+    # multiple timers can exist with the same or very similar name+channel
+    # at once (an about-to-be-cleaned-up orphan alongside the genuinely new
+    # one) -- taking the first match is a coin flip between them. Now
+    # collects every candidate and prefers the one with the most recent
+    # StartDate, since the timer we actually just asked Jellyfin to create
+    # is definitionally the newest one that can possibly match.
+    if not restore_tid:
+        timers = get_existing_timers() or read_live_timers()
+        candidates = [tm for tm in (timers or [])
+                      if tm.get("Name") == restore_name
+                      and (tm.get("ChannelId") == cid or tm.get("ExternalChannelId") == cid)]
+        if candidates:
+            def _start_key(tm: dict[str, Any]) -> datetime:
+                try:
+                    return datetime.fromisoformat(tm.get("StartDate", "").replace("Z", "+00:00"))
+                except (ValueError, AttributeError):
+                    return datetime.min.replace(tzinfo=timezone.utc)
+            candidates.sort(key=_start_key, reverse=True)
+            restore_tid = candidates[0].get("Id")
+            if len(candidates) > 1:
+                logging.warning(
+                    "[AUTO-RESTORE] %d timers matched name+channel for '%s' -- picked the most "
+                    "recently-started one (%s). Others: %s",
+                    len(candidates), restore_name, restore_tid,
+                    [c.get("Id") for c in candidates[1:]])
+
+    if restore_tid:
+        logging.info("  [SUCCESS] Auto-restore timer created for '%s' (Id: %s)", restore_name, restore_tid)
+        msg = f"a replacement recording has been started to continue capturing from now (Timer ID: {restore_tid})"
+        if not cancel_ok:
+            msg += f". WARNING: Cancelling original timer {orig_tid} failed ({cancel_msg}). Both original and restored timers may now be attempting to record simultaneously!"
+        return True, msg, restore_tid, cancel_ok
+    else:
+        err = "Timer creation requested but created timer ID could not be confirmed"
+        logging.warning("  [WARNING] %s", err)
+        msg = f"API error ({err})"
+        if not cancel_ok:
+            msg += f". WARNING: Cancelling original timer {orig_tid} also failed ({cancel_msg})."
+        return False, msg, None, cancel_ok
+
+
+def resolve_active_recording_path(name: str) -> str | None:
+    """Find the on-disk .ts path for a timer that's actively recording.
+
+    Discovered 2026-08-10 (E2E re-test after the InProgress fix still failed):
+    Jellyfin's live API timer DTO has NO RecordingPath field at all while a
+    recording is in progress (confirmed live -- not null, genuinely absent
+    from the JSON), and the on-disk timers.json doesn't contain the timer
+    either until AFTER it finishes (only New/Completed/Cancelled entries
+    persist there). So there's no data source with the path while it's still
+    actively being written -- it has to be found by searching the recordings
+    directory directly. Jellyfin's folder/file naming replaces ':' with a
+    space (confirmed against two real examples: "Brewers: MIN @ MIL" ->
+    "Brewers  MIN @ MIL", "TEST: watchdog-e2e-..." -> "TEST  watchdog-e2e-...").
+    Glob on a ':'-agnostic pattern so exact spacing doesn't matter.
+    """
+    pattern = re.sub(r"[:]+", "*", name).strip()
+    if not pattern:
+        return None
+    try:
+        out = subprocess.run(
+            ["/usr/sbin/pct", "exec", "105", "--", "find",
+             "/srv/media-core/media/recordings", "-iname", f"*{pattern}*.ts"],
+            capture_output=True, text=True, timeout=20, check=True,
+        ).stdout
+    except Exception as exc:                                     # noqa: BLE001
+        logging.warning("resolve_active_recording_path: find failed for %r: %s", name, exc)
+        return None
+    candidates = [line.strip() for line in out.splitlines() if line.strip()]
+    if not candidates:
+        return None
+    # Prefer the most recently modified match if more than one turned up.
+    real_path = candidates[0]
+    if len(candidates) > 1:
+        try:
+            stat_out = subprocess.run(
+                ["/usr/sbin/pct", "exec", "105", "--", "stat", "-c", "%Y %n", *candidates],
+                capture_output=True, text=True, timeout=20, check=True,
+            ).stdout
+            ranked = sorted(
+                (line.split(" ", 1) for line in stat_out.splitlines() if " " in line),
+                key=lambda pair: int(pair[0]), reverse=True,
+            )
+            if ranked:
+                real_path = ranked[0][1]
+        except Exception:                                        # noqa: BLE001
+            pass  # fall back to the first candidate found above
+    prefix = "/srv/media-core/media"
+    if not real_path.startswith(prefix):
+        return None
+    return "/media" + real_path[len(prefix):]
+
+
+def check_stalled_recordings(dry_run: bool = True) -> None:
+    """Detect a recording whose file has stopped growing well before its scheduled end.
+
+    Root-caused 2026-08-10 (agy diagnose+plan, verified against real timers.json
+    and Jellyfin's own log): this used to read only read_live_timers(), which
+    is Jellyfin's on-disk timers.json -- that file's Status enum is
+    New/Completed/Cancelled and NEVER "InProgress". "InProgress" only exists
+    on the live REST API (get_existing_timers(), /emby/LiveTv/Timers), which
+    computes it dynamically. The old `if t.get("Status") != "InProgress":
+    continue` therefore dropped every single timer, every tick -- the Aug 9
+    Twins@Brewers stall (truncated to ~2h35m of a 3+ hour game, zero errors
+    logged) was never seen at all; recording-stall-state.json stayed {} the
+    whole game. Now sources active timers from the API (where InProgress is
+    real), enriches RecordingPath from disk if the API DTO omits it, and
+    falls back to a disk-based time-window check if the API is unreachable.
+    """
+    logging.info("=== Checking for stalled recordings ===")
+    now = datetime.now(timezone.utc)
+    api_timers = get_existing_timers()
+    disk_timers = read_live_timers()
+
+    disk_map: dict[str, dict[str, Any]] = {}
+    for dt in (disk_timers or []):
+        for key in ("Id", "ExternalId"):
+            if dt.get(key):
+                disk_map[dt[key]] = dt
+
+    active_timers: list[dict[str, Any]] = []
+    if api_timers:
+        for t in api_timers:
+            if t.get("Status") != "InProgress":
+                continue
+            tid = t.get("Id") or t.get("ExternalId")
+            if not t.get("RecordingPath") and tid in disk_map:
+                t["RecordingPath"] = disk_map[tid].get("RecordingPath")
+            if not t.get("RecordingPath") and t.get("Name"):
+                # Live API timers never carry RecordingPath while InProgress
+                # (confirmed empirically 2026-08-10) -- resolve it by
+                # searching the recordings directory instead.
+                t["RecordingPath"] = resolve_active_recording_path(t["Name"])
+            active_timers.append(t)
+    elif disk_timers:
+        # API unreachable -- fall back to disk, using the time window since
+        # disk Status is never "InProgress".
+        for t in disk_timers:
+            if t.get("Status") in ("Completed", "Cancelled"):
+                continue
+            try:
+                t_start = datetime.fromisoformat(t["StartDate"].replace("Z", "+00:00"))
+                t_end = datetime.fromisoformat(t["EndDate"].replace("Z", "+00:00"))
+            except (KeyError, ValueError):
+                continue
+            if t_start <= now <= t_end:
+                active_timers.append(t)
+
+    state = load_stall_state()
+    restore_state = load_restore_state()
+    seen_ids: set[str] = set()
+
+    for t in active_timers:
+        tid = t.get("Id") or t.get("ExternalId")
+        path = t.get("RecordingPath")
+        name = t.get("Name", "recording")
+        if not tid or not path:
+            continue
+        seen_ids.add(tid)
+
+        try:
+            t_end = datetime.fromisoformat(t["EndDate"].replace("Z", "+00:00"))
+        except (KeyError, ValueError):
+            continue
+
+        if (t_end - now) < timedelta(minutes=15):
+            continue
+
+        size = recording_file_size(path)
+        if size is None:
+            logging.warning("Stall check: could not stat %s for '%s'", path, name)
+            continue
+
+        prev = state.get(tid)
+        if prev is None:
+            state[tid] = {"size": size, "checked_at": now.isoformat(), "alerted_at": None}
+            continue
+
+        try:
+            prev_checked = datetime.fromisoformat(prev["checked_at"])
+        except (KeyError, ValueError):
+            prev_checked = now - STALL_MIN_CHECK_GAP
+        elapsed = now - prev_checked
+
+        if elapsed < STALL_MIN_CHECK_GAP:
+            continue
+
+        grew = size - prev.get("size", size)
+        alerted_at = prev.get("alerted_at")
+
+        if grew >= STALL_MIN_GROWTH_BYTES:
+            state[tid] = {"size": size, "checked_at": now.isoformat(), "alerted_at": None}
+            continue
+
+        state[tid] = {"size": size, "checked_at": now.isoformat(), "alerted_at": alerted_at}
+
+        minutes_left = (t_end - now).total_seconds() / 60
+        msg = (f"Recording '{name}' has grown only {grew} bytes in the last "
+               f"{elapsed.total_seconds() / 60:.0f} min, but is scheduled to keep "
+               f"recording for about {minutes_left:.0f} more minutes. The stream may "
+               f"have dropped -- worth checking Jellyfin/Threadfin and the file directly:\n"
+               f"  {path}")
+        logging.warning("STALLED: %s", msg.replace(chr(10), " "))
+        log_event("stall_detected", tid, name, {
+            "bytes_grown": grew, "elapsed_minutes": round(elapsed.total_seconds() / 60, 1),
+            "minutes_left_scheduled": round(minutes_left, 1), "file_path": path,
+        }, dry_run=dry_run)
+
+        already_alerted = bool(alerted_at) and (
+            now - datetime.fromisoformat(alerted_at) < STALL_ALERT_COOLDOWN)
+        if not already_alerted:
+            # Trigger Auto-restore
+            restore_note = ""
+            existing_restore = restore_state.get(tid)
+            if existing_restore and existing_restore.get("status") in ("restoring", "completed", "stitched"):
+                restore_note = f"Auto-restore status: Replacement recording already active or completed (Timer ID: {existing_restore.get('restore_timer_id')})."
+            else:
+                # Race condition check: re-stat original file right before triggering cancel/restore
+                latest_size = recording_file_size(path)
+                if latest_size is not None and (latest_size - size >= STALL_MIN_GROWTH_BYTES or latest_size - prev.get("size", size) >= STALL_MIN_GROWTH_BYTES):
+                    logging.info("Original recording '%s' recovered before restore was triggered (size grew from %d to %d bytes); skipping cancel/restore.", name, size, latest_size)
+                    log_event("stall_self_recovered", tid, name, {
+                        "size_before": size, "size_after": latest_size,
+                    }, dry_run=dry_run)
+                    state[tid] = {"size": latest_size, "checked_at": now.isoformat(), "alerted_at": None}
+                    continue
+
+                success, details, restore_tid, cancel_ok = trigger_auto_restore(t, dry_run=dry_run)
+                log_event("restore_triggered", tid, name, {
+                    "success": success, "details": details,
+                    "restore_timer_id": restore_tid, "cancel_original_success": cancel_ok,
+                }, dry_run=dry_run)
+                if success:
+                    if dry_run:
+                        restore_note = f"Auto-restore status: {details}."
+                    else:
+                        restore_note = f"Auto-restore status: {details}."
+                        restore_state[tid] = {
+                            "original_timer_id": tid,
+                            "original_file_path": path,
+                            "original_name": name,
+                            "original_end_date": t.get("EndDate"),
+                            "channel_id": t.get("ChannelId"),
+                            "cancel_original_success": cancel_ok,
+                            "restore_timer_id": restore_tid,
+                            "restore_file_path": None,
+                            "status": "restoring",
+                            "restored_at": now.isoformat(),
+                            "stitched_file_path": None,
+                            "error": None if cancel_ok else details,
+                        }
+                        save_restore_state(restore_state)
+                else:
+                    restore_note = f"Auto-restore status: Failed to start replacement recording ({details})."
+                    if not dry_run:
+                        restore_state[tid] = {
+                            "original_timer_id": tid,
+                            "original_file_path": path,
+                            "original_name": name,
+                            "original_end_date": t.get("EndDate"),
+                            "channel_id": t.get("ChannelId"),
+                            "cancel_original_success": cancel_ok,
+                            "restore_timer_id": None,
+                            "restore_file_path": None,
+                            "status": "failed_restore_creation",
+                            "restored_at": now.isoformat(),
+                            "stitched_file_path": None,
+                            "error": details,
+                        }
+                        save_restore_state(restore_state)
+
+            concurrency_note = check_concurrent_stream(t.get("ChannelId", ""))
+            full_msg = f"{msg}\n\n{restore_note}\n\n{concurrency_note}"
+            if dry_run:
+                logging.info("  [DRY-RUN] Would email stall alert for '%s':\n%s", name, full_msg)
+            else:
+                notify(f"DVR: recording may have stalled -- {name}", [full_msg])
+            state[tid]["alerted_at"] = now.isoformat()
+
+    if api_timers is not None or disk_timers is not None:
+        for tid in list(state.keys()):
+            if tid not in seen_ids:
+                del state[tid]
+
+    save_stall_state(state)
+
+
+def perform_ffmpeg_concat(segment_paths: list[str], stitched_path: str) -> tuple[bool, str]:
+    """Execute ffmpeg concat demuxer inside CT105's jellyfin container.
+
+    Generalized 2026-08-12 from a fixed original+restore pair to an ordered
+    list of N segments -- real incident that day showed a chain of 4
+    restores (5 segments total) for one game, and the old 2-file-only
+    version could only ever stitch the first pair, never the full chain."""
+    if len(segment_paths) < 2:
+        return False, f"need at least 2 segments to concat, got {len(segment_paths)}"
+    escaped = [p.replace("'", "'\\''") for p in segment_paths]
+    concat_content = "".join(f"file '{p}'\n" for p in escaped)
+
+    tmp_list_container = f"/tmp/concat_{int(datetime.now().timestamp())}.txt"
+
+    try:
+        write_cmd = [
+            "/usr/sbin/pct", "exec", "105", "--",
+            "docker", "exec", "-i", "jellyfin",
+            "sh", "-c", f"cat > '{tmp_list_container}'"
+        ]
+        res_write = subprocess.run(write_cmd, input=concat_content, text=True, capture_output=True, timeout=15)
+        if res_write.returncode != 0:
+            return False, f"Failed to write concat list inside container: {res_write.stderr.strip()}"
+
+        ffmpeg_cmd = [
+            "/usr/sbin/pct", "exec", "105", "--",
+            "docker", "exec", "jellyfin",
+            "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", tmp_list_container,
+            "-c", "copy",
+            stitched_path
+        ]
+        res_ffmpeg = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=600)
+        if res_ffmpeg.returncode != 0:
+            return False, f"ffmpeg exited with code {res_ffmpeg.returncode}: {res_ffmpeg.stderr.strip()}"
+
+        if not file_exists_on_ct105(stitched_path):
+            return False, "ffmpeg reported success but output file was not found on disk"
+
+        return True, ""
+
+    except Exception as exc:                                 # noqa: BLE001
+        return False, str(exc)
+
+    finally:
+        try:
+            subprocess.run([
+                "/usr/sbin/pct", "exec", "105", "--",
+                "docker", "exec", "jellyfin",
+                "rm", "-f", tmp_list_container
+            ], timeout=15, check=False)
+        except Exception:                                     # noqa: BLE001
+            pass
+
+
+def build_restore_chain(root_tid: str, restore_state: dict[str, Any]) -> list[str]:
+    """Walk a chain of restores starting at root_tid, following
+    restore_timer_id links through restore_state, until reaching a timer
+    that never itself needed restoring (so it isn't a restore_state key).
+    Returns the full ordered list of timer IDs, root first, tail last.
+
+    Rewritten 2026-08-12 after a real incident: the Aug 12 Brewers @ Padres
+    game stalled and got restored FOUR times in a row (5 real segments
+    total). The old code treated every restore_state entry as an
+    independent original+restore PAIR, so even with the path-resolution bug
+    below fixed, it could only ever have produced up to 4 separate 2-piece
+    stitches -- never one combined 5-piece file."""
+    chain = [root_tid]
+    entry = restore_state.get(root_tid)
+    while entry and entry.get("restore_timer_id") in restore_state:
+        next_tid = entry["restore_timer_id"]
+        chain.append(next_tid)
+        entry = restore_state[next_tid]
+    if entry and entry.get("restore_timer_id"):
+        chain.append(entry["restore_timer_id"])  # tail: never itself restored
+    return chain
+
+
+def resolve_segment(tid: str, restore_state: dict[str, Any], live_timer_map: dict[str, Any]) -> dict[str, Any]:
+    """Name/path/status for one segment in a chain. live_timer_map (on-disk
+    timers.json) is authoritative once a segment is done -- prefer it over
+    the possibly-stale original_file_path captured back when the restore
+    was first triggered. Falls back to restore_state's own record for a
+    segment that IS a restore_state key (covers every segment except the
+    final tail, which is never itself a key)."""
+    live = live_timer_map.get(tid)
+    if live:
+        return {"name": live.get("Name", "recording"), "path": live.get("RecordingPath"),
+                "status": live.get("Status"), "start": live.get("StartDate")}
+    entry = restore_state.get(tid)
+    if entry:
+        return {"name": entry.get("original_name", "recording"), "path": entry.get("original_file_path"),
+                "status": None, "start": entry.get("restored_at")}
+    return {"name": "recording", "path": None, "status": None, "start": None}
+
+
+def check_restore_stitching(dry_run: bool = True) -> None:
+    """Check tracked restore chains for completion and stitch every segment
+    into one combined file. Rewritten 2026-08-12 -- see build_restore_chain
+    for why (chain handling) and the note below for the other real bug this
+    fixes (permanent-failure-on-a-timing-gap)."""
+    logging.info("=== Checking restore chains for stitching ===")
+    now = datetime.now(timezone.utc)
+    restore_state = load_restore_state()
+    if not restore_state:
+        logging.info("No active or pending restore recordings to stitch.")
+        return
+
+    timers = read_live_timers()
+    if timers is None:
+        logging.warning("Could not read live timers; skipping stitch check this cycle.")
+        return
+
+    live_timer_map = {t["Id"]: t for t in timers if "Id" in t}
+    updated = False
+
+    # Only process chain ROOTS -- an entry that is itself nobody else's
+    # restore_timer_id. Every other entry belongs to some root's chain and
+    # gets handled when that root is processed.
+    all_restore_targets = {e.get("restore_timer_id") for e in restore_state.values()}
+    roots = [tid for tid in restore_state if tid not in all_restore_targets]
+
+    for root_tid in roots:
+        root_entry = restore_state[root_tid]
+        status = root_entry.get("status")
+        if status in ("stitched", "failed_missing_original", "failed_missing_restore",
+                      "failed_restore_creation", "failed_concat", "failed_overlap_suspected"):
+            continue
+
+        chain = build_restore_chain(root_tid, restore_state)
+        base_name = root_entry.get("original_name", "recording")
+        segments = [resolve_segment(tid, restore_state, live_timer_map) for tid in chain]
+
+        # Bug found + fixed 2026-08-12 (real incident): the old code treated
+        # "file not found yet" as a PERMANENT failure (failed_missing_restore),
+        # even when the real cause was just that the segment was still
+        # actively recording. Every single restore attempt for the Aug 12
+        # Padres game hit this and got marked permanently failed within
+        # seconds of being created -- long before any of the real, genuine
+        # recordings actually finished. Now: a segment still in progress
+        # just means "try again next cycle", not "give up forever". Only a
+        # segment whose timer has reached a TERMINAL state with no
+        # resolvable file is a real, permanent failure.
+        # Bug found + fixed the same pass, before this ever ran for real: a
+        # segment resolved via the restore_state fallback (resolve_segment's
+        # "not in live_timer_map" branch) always sets status=None as a
+        # placeholder -- the check below used to treat that None as "still
+        # pending" even when the fallback had ALREADY found a real path,
+        # which would have made every completed chain retry forever without
+        # ever stitching. A real path found by either source means resolved,
+        # full stop; only missing-path segments get judged on status.
+        pending = []
+        for s, tid in zip(segments, chain):
+            if s["path"]:
+                continue
+            live = live_timer_map.get(tid)
+            if live is None or live.get("Status") in ("InProgress", "Scheduled"):
+                pending.append(s)
+        if pending:
+            logging.info("Chain for '%s' has %d/%d segment(s) still pending -- will retry next cycle.",
+                         base_name, len(pending), len(chain))
+            continue
+
+        missing = [(tid, s) for tid, s in zip(chain, segments) if not s["path"]]
+        if missing:
+            msg = (f"Stitch failed for '{base_name}': {len(missing)} of {len(chain)} segments have no "
+                   f"resolvable recording file even though their timer reached a terminal state "
+                   f"(ids: {[m[0] for m in missing]}).")
+            logging.error(msg)
+            root_entry["status"] = "failed_missing_restore"
+            root_entry["error"] = msg
+            updated = True
+            log_event("stitch_failed", root_tid, base_name,
+                      {"reason": "missing_segment", "chain_length": len(chain)}, dry_run=dry_run)
+            if not dry_run:
+                notify(f"DVR Stitch Failed: segment(s) missing -- {base_name}", [msg])
+            continue
+
+        paths = [s["path"] for s in segments]
+        for p in paths:
+            if not file_exists_on_ct105(p):
+                msg = f"Stitch failed for '{base_name}': segment file missing on disk at {p}"
+                logging.error(msg)
+                root_entry["status"] = "failed_missing_restore"
+                root_entry["error"] = msg
+                updated = True
+                log_event("stitch_failed", root_tid, base_name, {"reason": "file_missing_on_disk", "path": p}, dry_run=dry_run)
+                if not dry_run:
+                    notify(f"DVR Stitch Failed: file missing on disk -- {base_name}", [msg])
+                break
+        else:
+            # Overlap sanity check, generalized across the whole chain (was
+            # pairwise-only before this rewrite): for each consecutive pair,
+            # the earlier segment's file shouldn't have kept growing well
+            # after the later segment's own start time -- that would mean
+            # the cancel step failed and both were actually recording
+            # simultaneously, which would make a naive concat produce
+            # duplicated/overlapping content instead of a clean timeline.
+            overlap_found = False
+            for i in range(len(segments) - 1):
+                earlier_mtime = recording_file_mtime(paths[i])
+                later_start_raw = segments[i + 1]["start"]
+                if earlier_mtime is None or not later_start_raw:
+                    continue
+                try:
+                    later_start_dt = datetime.fromisoformat(later_start_raw.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if earlier_mtime - later_start_dt.timestamp() > 120:
+                    msg = (f"Stitch skipped for '{base_name}': segment {i+1} was still being written "
+                           f"well after segment {i+2} started -- implausible overlap suspected between "
+                           f"{paths[i]} and {paths[i+1]}.")
+                    logging.error(msg)
+                    root_entry["status"] = "failed_overlap_suspected"
+                    root_entry["error"] = msg
+                    updated = True
+                    log_event("stitch_failed", root_tid, base_name, {"reason": "overlap_suspected", "segment_index": i}, dry_run=dry_run)
+                    if not dry_run:
+                        notify(f"DVR Stitch Skipped: overlap suspected -- {base_name}", [msg])
+                    overlap_found = True
+                    break
+            if overlap_found:
+                continue
+
+            stitched_path = derive_stitched_path(paths[0])
+            logging.info("Ready to stitch '%s' (%d segments):\n  %s\n  Target: %s",
+                         base_name, len(paths), "\n  ".join(paths), stitched_path)
+
+            if dry_run:
+                logging.info("  [DRY-RUN] Would run ffmpeg concat demuxer on %d segments to create %s",
+                             len(paths), stitched_path)
+                continue
+
+            success, concat_err = perform_ffmpeg_concat(paths, stitched_path)
+            log_event("stitch_completed" if success else "stitch_failed", root_tid, base_name, {
+                "success": success, "reason": None if success else "ffmpeg_error",
+                "error": None if success else concat_err,
+                "segment_count": len(paths), "segment_paths": paths,
+                "stitched_path": stitched_path if success else None,
+            }, dry_run=dry_run)
+            if success:
+                logging.info("  [SUCCESS] Stitched %d-segment file created: %s", len(paths), stitched_path)
+                root_entry["status"] = "stitched"
+                root_entry["stitched_file_path"] = stitched_path
+                root_entry["stitched_at"] = now.isoformat()
+                root_entry["segment_count"] = len(paths)
+                updated = True
+                # Mark every non-root chain member too, so they're never
+                # independently re-evaluated (they're all part of this
+                # root's chain now, not separate stitch candidates).
+                for tid in chain[1:]:
+                    if tid in restore_state:
+                        restore_state[tid]["status"] = "stitched"
+                        restore_state[tid]["stitched_file_path"] = stitched_path
+
+                # Added 2026-08-12 per owner request: move the raw segments
+                # out of the DVR-browsable /media/recordings tree so only
+                # the one combined file shows up when picking what to play.
+                # Nothing is deleted -- see archive_segments' docstring for
+                # why this folder is genuinely invisible to Jellyfin rather
+                # than just a differently-named subfolder it would still list.
+                archived, archive_failed = archive_segments(paths, paths[0])
+                if not dry_run:
+                    jf_request("/Library/Refresh", method="POST")
+                # Persisted so check_archived_segment_cleanup can find these
+                # later -- added 2026-08-12 alongside the cleanup mechanism.
+                root_entry["archived_segment_paths"] = archived
+
+                body = [
+                    f"Stitching completed for '{base_name}' -- {len(paths)} segments combined "
+                    f"(the recording stalled and auto-restored {len(paths) - 1} time"
+                    f"{'s' if len(paths) != 2 else ''} during this game).",
+                    "",
+                    f"Combined file (this is what shows up in the DVR): {stitched_path}",
+                    "",
+                    "NOTE: There are real, unavoidable content gaps in the combined file corresponding",
+                    "to the time the stream was actually down between segments.",
+                    "",
+                ]
+                if archived:
+                    body += [f"Raw segments moved out of the DVR view to {SEGMENT_ARCHIVE_DIR} "
+                             f"(not deleted, just out of the way):", ""]
+                    body += [f"  {a}" for a in archived]
+                if archive_failed:
+                    body += ["", f"Could not archive {len(archive_failed)} segment(s) -- still visible "
+                                  "in the DVR alongside the combined file, worth checking manually:", ""]
+                    body += [f"  {f}" for f in archive_failed]
+                notify(f"DVR: stitched restored recording -- {base_name} ({len(paths)} segments)", body)
+            else:
+                msg = f"Stitch failed for '{base_name}': ffmpeg error: {concat_err}"
+                logging.error(msg)
+                root_entry["status"] = "failed_concat"
+                root_entry["error"] = msg
+                updated = True
+                notify(f"DVR Stitch Failed -- {base_name}", [msg])
+
+    if updated:
+        save_restore_state(restore_state)
+
+
+# Added 2026-08-12 per owner request, same conversation as archive_segments:
+# once a chain is stitched, when is it actually safe to delete the raw
+# segments sitting in SEGMENT_ARCHIVE_DIR? Two triggers, either one fires:
+#   1. Primary: the owner deletes the stitched recording through Jellyfin
+#      like any normal recording -- a clear, deliberate "done with this"
+#      signal. Nothing else reasonably needs the raw segments once that
+#      happens.
+#   2. Fallback: 60 days since stitching, whether or not the stitched file
+#      is still there -- pure safety net against unbounded disk growth if
+#      a stitched recording just never gets watched or cleaned up.
+ARCHIVE_CLEANUP_FALLBACK_DAYS = 60
+
+
+def check_archived_segment_cleanup(dry_run: bool = True) -> None:
+    logging.info("=== Checking archived segments for cleanup ===")
+    now = datetime.now(timezone.utc)
+    restore_state = load_restore_state()
+    if not restore_state:
+        return
+
+    archive_prefix = _real_path(SEGMENT_ARCHIVE_DIR)
+    updated = False
+
+    for tid, entry in list(restore_state.items()):
+        if entry.get("status") != "stitched":
+            continue
+        archived_paths = entry.get("archived_segment_paths") or []
+        if not archived_paths:
+            continue  # already cleaned up, or never had anything archived
+
+        stitched_path = entry.get("stitched_file_path")
+        stitched_gone = bool(stitched_path) and not file_exists_on_ct105(stitched_path)
+
+        stitched_at_raw = entry.get("stitched_at")
+        fallback_due = False
+        if stitched_at_raw:
+            try:
+                stitched_at = datetime.fromisoformat(stitched_at_raw.replace("Z", "+00:00"))
+                fallback_due = (now - stitched_at).days >= ARCHIVE_CLEANUP_FALLBACK_DAYS
+            except ValueError:
+                pass
+
+        if not stitched_gone and not fallback_due:
+            continue
+
+        reason = "stitched recording was deleted" if stitched_gone else \
+                 f"{ARCHIVE_CLEANUP_FALLBACK_DAYS}-day fallback reached (stitched file still present)"
+        base_name = entry.get("original_name", "recording")
+
+        if dry_run:
+            logging.info("  [DRY-RUN] Would delete %d archived segment path(s) for '%s' (%s)",
+                         len(archived_paths), base_name, reason)
+            continue
+
+        deleted, failed = [], []
+        for p in archived_paths:
+            # Safety check: never delete anything outside the archive dir,
+            # regardless of what's in the state file.
+            if not p.startswith(archive_prefix):
+                failed.append(p)
+                logging.error("check_archived_segment_cleanup: refusing to delete path outside "
+                              "the archive dir: %s", p)
+                continue
+            res = subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "rm", "-rf", p],
+                                 capture_output=True, text=True, timeout=30, check=False)
+            (deleted if res.returncode == 0 else failed).append(p)
+
+        log_event("segment_cleanup", tid, base_name, {
+            "success": not failed, "reason": reason,
+            "deleted_count": len(deleted), "failed_count": len(failed),
+        }, dry_run=dry_run)
+
+        if deleted:
+            entry["archived_segment_paths"] = failed  # keep only what's still there
+            entry["segment_cleanup_at"] = now.isoformat()
+            updated = True
+            notify(f"DVR: cleaned up archived segments -- {base_name}", [
+                f"Reason: {reason}",
+                "",
+                f"Deleted {len(deleted)} of {len(archived_paths)} archived segment path(s):", "",
+                *[f"  {d}" for d in deleted],
+                *(["", f"Failed to delete {len(failed)}:", "", *[f"  {f}" for f in failed]] if failed else []),
+            ])
+
+    if updated:
+        save_restore_state(restore_state)
+
+
+def print_event_history(n: int = 30) -> None:
+    """Print the last N automation events, newest first. Added 2026-08-11
+    per owner request: a quick way to answer "did the extend/stall/restore/
+    stitch logic actually fire" without grepping the systemd journal by hand."""
+    if not EVENT_LOG_FILE.exists():
+        print(f"No events logged yet ({EVENT_LOG_FILE} doesn't exist).")
+        return
+    lines = EVENT_LOG_FILE.read_text().splitlines()
+    for line in lines[-n:][::-1]:
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        tag = "[DRY-RUN] " if e.get("dry_run") else ""
+        ok = e.get("success")
+        ok_str = "" if ok is None else (" OK" if ok else " FAILED")
+        print(f"{e.get('ts', '?')}  {tag}{e.get('event', '?')}{ok_str}  -- {e.get('name', '?')}")
+        detail = {k: v for k, v in e.items()
+                  if k not in ("ts", "event", "name", "timer_id", "dry_run", "success")}
+        if detail:
+            print(f"    {detail}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Sports DVR Auto-Scheduler, Live Extender & Auto-Restore Stitcher (v3)")
+    parser.add_argument("--apply", action="store_true", help="Execute live API changes (default is dry-run)")
+    parser.add_argument("--schedule-only", action="store_true", help="Run auto-scheduler only")
+    parser.add_argument("--extend-only", action="store_true", help="Run live extender only")
+    parser.add_argument("--stall-check-only", action="store_true",
+                        help="Run the stalled-recording watchdog only")
+    parser.add_argument("--stitch-only", action="store_true",
+                        help="Run the restore stitching check only")
+    parser.add_argument("--cleanup-only", action="store_true",
+                        help="Run the archived-segment cleanup check only")
+    parser.add_argument("--history", type=int, nargs="?", const=30, default=None, metavar="N",
+                        help="Print the last N automation events (default 30) and exit -- "
+                             "did extend/trim/stall/restore/stitch actually fire, and when.")
+    args = parser.parse_args()
+
+    if args.history is not None:
+        print_event_history(args.history)
+        return
+
+    dry_run = not args.apply
+    if dry_run:
+        logging.info("Running in DRY-RUN mode. Pass --apply to execute changes against live Jellyfin API.")
+
+    if args.schedule_only:
+        run_auto_scheduler(dry_run=dry_run)
+    elif args.extend_only:
+        run_live_extender(dry_run=dry_run)
+    elif args.stall_check_only:
+        check_stalled_recordings(dry_run=dry_run)
+    elif args.stitch_only:
+        check_restore_stitching(dry_run=dry_run)
+    elif args.cleanup_only:
+        check_archived_segment_cleanup(dry_run=dry_run)
+    else:
+        run_auto_scheduler(dry_run=dry_run)
+        run_live_extender(dry_run=dry_run)
+        check_stalled_recordings(dry_run=dry_run)
+        check_restore_stitching(dry_run=dry_run)
+        check_archived_segment_cleanup(dry_run=dry_run)
+
+
+if __name__ == "__main__":
+    main()

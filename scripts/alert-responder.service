@@ -1,0 +1,13 @@
+[Unit]
+Description=Grafana alert webhook receiver -- dispatches Agy (diagnose-only) and emails findings
+Documentation=file:///root/pve-01-docs/docs/livetv-custom-build-and-updates-20260726.md
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/bin/alert-responder.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
