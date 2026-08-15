@@ -113,3 +113,15 @@ sanity-check miss) discards the work product and leaves the original
 untouched; errors are logged and the queue entry dropped so a poison file
 can't wedge the queue. A still-growing file defers (stays queued). The
 runner is flock-guarded against overlapping timer fires.
+
+## Post-deploy fix: output must be MKV (2026-08-15, same day)
+
+The first full-game run surfaced it: concatenating `.ts` keep-segments
+stream-copy leaves timestamp discontinuities at every splice. `ffprobe`'s
+container-level duration is right, but probes that walk stream timing —
+Jellyfin's included — report only the first keep-segment (the Packers game
+showed as "3.9 min"). Fix: the final concat now muxes to `.mkv` (with
+`-fflags +genpts`), which rebuilds a continuous timeline — still pure
+stream copy, no re-encode, ~2 min for a 9 GB game. Verified: the same
+game re-wrapped as MKV probes at 14117.8 s and shows the full 3h55m
+runtime in the Jellyfin library.
