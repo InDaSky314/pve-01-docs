@@ -1,0 +1,14 @@
+[Unit]
+Description=Sports DVR auto-scheduler and live-game timer extender
+Documentation=file:///root/pve-01-docs/docs/home-network-power-automation.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/bin/sports-dvr-auto --apply
+# Runs on the pve-01 HOST (not inside CT105) -- see the comments at the top
+# of sports-dvr-auto for why: it reads/writes the exact same
+# /var/lib/dvr-dashboard/sports-config.json the dashboard's toggles use, and
+# reaches CT105's Jellyfin over the LAN + a pct-exec fallback for the API key.
+User=root
+TimeoutStartSec=120
