@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import html as html_lib
 import json
+import re
 import subprocess
 import threading
 import time
@@ -62,16 +63,61 @@ FROM_ADDR = "kopr.notify@gmail.com"  # same authenticated account Grafana's own 
 FROM_NAME = "Media-Core Investigator"
 
 
+SUMMARY_HEADING_RE = re.compile(
+    r"^##\s*Plain-English Summary\s*$(.*?)(?=^##\s|\Z)", re.MULTILINE | re.DOTALL
+)
+TECH_HEADING_RE = re.compile(r"^##\s*Technical Details\s*$\n?", re.MULTILINE)
+
+
+def split_plain_summary(body_text: str) -> tuple[str | None, str]:
+    """Pull the '## Plain-English Summary' section (added to Agy's prompt
+    2026-08-15 per owner feedback -- the emails were readable but too
+    code-heavy for an at-a-glance read) out of the report. Returns
+    (summary_or_None, remaining_report_text). Falls back gracefully to
+    (None, full_text) for older reports or if Agy ever skips the heading --
+    the email still works, just without the plain-language lead-in."""
+    m = SUMMARY_HEADING_RE.search(body_text)
+    if not m:
+        return None, body_text
+    summary = m.group(1).strip()
+    rest = (body_text[: m.start()] + body_text[m.end() :]).strip()
+    rest = TECH_HEADING_RE.sub("", rest, count=1).strip()
+    return (summary or None), (rest or body_text)
+
+
 def render_html_email(subject: str, body_lines: list[str]) -> str:
     """Dress up the plain-text report into something readable at a glance,
     matching the visual language of the Grafana alert emails this follows up
     on (colored status badge, card layout) rather than a wall of monospace
-    text. Added 2026-08-12 per owner request."""
+    text. Added 2026-08-12 per owner request. Extended 2026-08-15 (owner:
+    "would be nice if there was an easier to understand summary in plain
+    language vs code") -- Agy's report now leads with a plain-English
+    section, rendered here as normal prose above the full technical report,
+    which stays in the original monospace card underneath for anyone who
+    wants the detail."""
     is_failure = "FAILED" in subject
     badge_color = "#c0392b" if is_failure else "#2f6fed"
     badge_text = "INVESTIGATION FAILED" if is_failure else "INVESTIGATION COMPLETE"
     body_text = "\n".join(body_lines)
-    body_escaped = html_lib.escape(body_text)
+    summary, technical = split_plain_summary(body_text)
+
+    if summary:
+        summary_html = "".join(
+            f'<p style="margin:0 0 10px 0;">{html_lib.escape(p)}</p>'
+            for p in summary.split("\n\n")
+            if p.strip()
+        )
+        summary_block = f"""\
+  <div style="padding:4px 24px 18px 24px;">
+    <div style="background:#eef4ff;border:1px solid #d6e4ff;border-radius:8px;padding:16px 18px;
+                color:#1a1d29;font-size:14.5px;line-height:1.6;">{summary_html}</div>
+  </div>"""
+        details_label = "Full technical details"
+    else:
+        summary_block = ""
+        details_label = "Full report"
+
+    technical_escaped = html_lib.escape(technical)
     return f"""\
 <!doctype html>
 <html><body style="margin:0;padding:0;background:#f2f3f5;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;">
@@ -87,10 +133,13 @@ def render_html_email(subject: str, body_lines: list[str]) -> str:
                  letter-spacing:.03em;padding:4px 10px;border-radius:4px;">{badge_text}</span>
     <div style="font-size:16px;font-weight:600;color:#1a1d29;margin-top:12px;">{html_lib.escape(subject)}</div>
   </div>
+{summary_block}
   <div style="padding:8px 24px 20px 24px;">
+    <div style="font-size:11.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+                color:#8a8f9c;margin:4px 0 8px 2px;">{details_label}</div>
     <pre style="background:#0f1117;color:#d7dae0;font-size:12.5px;line-height:1.5;padding:16px;
                 border-radius:8px;overflow-x:auto;white-space:pre-wrap;word-break:break-word;
-                font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;">{body_escaped}</pre>
+                font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;">{technical_escaped}</pre>
   </div>
   <div style="padding:14px 24px;background:#f7f8fa;border-top:1px solid #e8e9ec;">
     <span style="font-size:12px;color:#6b7280;">Sent by the alert-responder framework on pve-01 &middot;
@@ -143,7 +192,17 @@ def dispatch_and_notify(alertname: str, summary: str, labels: dict) -> None:
         "run any destructive or state-changing command. If you find a real "
         "problem and know the fix, describe it precisely in your report "
         "(what's wrong, why, and the exact fix) instead of applying it -- the "
-        "owner or Claude Code will apply it after reviewing your report."
+        "owner or Claude Code will apply it after reviewing your report.\n\n"
+        "REQUIRED FORMAT: begin your report with a section headed exactly "
+        "'## Plain-English Summary' containing 3-5 short sentences a "
+        "non-technical homeowner can read at a glance: what broke (in plain "
+        "words, no file paths/code/log lines/service names as jargon -- "
+        "describe what the thing IS, e.g. 'the DVR's channel guide' not "
+        "'xtream-sync.py'), why it likely happened, and what should happen "
+        "next (fixed already / needs the owner's OK / needs Claude Code). "
+        "After that section, put your full technical investigation as usual "
+        "under a '## Technical Details' heading -- that part can be as "
+        "detailed and code-heavy as the investigation actually was."
     )
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     prompt_file = STATE_DIR / f"{slug}.prompt.md"
