@@ -1,0 +1,18 @@
+[Unit]
+Description=Run the sports DVR auto-scheduler every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+# The live-game extender checks "<15 min left on the timer" and adds 20 min;
+# a 5-min cadence keeps at least one check inside that window even in the
+# worst case, so a close/extra-innings game doesn't get cut off waiting for
+# the next tick. (Was 10min until 2026-08-09 -- halved together with the
+# stalled-recording watchdog's STALL_MIN_CHECK_GAP to actually cut worst-case
+# stall-detection latency, not just the tick rate alone; see the comment on
+# STALL_MIN_CHECK_GAP in sports-dvr-auto for why both had to move together.)
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target
