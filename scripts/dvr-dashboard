@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""Dashboard: tonight's power state, scheduled recordings, and full team schedules.
+"""Dashboard: tonight's power state, scheduled recordings, full team schedules, and sports auto-recorder controls.
 
 Serves one responsive page plus a JSON API on the LAN and over Tailscale.
 Stdlib only -- no web framework, no build step, nothing to keep patched.
 
-  GET  /               the page
-  GET  /api/status     power state, recordings, games in the next 10 days
-  GET  /api/schedule   full season for every followed team, with recording match
-  POST /api/override   {"hours": N}  keep the host up; N<=0 clears
-
-The override writes a timestamp that dvr-clean-shutdown reads, so pressing
-the button stops tonight's automatic shutdown. It does NOT hold the mains
-timer open -- that is a physical switch, and the page says so.
+  GET  /                  the page
+  GET  /api/status        power state, recordings, games in the next 10 days
+  GET  /api/schedule      full season for every followed team, with recording match
+  GET  /api/sports-config sports auto-recorder per-team enabled state
+  POST /api/override      {"hours": N}  keep the host up; N<=0 clears
+  POST /api/sports-config {"team": "Brewers", "enabled": true} toggle sports auto-recorder
+  POST /api/record-game   {"team": "Brewers", "id": "..."} create a one-off Jellyfin LiveTV timer
 
 Docs: /root/pve-01-docs/docs/livetv-custom-build-and-updates-20260726.md
 """
 from __future__ import annotations
 
 import base64
-import hashlib
 import hmac
 import json
+import os
+import socket
 import subprocess
 import sys
 import threading
@@ -28,6 +28,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone, time as dtime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 AUTH_FILE = Path("/etc/dvr-dashboard.auth")
@@ -56,15 +57,373 @@ def load_auth() -> tuple[str, str]:
 AUTH_USER, AUTH_PASS = load_auth()
 
 LOCAL = ZoneInfo("Europe/Berlin")
-PORT = 8099
-POWER_ON, POWER_OFF = dtime(4, 57), dtime(22, 24)
-SHUTDOWN_AT = dtime(22, 10)
+PORT = int(os.environ.get("PORT", "8099"))
+
+# Real physical timer schedule, confirmed against the owner's actual timer
+# 2026-08-08. Power restores at the same time every day; the cutoff differs
+# by day of week -- Fri and Sat nights stay on past midnight, cutting off
+# early the FOLLOWING calendar day instead of that same evening.
+POWER_ON = dtime(5, 5)
+POWER_OFF_NORMAL = dtime(22, 25)     # Sun/Mon/Tue/Wed/Thu nights, same day
+POWER_OFF_LATE = dtime(1, 0)         # Fri/Sat nights, lands on the *next* day
+LATE_NIGHT_WEEKDAYS = (4, 5)         # Mon=0 ... Fri=4, Sat=5
+SHUTDOWN_BUFFER = timedelta(minutes=15)  # how far ahead of the real cutoff to check
+
+
+def is_powered(moment: datetime) -> bool:
+    """Is the physical mains timer actually supplying power at this instant?"""
+    t = moment.time()
+    if t >= POWER_ON:
+        # Evening/daytime portion of today. Fri/Sat stay on straight through;
+        # every other night follows the normal same-day cutoff.
+        if moment.weekday() in LATE_NIGHT_WEEKDAYS:
+            return True
+        return t <= POWER_OFF_NORMAL
+    # Early-morning portion of today, before POWER_ON. Only "on" if
+    # yesterday was a late night and we haven't hit that late cutoff yet.
+    if (moment - timedelta(days=1)).weekday() in LATE_NIGHT_WEEKDAYS:
+        return t <= POWER_OFF_LATE
+    return False
+
+
+def todays_power_off(now: datetime) -> tuple[datetime, bool]:
+    """The next real cutoff from `now`'s perspective, and whether it's the
+    late (next-calendar-day) kind. Used for display and for the
+    shutdown-recheck comparison -- both care about "today's applicable
+    cutoff", which needs the early-morning tail-end case handled specially:
+    at e.g. Sunday 00:30, the relevant cutoff is *today* at 01:00 (the tail
+    of Saturday night), not Sunday's own evening 22:25."""
+    if now.time() < POWER_ON and (now - timedelta(days=1)).weekday() in LATE_NIGHT_WEEKDAYS:
+        cutoff = now.replace(hour=POWER_OFF_LATE.hour, minute=POWER_OFF_LATE.minute,
+                             second=0, microsecond=0)
+        return cutoff, True
+    if now.weekday() in LATE_NIGHT_WEEKDAYS:
+        cutoff = (now + timedelta(days=1)).replace(
+            hour=POWER_OFF_LATE.hour, minute=POWER_OFF_LATE.minute,
+            second=0, microsecond=0)
+        return cutoff, True
+    cutoff = now.replace(hour=POWER_OFF_NORMAL.hour, minute=POWER_OFF_NORMAL.minute,
+                         second=0, microsecond=0)
+    return cutoff, False
+
+
+def next_shutdown_cutoff(now: datetime) -> tuple[datetime, bool]:
+    """The next real cutoff strictly after `now` -- for sizing "keep awake
+    tonight" to exactly cover the current powered stretch, no more, no less."""
+    for days_ahead in range(3):
+        day = (now + timedelta(days=days_ahead)).date()
+        late = day.weekday() in LATE_NIGHT_WEEKDAYS
+        if late:
+            cutoff = datetime.combine(day + timedelta(days=1), POWER_OFF_LATE, tzinfo=LOCAL)
+        else:
+            cutoff = datetime.combine(day, POWER_OFF_NORMAL, tzinfo=LOCAL)
+        if cutoff > now:
+            return cutoff, late
+    return now + timedelta(hours=12), False  # unreachable in practice
+
+
+def keep_awake_cutoff(now: datetime) -> datetime:
+    """What "Keep awake tonight" should actually protect through."""
+    cutoff, late = next_shutdown_cutoff(now)
+    for _ in range(3):  # Fri+Sat is the longest possible late-night run
+        if not late:
+            return cutoff
+        cutoff, late = next_shutdown_cutoff(cutoff)
+    return cutoff
+
 
 OVERRIDE = Path("/var/lib/dvr-dashboard/override-until")
+SPORTS_CONFIG = Path("/var/lib/dvr-dashboard/sports-config.json")
+DEFAULT_SPORTS_CONFIG = {
+    "Packers": True,
+    "Badgers Football": True,
+    "Badgers Basketball": True,
+    "Bucks": True,
+    "Brewers": False,
+}
+
 CT = "105"
-NEXTPVR = "http://localhost:8866/service"
+JELLYFIN_URL = "http://127.0.0.1:8096"
+JELLYFIN_KEY_FILE = "/srv/media-core/.jellyfin_api_key"
 JELLYFIN_TIMERS = "/srv/media-core/jellyfin/config/data/livetv/timers.json"
 JF_DONE = {"Completed", "Cancelled", "Error"}
+
+JF_URLS = ["http://192.168.9.50:8096", "http://127.0.0.1:8096"]
+JF_KEY_FILES = [
+    Path("/srv/media-core/.jellyfin_api_key"),
+    Path("/config/.jellyfin_api_key"),
+    Path("/var/lib/lxc/105/rootfs/srv/media-core/.jellyfin_api_key"),
+]
+
+NETWORK_CHANNEL_MAP = {
+    "CBS": "Madison: CBS 3 (WISC)",
+    "FOX": "Madison: Fox 47 (WMSN)",
+    "ABC": "Madison: ABC 27 (WKOW)",
+    "NBC": "Madison: NBC 15 (WMTV)",
+    "ESPN": "ESPN",
+    "ESPN2": "ESPN2",
+    "ESPNU": "ESPNU",
+    "ESPNEWS": "ESPNews",
+    "ESPNews": "ESPNews",
+    "BTN": "Big Ten",
+    "Big Ten Network": "Big Ten",
+    "Big Ten": "Big Ten",
+    "NFL Net": "NFL Network HD",
+    "NFLN": "NFL Network HD",
+    "NFL Network": "NFL Network HD",
+    "NBA TV": "NBA TV HD",
+    "NBATV": "NBA TV HD",
+    "MLB Net": "MLB Network",
+    "MLBN": "MLB Network",
+    "MLB Network": "MLB Network",
+    "ACCN": "ACC Network HD",
+    "ACC Network": "ACC Network HD",
+    "TBS": "TBS HD",
+    "TNT": "TNT West 4K",
+}
+
+RSN_DEFAULTS = {
+    "Brewers": "Milwaukee Brewers HD",
+    "Bucks": "Milwaukee Bucks HD",
+}
+
+STREAMING_NETWORKS = {"Peacock", "Netflix", "Prime Video", "Apple TV", "Hulu"}
+
+_jf_token_cache: str | None = None
+
+
+def get_jf_token() -> str:
+    """Read Jellyfin AccessToken from secret file, cached after the first read.
+
+    Falls back to `pct exec 105 -- cat` if local host paths don't exist.
+    """
+    global _jf_token_cache
+    if _jf_token_cache:
+        return _jf_token_cache
+    for key_file in JF_KEY_FILES:
+        if key_file.exists():
+            try:
+                tok = key_file.read_text().strip()
+                if tok:
+                    _jf_token_cache = tok
+                    return tok
+            except Exception as exc:
+                sys.stderr.write(f"Failed to read Jellyfin API key file {key_file}: {exc}\n")
+    try:
+        tok = subprocess.run(
+            ["/usr/sbin/pct", "exec", CT, "--", "cat", JELLYFIN_KEY_FILE],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout.strip()
+        if tok:
+            _jf_token_cache = tok
+            return tok
+    except Exception as exc:
+        sys.stderr.write(f"Failed to read Jellyfin API key via pct exec into CT{CT}: {exc}\n")
+    return ""
+
+
+def jf_request(endpoint: str, data: dict[str, Any] | None = None, method: str = "GET") -> Any:
+    """Execute HTTP request against Jellyfin API."""
+    token = get_jf_token()
+    if not token:
+        return None
+
+    headers = {
+        "Authorization": f'MediaBrowser Token="{token}"',
+        "Content-Type": "application/json",
+        "User-Agent": "SportsDVRDashboard/1.0",
+    }
+    payload = json.dumps(data).encode("utf-8") if data is not None else None
+
+    for base_url in JF_URLS:
+        url = f"{base_url}{endpoint}"
+        req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                res_body = resp.read()
+                if not res_body:
+                    return {}
+                return json.loads(res_body)
+        except Exception:
+            continue
+
+    sys.stderr.write(f"Jellyfin API {method} {endpoint} failed on all URLs\n")
+    return None
+
+
+def get_jellyfin_channels() -> dict[str, str]:
+    """Fetch channel list from Jellyfin API or fallback to Threadfin M3U.
+
+    Returns mapping of channel name -> Jellyfin GUID channel ID.
+    """
+    chans = jf_request("/emby/LiveTv/Channels")
+    mapping: dict[str, str] = {}
+
+    if chans and "Items" in chans:
+        for c in chans["Items"]:
+            cid = c.get("Id")
+            cname = c.get("Name", "")
+            if cid and cname:
+                mapping[cname] = cid
+                mapping[cname.lower()] = cid
+        return mapping
+
+    tf_urls = ["http://127.0.0.1:34400/m3u/threadfin.m3u", "http://192.168.9.50:34400/m3u/threadfin.m3u"]
+    for url in tf_urls:
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                m3u_text = resp.read().decode("utf-8", errors="ignore")
+                for line in m3u_text.splitlines():
+                    if line.startswith("#EXTINF"):
+                        parts = line.split(",")
+                        cname = parts[-1].strip() if len(parts) > 1 else ""
+                        header = parts[0]
+                        chno = ""
+                        if 'tvg-chno="' in header:
+                            chno = header.split('tvg-chno="')[1].split('"')[0]
+                        cid = f"hdhr_{chno}" if chno else cname
+                        if cname:
+                            mapping[cname] = cid
+                            mapping[cname.lower()] = cid
+                if mapping:
+                    return mapping
+        except Exception:
+            continue
+
+    return mapping
+
+
+def resolve_channel_id(game: dict[str, Any], jf_channels: dict[str, str]) -> tuple[str | None, str]:
+    """Resolve ESPN broadcast network to Jellyfin channel ID and channel name."""
+    team = game.get("team", "")
+    broadcasts = game.get("broadcasts") or []
+
+    for bc in broadcasts:
+        if bc in STREAMING_NETWORKS:
+            return None, f"Streaming Exclusive ({bc})"
+
+        if "Brewers" in bc and "Milwaukee Brewers HD" in jf_channels:
+            return jf_channels["Milwaukee Brewers HD"], "Milwaukee Brewers HD"
+        if "Bucks" in bc and "Milwaukee Bucks HD" in jf_channels:
+            return jf_channels["Milwaukee Bucks HD"], "Milwaukee Bucks HD"
+
+        mapped_name = NETWORK_CHANNEL_MAP.get(bc)
+        if mapped_name and (mapped_name in jf_channels or mapped_name.lower() in jf_channels):
+            cid = jf_channels.get(mapped_name) or jf_channels.get(mapped_name.lower())
+            if cid:
+                return cid, mapped_name
+
+        for ch_name, cid in jf_channels.items():
+            if bc.lower() in ch_name.lower():
+                return cid, ch_name
+
+    if team in RSN_DEFAULTS:
+        rsn_name = RSN_DEFAULTS[team]
+        cid = jf_channels.get(rsn_name) or jf_channels.get(rsn_name.lower())
+        if cid:
+            return cid, rsn_name
+
+    return None, f"Unmapped ({', '.join(broadcasts) if broadcasts else 'No Broadcast Info'})"
+
+
+def get_existing_timers() -> list[dict[str, Any]]:
+    """Fetch active Jellyfin LiveTv timers."""
+    res = jf_request("/emby/LiveTv/Timers")
+    return res.get("Items", []) if res else []
+
+
+def is_overlapping_timer(channel_id: str, start: datetime, end: datetime, existing_timers: list[dict[str, Any]]) -> bool:
+    """Check if an existing timer overlaps the given time range on the same channel."""
+    for t in existing_timers:
+        if t.get("Status") in ("Completed", "Cancelled", "Error"):
+            continue
+        t_cid = t.get("ChannelId")
+        if t_cid != channel_id:
+            continue
+        try:
+            t_start = datetime.fromisoformat(t["StartDate"].replace("Z", "+00:00"))
+            t_end = datetime.fromisoformat(t["EndDate"].replace("Z", "+00:00"))
+        except (KeyError, ValueError):
+            continue
+
+        if t_start < end and t_end > start:
+            return True
+    return False
+
+
+def find_matching_program_id(channel_id: str, game_start: datetime) -> str | None:
+    """Look up the real EPG Program for a game on this channel, matching by
+    start-time proximity (within 30 min). Returns the Program's Id, or None.
+
+    Root-caused 2026-08-16 (Agy independently traced Jellyfin's own server
+    source -- see agy-reports/20260816T190057Z-timerdto-investigation.md):
+    "IsSports" is not a writable field on the timer-creation DTO at all --
+    it's a read-only computed property on the server, populated only by
+    copying Tags from a linked EPG Program via ProgramId. The "IsSports":
+    True field this function sent (added 2026-08-16, believed to fix
+    manually-recorded games landing in "Other") was confirmed via direct
+    on-disk inspection to be a silent no-op, same as sports-dvr-auto's
+    identical mistake from 2026-08-13. This is the real fix, mirrored from
+    sports-dvr-auto's copy of the same helper."""
+    # Two match modes (Agy's review, 2026-08-16): proximity to p_start
+    # handles normal pre-scheduling; containment (p_start <= target < p_end)
+    # handles a lookup for a timestamp deep inside an already-running game.
+    programs = jf_request(f"/LiveTv/Programs?ChannelIds={channel_id}&HasAired=false")
+    if not programs:
+        return None
+    best_id, best_diff = None, None
+    for p in programs.get("Items", []):
+        try:
+            p_start = datetime.fromisoformat(str(p["StartDate"]).replace("Z", "+00:00"))
+            p_end = datetime.fromisoformat(str(p["EndDate"]).replace("Z", "+00:00"))
+        except (KeyError, ValueError, TypeError, AttributeError):
+            continue
+        if p_start <= game_start < p_end:
+            return p.get("Id")
+        diff = abs((p_start - game_start).total_seconds())
+        if diff <= 1800 and (best_diff is None or diff < best_diff):
+            best_id, best_diff = p.get("Id"), diff
+    return best_id
+
+
+def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str, dry_run: bool = False) -> tuple[bool, str, dict[str, Any]]:
+    """Create a Jellyfin LiveTv timer for a game."""
+    start_dt = game["start"] if isinstance(game["start"], datetime) else datetime.fromisoformat(game["start"])
+    end_dt = game["end"] if isinstance(game["end"], datetime) else datetime.fromisoformat(game["end"])
+
+    start_utc = start_dt.astimezone(timezone.utc)
+    end_utc = end_dt.astimezone(timezone.utc)
+
+    start_iso = (start_utc - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_iso = (end_utc + timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    name = f"{game['team']}: {game['name']}"
+
+    program_id = find_matching_program_id(channel_id, start_utc)
+
+    payload = {
+        "Type": "Timer",
+        "ChannelId": channel_id,
+        "ChannelName": channel_name,
+        # Required. Without it, Jellyfin's CreateTimer looks up a service named "" and throws 500.
+        "ServiceName": "Emby",
+        "Name": name,
+        "StartDate": start_iso,
+        "EndDate": end_iso,
+        "PrePaddingSeconds": 300,
+        "PostPaddingSeconds": 1800,
+    }
+    if program_id:
+        payload["ProgramId"] = program_id
+
+    if dry_run:
+        return True, "dry-run", payload
+
+    res = jf_request("/emby/LiveTv/Timers", data=payload, method="POST")
+    if res is not None:
+        return True, "success", payload
+    return False, "failed to create timer in Jellyfin", payload
+
 
 UPCOMING_DAYS = 10
 DURATION = {"football": timedelta(hours=3, minutes=45),
@@ -78,9 +437,62 @@ TEAMS = [
     ("Brewers",            "baseball/mlb",                       "mil"),
 ]
 
-# Schedules change rarely; recordings change often. Cached separately.
+LINKS = [
+    {"group": "Media servers", "label": "Jellyfin - production",
+     "url": "http://192.168.9.50:8096", "host": "192.168.9.50", "port": 8096},
+    {"group": "Media servers", "label": "Jellyfin - live (Threadfin)",
+     "url": "http://192.168.9.195:8096", "host": "192.168.9.195", "port": 8096},
+    {"group": "Media servers", "label": "Jellyfin - VOD",
+     "url": "http://192.168.9.171:8096", "host": "192.168.9.171", "port": 8096},
+    {"group": "Media servers", "label": "Jellyfin - NextPVR",
+     "url": "http://192.168.9.219:8096", "host": "192.168.9.219", "port": 8096},
+    {"group": "Tuners / DVR", "label": "Threadfin - production",
+     "url": "http://192.168.9.50:34400", "host": "192.168.9.50", "port": 34400},
+    {"group": "Tuners / DVR", "label": "Threadfin - live",
+     "url": "http://192.168.9.195:34400", "host": "192.168.9.195", "port": 34400},
+    {"group": "Tuners / DVR", "label": "NextPVR",
+     "url": "http://192.168.9.219:8866", "host": "192.168.9.219", "port": 8866},
+    {"group": "Monitoring", "label": "Grafana",
+     "url": "http://192.168.9.164:3000", "host": "192.168.9.164", "port": 3000},
+    {"group": "Monitoring", "label": "Router Network Dashboard",
+     "url": "http://192.168.9.11:8098", "host": "192.168.9.11", "port": 8098},
+    {"group": "Infrastructure", "label": "Proxmox",
+     "url": "https://192.168.9.11:8006", "host": "192.168.9.11", "port": 8006},
+    {"group": "Infrastructure", "label": "Router (GL-MT6000)",
+     "url": "http://192.168.9.1", "host": "192.168.9.1", "port": 80},
+]
+
 _sched: dict = {"at": None, "games": []}
 _lock = threading.Lock()
+
+
+def load_json_config(path: Path, defaults: dict) -> dict:
+    if not path.exists():
+        save_json_config(path, defaults)
+        return dict(defaults)
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("Config root must be a JSON object")
+        updated = False
+        for k, v in defaults.items():
+            if k not in data:
+                data[k] = v
+                updated = True
+        if updated:
+            save_json_config(path, data)
+        return data
+    except Exception as exc:
+        sys.stderr.write(f"WARNING: Failed reading {path}: {exc}. Resetting to defaults.\n")
+        save_json_config(path, defaults)
+        return dict(defaults)
+
+
+def save_json_config(path: Path, config: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(config, indent=2) + "\n")
+    tmp.replace(path)
 
 
 def pct(*args: str, timeout: int = 25) -> str:
@@ -89,27 +501,52 @@ def pct(*args: str, timeout: int = 25) -> str:
                           timeout=timeout, check=True).stdout
 
 
-def npvr_start(tag) -> datetime:
-    """NextPVR start time as a real local datetime.
+def check_link(host: str, port: int, timeout: float = 1.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
-    <start_time> is local wall time ("07/31/2026 22:00:00"). <start_time_ticks>
-    looks like an epoch but is that same wall time encoded as if it were UTC,
-    so reading it with fromtimestamp(tz=LOCAL) lands 2 h out in CEST. Parse the
-    string; fall back to relabelling the ticks rather than trusting them.
-    """
-    raw = tag("start_time")
-    if raw:
-        return datetime.strptime(raw.strip(), "%m/%d/%Y %H:%M:%S").replace(tzinfo=LOCAL)
-    naive = datetime.fromtimestamp(int(tag("start_time_ticks")), tz=timezone.utc)
-    return naive.replace(tzinfo=LOCAL)
+
+def links_status() -> list[dict]:
+    return [{"group": l["group"], "label": l["label"], "url": l["url"],
+              "up": check_link(l["host"], l["port"])} for l in LINKS]
+
+
+# Added 2026-08-11 per owner request: a way to see whether sports-dvr-auto's
+# extend/trim/stall/restore/stitch logic actually fired, without SSHing in
+# and grepping the systemd journal. Same file sports-dvr-auto itself appends
+# to (/var/lib/dvr-dashboard/dvr-automation-events.jsonl) -- this dashboard
+# only reads it, never writes it, so there's no write-contention risk between
+# the two processes.
+AUTOMATION_EVENT_LOG = Path("/var/lib/dvr-dashboard/dvr-automation-events.jsonl")
+
+
+def automation_events(n: int = 50) -> list[dict]:
+    if not AUTOMATION_EVENT_LOG.exists():
+        return []
+    try:
+        lines = AUTOMATION_EVENT_LOG.read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines[-n:]:
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    out.reverse()
+    return out
+
 
 def outside_window(start: datetime, end: datetime) -> bool:
     cur = start
     while cur <= end:
-        if not (POWER_ON <= cur.time() <= POWER_OFF):
+        if not is_powered(cur):
             return True
         cur += timedelta(minutes=15)
-    return not (POWER_ON <= end.time() <= POWER_OFF)
+    return not is_powered(end)
 
 
 def override_until() -> datetime | None:
@@ -120,9 +557,6 @@ def override_until() -> datetime | None:
     return ts if ts > datetime.now(LOCAL) else None
 
 
-# ESPN's default schedule response is the regular season only. Preseason and
-# postseason live behind seasontype, and preseason matters here -- those games
-# are watched too, and they start weeks before the regular season.
 SEASON_TYPES = {1: "Preseason", 2: "", 3: "Postseason"}
 
 
@@ -140,20 +574,11 @@ def all_games(now: datetime) -> list[dict]:
             req = urllib.request.Request(
                 f"https://site.api.espn.com/apis/site/v2/sports/{sport}"
                 f"/teams/{team}/schedule?seasontype={stype}",
-                # No custom User-Agent. ESPN's edge 403s "dvr-dashboard/1.0",
-                # any Mozilla string, and Wget, but serves curl/* and Python's
-                # default urllib UA. Setting a polite identifying UA is exactly
-                # what silently broke every team's schedule -- all_games()
-                # swallows the exception and returns an empty list, so the
-                # dashboard just showed no games rather than an error.
-                )
-            with urllib.request.urlopen(req, timeout=20) as r:
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
                 data = json.load(r)
         except Exception:                                   # noqa: BLE001
             continue
-        # Derived from the sport path, not guessed. The old
-        # football-or-basketball test silently called baseball "basketball"
-        # and gave every Brewers game a 2h45 duration.
         kind = sport.split("/")[0]
         for ev in data.get("events", []):
             try:
@@ -178,11 +603,23 @@ def all_games(now: datetime) -> list[dict]:
                 continue
             seen.add(key)
             end = start + DURATION[kind]
+
+            broadcast_names: list[str] = []
+            for bc in comp.get("broadcasts") or []:
+                m_short = (bc.get("media") or {}).get("shortName")
+                if m_short:
+                    broadcast_names.append(m_short)
+                for n in bc.get("names") or []:
+                    if n and n not in broadcast_names:
+                        broadcast_names.append(n)
+
             out.append({
+                "id": str(ev.get("id") or ""),
                 "team": label, "kind": kind, "season": sname,
                 "name": ev.get("shortName") or ev.get("name") or "game",
                 "start": start.isoformat(), "end": end.isoformat(),
                 "done": done, "score": score,
+                "broadcasts": broadcast_names,
                 "needsPower": outside_window(start, end),
             })
     out.sort(key=lambda g: g["start"])
@@ -191,72 +628,27 @@ def all_games(now: datetime) -> list[dict]:
     return out
 
 
-def channel_names(sid: str) -> dict[str, str]:
-    """number -> name, so a Jellyfin timer's 'hdhr_100' can be shown as a name.
-
-    Jellyfin timers carry only the tuner's channel id. Both tuners number these
-    channels identically, so NextPVR's list resolves them.
-    """
+def channel_names() -> dict[str, str]:
     out: dict[str, str] = {}
     try:
-        xml = pct("curl", "-s", "--max-time", "10",
-                  f"{NEXTPVR}?method=channel.list&sid={sid}")
+        key = pct("cat", JELLYFIN_KEY_FILE).strip()
+        raw = pct("curl", "-s", "--max-time", "10",
+                  f"{JELLYFIN_URL}/emby/LiveTv/Channels?Limit=2000",
+                  "-H", f'Authorization: MediaBrowser Token="{key}"')
+        data = json.loads(raw)
     except Exception:                                       # noqa: BLE001
         return out
-    for chunk in xml.split("<channel>")[1:]:
-        def tag(t: str) -> str:
-            return (chunk.split(f"<{t}>")[1].split(f"</{t}>")[0]
-                    if f"<{t}>" in chunk else "")
-        if tag("number"):
-            out[tag("number")] = tag("name")
+    for c in data.get("Items", []):
+        number = c.get("Number") or c.get("ChannelNumber")
+        name = c.get("Name")
+        if number and name:
+            out[str(number)] = name
     return out
 
 
 def recordings(now: datetime) -> tuple[list[dict], list[str]]:
     items, problems = [], []
-    chmap: dict[str, str] = {}
-    try:
-        init = pct("curl", "-s", "--max-time", "10",
-                   f"{NEXTPVR}?method=session.initiate&ver=1.0&device=dashboard")
-        sid = init.split("<sid>")[1].split("</sid>")[0]
-        salt = init.split("<salt>")[1].split("</salt>")[0]
-        h = hashlib.md5(f":{hashlib.md5(b'0000').hexdigest()}:{salt}".encode()).hexdigest()
-        pct("curl", "-s", "--max-time", "10",
-            f"{NEXTPVR}?method=session.login&md5={h}&sid={sid}")
-        chmap = channel_names(sid)
-        # A recording currently airing appears under BOTH filters, so track ids.
-        seen_rec: set = set()
-        for f in ("inprogress", "pending"):
-            xml = pct("curl", "-s", "--max-time", "10",
-                      f"{NEXTPVR}?method=recording.list&filter={f}&sid={sid}")
-            for chunk in xml.split("<recording>")[1:]:
-                def tag(t: str) -> str:
-                    return (chunk.split(f"<{t}>")[1].split(f"</{t}>")[0]
-                            if f"<{t}>" in chunk else "")
-                # NextPVR exposes BOTH a formatted <start_time>
-                # ('07/31/2026 22:00:00') and epoch <start_time_ticks>;
-                # likewise <duration> ('00:30') and <duration_seconds>.
-                # Parsing the formatted pair threw and hit the continue
-                # below, so every NextPVR recording was silently invisible.
-                try:
-                    start = npvr_start(tag)
-                    end = start + timedelta(seconds=int(tag("duration_seconds") or 0))
-                except (ValueError, IndexError):
-                    continue
-                start -= timedelta(seconds=int(tag("pre_padding") or 0) * 60)
-                end += timedelta(seconds=int(tag("post_padding") or 0) * 60)
-                rid = tag("id")
-                if rid and rid in seen_rec:
-                    continue
-                seen_rec.add(rid)
-                sub = tag("subtitle")
-                items.append({"source": "NextPVR", "name": tag("name") or "recording",
-                              "subtitle": sub, "channel": tag("channel"),
-                              "start": start.isoformat(), "end": end.isoformat(),
-                              "live": start <= now <= end,
-                              "needsPower": outside_window(start, end)})
-    except Exception as exc:                                # noqa: BLE001
-        problems.append(f"NextPVR unreachable ({type(exc).__name__})")
+    chmap = channel_names()
 
     try:
         for t in json.loads(pct("cat", JELLYFIN_TIMERS)):
@@ -285,12 +677,6 @@ def recordings(now: datetime) -> tuple[list[dict], list[str]]:
 
 
 def tag_recordings(games: list[dict], recs: list[dict]) -> None:
-    """Mark games whose airtime overlaps a scheduled recording.
-
-    Matched purely on time overlap -- neither DVR records "the Packers game",
-    it records a channel for a span. So we report which recording overlaps and
-    let the reader judge, rather than asserting the game itself is covered.
-    """
     for g in games:
         gs, ge = datetime.fromisoformat(g["start"]), datetime.fromisoformat(g["end"])
         hits = [r["name"] for r in recs
@@ -307,10 +693,13 @@ def status() -> dict:
                 if now <= datetime.fromisoformat(g["start"]) <= horizon]
     tag_recordings(upcoming, recs)
     ov = override_until()
+    cutoff, is_late = todays_power_off(now)
+    check_at = cutoff - SHUTDOWN_BUFFER
+    suffix = " (+1d)" if is_late else ""
     return {"now": now.isoformat(),
             "powerOn": POWER_ON.strftime("%H:%M"),
-            "powerOff": POWER_OFF.strftime("%H:%M"),
-            "shutdownAt": SHUTDOWN_AT.strftime("%H:%M"),
+            "powerOff": cutoff.strftime("%H:%M") + suffix,
+            "shutdownAt": check_at.strftime("%H:%M") + suffix,
             "override": ov.isoformat() if ov else None,
             "games": upcoming, "recordings": recs, "problems": problems}
 
@@ -361,6 +750,9 @@ margin:0 0 10px;font-weight:600}
 .pill.rec{background:var(--okbg);color:var(--ok)}
 .pill.live{background:var(--live);color:#fff}
 .pill.season{background:var(--line);color:var(--dim)}
+button.pill.btn-rec{background:var(--card);border:1px solid var(--accent);color:var(--accent);cursor:pointer;font-family:inherit;line-height:1.2}
+button.pill.btn-rec:hover{background:var(--accent);color:#fff}
+button.pill.btn-rec:disabled{opacity:.5;cursor:not-allowed}
 .status{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .dot{width:10px;height:10px;border-radius:50%;flex:0 0 auto}
 .big{font-size:1.05rem;font-weight:600}
@@ -386,6 +778,22 @@ button.danger.armed{background:var(--live);border-color:var(--live);color:#fff}
 .danger-note{font-size:.8rem;color:var(--warn);background:var(--warnbg);
 border-radius:8px;padding:10px 12px;margin-top:10px;display:none}
 .danger-note.show{display:block}
+
+/* Sports Auto-Recorder Toggle UI */
+.toggle-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-top:1px solid var(--line)}
+.toggle-row:first-of-type{border-top:0}
+.toggle-label{display:flex;align-items:center;gap:8px}
+.toggle-name{font-weight:600;font-size:.92rem}
+.badge{font-size:.68rem;padding:2px 6px;border-radius:4px;background:var(--line);color:var(--dim);font-weight:700;text-transform:uppercase}
+.toggle-right{display:flex;align-items:center;gap:10px}
+.toggle-state-text{font-size:.78rem;font-weight:600;min-width:4.2em;text-align:right;color:var(--dim)}
+.toggle-state-text.on{color:var(--ok)}
+.switch{position:relative;width:44px;height:24px;background:var(--line);border-radius:99px;border:0;padding:2px;cursor:pointer;transition:background-color .2s ease;outline:none;flex-shrink:0}
+.switch[aria-checked="true"]{background:var(--ok)}
+.switch:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.switch-thumb{width:20px;height:20px;background:#fff;border-radius:50%;transition:transform .2s cubic-bezier(.4,0,.2,1);box-shadow:0 1px 3px rgba(0,0,0,.3)}
+.switch[aria-checked="true"] .switch-thumb{transform:translateX(20px)}
+.link-row{display:inline-flex;align-items:center;gap:8px}
 </style></head><body>
 <h1>Media-Core DVR</h1>
 <div class="sub" id="sub">loading…</div>
@@ -393,6 +801,7 @@ border-radius:8px;padding:10px 12px;margin-top:10px;display:none}
   <button role="tab" aria-selected="true" onclick="tab('now')" id="t-now">Tonight</button>
   <button role="tab" aria-selected="false" onclick="tab('sched')" id="t-sched">Schedules</button>
   <button role="tab" aria-selected="false" onclick="tab('links')" id="t-links">Links</button>
+  <button role="tab" aria-selected="false" onclick="tab('events')" id="t-events">Automation</button>
 </div>
 
 <div id="p-now">
@@ -401,7 +810,7 @@ border-radius:8px;padding:10px 12px;margin-top:10px;display:none}
     <div class="status"><span class="dot" id="dot"></span><span class="big" id="pstate">…</span></div>
     <div class="note" id="pnote"></div>
     <div class="btns">
-      <button class="act primary" onclick="ov(12)">Keep awake tonight</button>
+      <button class="act primary" onclick="keepAwakeTonight()">Keep awake tonight</button>
       <button class="act" onclick="ov(0)">Cancel override</button>
     </div>
     <div class="note"><b>This does not hold the wall timer open.</b>
@@ -409,6 +818,11 @@ border-radius:8px;padding:10px 12px;margin-top:10px;display:none}
     still armed, power is cut anyway — switch it off too.</div>
     <div class="btns"><button class="act danger" id="sd" onclick="sd()">Shut down now</button></div>
     <div class="danger-note" id="sdnote"></div>
+  </div>
+  <div class="card">
+    <h2>Sports auto-recorder</h2>
+    <div class="sub" style="margin-bottom:8px">Automatic game scheduling & live extension via ESPN</div>
+    <div id="sports-toggles"><div class="empty">loading sports config…</div></div>
   </div>
   <div class="card"><h2>Scheduled recordings</h2><div id="recs"></div></div>
   <div class="card"><h2>Next 10 days</h2><div id="games"></div></div>
@@ -426,116 +840,239 @@ border-radius:8px;padding:10px 12px;margin-top:10px;display:none}
 </div>
 
 <div id="p-links" hidden>
-  <div class="note" style="margin-bottom:14px">Note: These services are accessible on LAN or Tailscale only.</div>
-  <div class="card">
-    <h2>Media servers</h2>
-    <div class="row">
-      <div class="what">
-        <a href="http://192.168.9.50:8096" target="_blank" rel="noopener"><b>Jellyfin - production</b></a>
-        <span class="tag">http://192.168.9.50:8096</span>
-      </div>
-    </div>
-    <div class="row">
-      <div class="what">
-        <a href="http://192.168.9.195:8096" target="_blank" rel="noopener"><b>Jellyfin - live (Threadfin)</b></a>
-        <span class="tag">http://192.168.9.195:8096</span>
-      </div>
-    </div>
-    <div class="row">
-      <div class="what">
-        <a href="http://192.168.9.134:8096" target="_blank" rel="noopener"><b>Jellyfin - VOD</b></a>
-        <span class="tag">http://192.168.9.134:8096</span>
-      </div>
-    </div>
-    <div class="row">
-      <div class="what">
-        <a href="http://192.168.9.219:8096" target="_blank" rel="noopener"><b>Jellyfin - NextPVR</b></a>
-        <span class="tag">http://192.168.9.219:8096</span>
-      </div>
-    </div>
+  <div class="note" style="margin-bottom:14px">Note: These services are accessible on LAN or Tailscale only.
+    Status dot: checked from the server (pve-01) each time this tab opens -- reachable from here does not
+    guarantee reachable from your device (different network segments can see different things), but
+    unreachable from here means the service itself is genuinely down or moved.</div>
+  <div id="links-body"><div class="empty">checking links…</div></div>
+</div>
+
+<div id="p-events" hidden>
+  <div class="note" style="margin-bottom:14px">Every extend/trim decision, stall detection, auto-restore
+    attempt, and file stitch the DVR automation has made -- permanent history, not just current state.
+    Newest first. [DRY-RUN] entries are test runs (e.g. --dry-run invocations), not real actions.</div>
+  <div class="card" style="margin-bottom:14px">
+    <h2>Key</h2>
+    <div class="row"><div class="what"><b>Extended recording</b>
+      <span class="tag">Game was still live and the recording was running low on buffer, so the timer's
+        end time got pushed further out.</span></div></div>
+    <div class="row"><div class="what"><b>Trimmed recording (game ended)</b>
+      <span class="tag">ESPN confirmed the game went final, so the timer was cut back to stop recording
+        soon after instead of running out the full padded window and capturing dead air.</span></div></div>
+    <div class="row"><div class="what"><b>Stall detected</b>
+      <span class="tag">The recording file stopped growing well before its scheduled end -- the stream
+        may have dropped.</span></div></div>
+    <div class="row"><div class="what"><b>Stall self-recovered (no action needed)</b>
+      <span class="tag">A stall was seen, but the file started growing again on its own before any
+        recovery action was triggered.</span></div></div>
+    <div class="row"><div class="what"><b>Auto-restore triggered</b>
+      <span class="tag">A real stall didn't recover on its own, so the original timer was cancelled and a
+        new continuation timer was created to pick up recording where it left off.</span></div></div>
+    <div class="row"><div class="what"><b>Files stitched together</b>
+      <span class="tag">Both the original and continuation recordings finished, and were joined into one
+        combined file. Note: there's still a real content gap in the combined file for however long the
+        stream was actually down between the two recordings.</span></div></div>
+    <div class="row"><div class="what"><b>Stitch failed</b>
+      <span class="tag">The join couldn't be completed -- see the event's own detail line for why (a
+        missing file, a suspected time overlap, or an ffmpeg error).</span></div></div>
+    <div class="row"><div class="what"><b>Archived segments cleaned up</b>
+      <span class="tag">The raw segments for a stitched recording were deleted -- either because the
+        combined recording was itself deleted (a clear "done with this" signal), or as a 60-day safety-net
+        fallback if that never happened. Never touches anything outside the archive folder.</span></div></div>
+    <div class="row"><div class="what"><b>OK / FAILED badge</b>
+      <span class="tag">Whether that specific action (the extend call, the restore attempt, the stitch)
+        actually succeeded, independent of what triggered it.</span></div></div>
   </div>
-  <div class="card">
-    <h2>Tuners / DVR</h2>
-    <div class="row">
-      <div class="what">
-        <a href="http://192.168.9.50:34400" target="_blank" rel="noopener"><b>Threadfin - production</b></a>
-        <span class="tag">http://192.168.9.50:34400</span>
-      </div>
-    </div>
-    <div class="row">
-      <div class="what">
-        <a href="http://192.168.9.195:34400" target="_blank" rel="noopener"><b>Threadfin - live</b></a>
-        <span class="tag">http://192.168.9.195:34400</span>
-      </div>
-    </div>
-    <div class="row">
-      <div class="what">
-        <a href="http://192.168.9.50:8866" target="_blank" rel="noopener"><b>NextPVR - production</b></a>
-        <span class="tag">http://192.168.9.50:8866</span>
-      </div>
-    </div>
-    <div class="row">
-      <div class="what">
-        <a href="http://192.168.9.219:8866" target="_blank" rel="noopener"><b>NextPVR - live</b></a>
-        <span class="tag">http://192.168.9.219:8866</span>
-      </div>
-    </div>
-  </div>
-  <div class="card">
-    <h2>Monitoring</h2>
-    <div class="row">
-      <div class="what">
-        <a href="http://192.168.9.164:3000" target="_blank" rel="noopener"><b>Grafana</b></a>
-        <span class="tag">http://192.168.9.164:3000</span>
-      </div>
-    </div>
-  </div>
-  <div class="card">
-    <h2>Infrastructure</h2>
-    <div class="row">
-      <div class="what">
-        <a href="https://192.168.9.11:8006" target="_blank" rel="noopener"><b>Proxmox</b></a>
-        <span class="tag">https://192.168.9.11:8006</span>
-      </div>
-    </div>
-    <div class="row">
-      <div class="what">
-        <a href="http://192.168.9.1" target="_blank" rel="noopener"><b>Router (GL-MT6000)</b></a>
-        <span class="tag">http://192.168.9.1</span>
-      </div>
-    </div>
-  </div>
+  <div id="events-body"><div class="empty">loading…</div></div>
 </div>
 
 <script>
 const fD=s=>new Date(s).toLocaleString([],{weekday:'short',day:'numeric',month:'short',
   hour:'2-digit',minute:'2-digit'});
 const fT=s=>new Date(s).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+const fCT=s=>new Date(s).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',
+  timeZone:'America/Chicago'});
 const esc=s=>String(s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
 let TEAM='All', SCHED=null, PON=null;
 
-function pills(g){let h='';
+const TEAM_BADGES = {
+  'Packers': 'NFL',
+  'Badgers Football': 'CFB',
+  'Badgers Basketball': 'NCAAM',
+  'Bucks': 'NBA',
+  'Brewers': 'MLB'
+};
+let SPORTS_CONFIG = {};
+
+async function loadSportsConfig() {
+  try {
+    SPORTS_CONFIG = await (await fetch('/api/sports-config')).json();
+    renderSportsConfig();
+    if (SCHED) render();
+  } catch (e) {
+    const el = document.getElementById('sports-toggles');
+    if (el) el.innerHTML = '<div class="err">Could not load sports config</div>';
+  }
+}
+
+function renderSportsConfig() {
+  const el = document.getElementById('sports-toggles');
+  if (!el) return;
+  const teams = Object.keys(SPORTS_CONFIG);
+  if (!teams.length) {
+    el.innerHTML = '<div class="empty">No sports teams found.</div>';
+    return;
+  }
+  el.innerHTML = teams.map(t => {
+    const on = !!SPORTS_CONFIG[t];
+    const badge = TEAM_BADGES[t] || '';
+    return `<div class="toggle-row">
+      <div class="toggle-label">
+        <span class="toggle-name">${esc(t)}</span>
+        ${badge ? `<span class="badge">${esc(badge)}</span>` : ''}
+      </div>
+      <div class="toggle-right">
+        <span class="toggle-state-text ${on ? 'on' : ''}">${on ? 'Auto ON' : 'Off'}</span>
+        <button type="button" role="switch" aria-checked="${on}" aria-label="Toggle ${esc(t)} auto-recording" class="switch" onclick="toggleTeam('${esc(t)}', ${!on})">
+          <div class="switch-thumb"></div>
+        </button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function toggleTeam(team, newState) {
+  SPORTS_CONFIG[team] = newState;
+  renderSportsConfig();
+  try {
+    const res = await fetch('/api/sports-config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({team: team, enabled: newState})
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok || !j.ok) throw new Error(j.error || 'Server HTTP error');
+    if (j.config) SPORTS_CONFIG = j.config;
+    renderSportsConfig();
+    if (SCHED) render();
+  } catch (e) {
+    SPORTS_CONFIG[team] = !newState;
+    renderSportsConfig();
+    alert('Could not update sports recording toggle: ' + e.message);
+  }
+}
+
+async function recordGame(btn, encodedGame) {
+  const game = JSON.parse(decodeURIComponent(encodedGame));
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Scheduling…';
+  try {
+    const res = await fetch('/api/record-game', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(game)
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok || !j.ok) {
+      throw new Error(j.error || 'Server error creating recording timer');
+    }
+    await load();
+    if (SCHED) await loadSched();
+  } catch (e) {
+    alert('Could not record game: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+function pills(g, past){let h='';
   if(g.season)h+=`<span class="pill season">${esc(g.season)}</span>`;
-  if(g.recording)h+=`<span class="pill rec" title="${esc(g.recording)}">recording</span>`;
+  if(SPORTS_CONFIG[g.team] === false)h+=`<span class="pill season" title="Auto-record toggled off for ${esc(g.team)}">auto off</span>`;
+  const sameGame=g.team&&g.recording&&g.recording.startsWith(g.team+':');
+  if(g.recording){
+    const label=sameGame?'recording':'other recording overlaps';
+    h+=`<span class="pill rec" title="${esc(g.recording)}">${label}</span>`;
+  }
+  if(!past && !g.done && !sameGame && g.team && g.kind){
+    const enc = encodeURIComponent(JSON.stringify(g));
+    h+=`<button class="pill btn-rec" onclick="recordGame(this, '${enc}')">Record</button>`;
+  }
   if(g.needsPower&&!g.done)h+='<span class="pill warn">needs power</span>';
   return h}
+
 function row(g,past,extra){
-  return `<div class="row${past?' past':''}"><div class="when">${fD(g.start)}<br>
-  <span class="tag">to ${fT(g.end)}</span></div>
+  const ct=g.kind?` <span class="tag">(${fCT(g.start)} CT)</span>`:'';
+  const ctEnd=g.kind?` (${fCT(g.end)} CT)`:'';
+  return `<div class="row${past?' past':''}"><div class="when">${fD(g.start)}${ct}<br>
+  <span class="tag">to ${fT(g.end)}${ctEnd}</span></div>
   <div class="what"><b>${esc(g.name)}</b><span class="tag">${
     [g.channel, g.subtitle, g.team||g.source, g.score].filter(Boolean).map(esc).join(' · ')
   }</span></div>
-  <div class="pills">${extra||''}${pills(g)}</div></div>`}
+  <div class="pills">${extra||''}${pills(g, past)}</div></div>`}
 
 function tab(w){
-  const n=w==='now', s=w==='sched', l=w==='links';
+  const n=w==='now', s=w==='sched', l=w==='links', e=w==='events';
   document.getElementById('p-now').hidden=!n;
   document.getElementById('p-sched').hidden=!s;
   document.getElementById('p-links').hidden=!l;
+  document.getElementById('p-events').hidden=!e;
   document.getElementById('t-now').setAttribute('aria-selected',n);
   document.getElementById('t-sched').setAttribute('aria-selected',s);
   document.getElementById('t-links').setAttribute('aria-selected',l);
+  document.getElementById('t-events').setAttribute('aria-selected',e);
   if(s&&!SCHED)loadSched();
+  if(l)loadLinks();
+  if(e)loadEvents();
+}
+const EVENT_LABELS = {
+  extend: 'Extended recording', trim: 'Trimmed recording (game ended)',
+  stall_detected: 'Stall detected', stall_self_recovered: 'Stall self-recovered (no action needed)',
+  restore_triggered: 'Auto-restore triggered', stitch_completed: 'Files stitched together',
+  stitch_failed: 'Stitch failed', segment_cleanup: 'Archived segments cleaned up',
+};
+async function loadEvents(){
+  const el=document.getElementById('events-body');
+  el.innerHTML='<div class="empty">loading…</div>';
+  let events;
+  try{events=await (await fetch('/api/automation-events')).json()}
+  catch(e){el.innerHTML='<div class="err">could not load automation events</div>';return}
+  if(!events.length){el.innerHTML='<div class="empty">no automation events logged yet</div>';return}
+  el.innerHTML=`<div class="card"><h2>Recent automation activity</h2>${events.map(ev=>{
+    const label=EVENT_LABELS[ev.event]||ev.event;
+    const dry=ev.dry_run?'<span class="tag">DRY-RUN</span> ':'';
+    const okBadge=ev.success===true?'<span class="tag" style="color:var(--ok)">OK</span>'
+      :ev.success===false?'<span class="tag" style="color:var(--live)">FAILED</span>':'';
+    const skip=new Set(['ts','event','name','timer_id','dry_run','success']);
+    const detail=Object.entries(ev).filter(([k])=>!skip.has(k))
+      .map(([k,v])=>`${esc(k)}: ${esc(JSON.stringify(v))}`).join(' · ');
+    return `<div class="row"><div class="what">
+      <div>${dry}<b>${esc(label)}</b> ${okBadge} — ${esc(ev.name||'')}</div>
+      <span class="tag">${fD(ev.ts)}</span>
+      ${detail?`<div class="tag" style="display:block;margin-top:4px">${detail}</div>`:''}
+    </div></div>`;
+  }).join('')}</div>`;
+}
+async function loadLinks(){
+  const el=document.getElementById('links-body');
+  el.innerHTML='<div class="empty">checking links…</div>';
+  let links;
+  try{links=await (await fetch('/api/links')).json()}
+  catch(e){el.innerHTML='<div class="err">could not check links</div>';return}
+  const groups={};
+  for(const lk of links)(groups[lk.group]=groups[lk.group]||[]).push(lk);
+  el.innerHTML=Object.entries(groups).map(([g,items])=>`
+    <div class="card">
+      <h2>${esc(g)}</h2>
+      ${items.map(lk=>`<div class="row"><div class="what">
+        <div class="link-row">
+          <span class="dot" style="background:var(${lk.up?'--ok':'--live'})" title="${
+            lk.up?'reachable from the server just now':'unreachable from the server just now'}"></span>
+          <a href="${esc(lk.url)}" target="_blank" rel="noopener"><b>${esc(lk.label)}</b></a>
+        </div>
+        <span class="tag">${esc(lk.url)}</span>
+      </div></div>`).join('')}
+    </div>`).join('');
 }
 async function load(){
   let d;try{d=await (await fetch('/api/status')).json()}catch(e){
@@ -573,18 +1110,36 @@ async function loadSched(){
 }
 function pick(t){TEAM=t;document.querySelectorAll('#filter button')
   .forEach(b=>b.setAttribute('aria-pressed',b.textContent===t));render()}
+let showPast=false;
+function togglePast(){showPast=!showPast;render()}
 function render(){
   const now=new Date(SCHED.now);
   const gs=SCHED.games.filter(g=>TEAM==='All'||g.team===TEAM);
   if(!gs.length){document.getElementById('sched').innerHTML=
     '<div class="empty">No games listed. ESPN publishes schedules closer to the season.</div>';return}
-  let html='',month='';
-  for(const g of gs){
-    const d=new Date(g.start);
-    const m=d.toLocaleString([], {month:'long',year:'numeric'});
-    if(m!==month){month=m;html+=`<div class="month">${m}</div>`}
-    html+=row(g,d<now);
+  const past=gs.filter(g=>new Date(g.start)<now);
+  const upcoming=gs.filter(g=>new Date(g.start)>=now);
+  let html='';
+  if(past.length){
+    html+=`<button class="act" style="margin-bottom:12px" onclick="togglePast()">${
+      showPast?'Hide':'Show'} ${past.length} past game${past.length===1?'':'s'}</button>`;
+    if(showPast){
+      let month='';
+      for(const g of past){
+        const m=new Date(g.start).toLocaleString([], {month:'long',year:'numeric'});
+        if(m!==month){month=m;html+=`<div class="month">${m}</div>`}
+        html+=row(g,true);
+      }
+    }
   }
+  let month='';
+  for(const g of upcoming){
+    const m=new Date(g.start).toLocaleString([], {month:'long',year:'numeric'});
+    if(m!==month){month=m;html+=`<div class="month">${m}</div>`}
+    html+=row(g,false);
+  }
+  if(!upcoming.length&&!(showPast&&past.length))
+    html+='<div class="empty">No upcoming games. Tap above to see past ones.</div>';
   document.getElementById('sched').innerHTML=html;
 }
 async function ov(h){
@@ -596,6 +1151,11 @@ async function ov(h){
       ', so the nightly check ran again — the server will shut down shortly '+
       'unless a recording is due.',true);
   }
+  load();
+}
+async function keepAwakeTonight(){
+  await fetch('/api/override',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({untilShutdown:true})});
   load();
 }
 let armed=false, SD=null;
@@ -630,7 +1190,8 @@ async function sd(force){
   note('Shutting down in about a minute. This page will stop responding.',true);
   b.disabled=true;b.textContent='Shutting down…';
 }
-load();setInterval(load,60000);
+function loadAll(){load();loadSportsConfig()}
+loadAll();setInterval(loadAll,60000);
 </script></body></html>"""
 
 
@@ -692,6 +1253,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(status)
         elif self.path.startswith("/api/schedule"):
             self._json(schedule)
+        elif self.path.startswith("/api/sports-config"):
+            self._json(lambda: load_json_config(SPORTS_CONFIG, DEFAULT_SPORTS_CONFIG))
+        elif self.path.startswith("/api/links"):
+            self._json(links_status)
+        elif self.path.startswith("/api/automation-events"):
+            self._json(automation_events)
         elif self.path in ("/", "/index.html"):
             self._send(200, PAGE.encode(), "text/html; charset=utf-8")
         else:
@@ -708,26 +1275,144 @@ class Handler(BaseHTTPRequestHandler):
             return self._override()
         if self.path == "/api/shutdown":
             return self._shutdown()
+        if self.path == "/api/sports-config":
+            return self._toggle_config(SPORTS_CONFIG, DEFAULT_SPORTS_CONFIG, key_param="team")
+        if self.path == "/api/record-game":
+            return self._record_game()
         self._send(404, b"not found", "text/plain")
+
+    def _toggle_config(self, path: Path, defaults: dict, key_param: str = "item"):
+        try:
+            body = self._body()
+        except Exception:
+            return self._send(400, b'{"error":"invalid JSON"}', "application/json")
+
+        item_key = body.get(key_param)
+        enabled = body.get("enabled")
+        if not isinstance(item_key, str) or not isinstance(enabled, bool):
+            return self._send(400, b'{"error":"bad request"}', "application/json")
+
+        cfg = load_json_config(path, defaults)
+        if item_key not in cfg:
+            return self._send(400, b'{"error":"unknown item"}', "application/json")
+
+        cfg[item_key] = enabled
+        save_json_config(path, cfg)
+        self._send(200, json.dumps({"ok": True, "config": cfg}).encode(), "application/json")
+
+    def _record_game(self):
+        try:
+            body = self._body()
+        except Exception:
+            return self._send(400, b'{"error":"invalid JSON"}', "application/json")
+
+        team = body.get("team")
+        event_id = body.get("id")
+        start_str = body.get("start")
+        dry_run_req = bool(body.get("dryRun")) or bool(os.environ.get("DVR_DRY_RUN"))
+
+        if not team or (not event_id and not start_str):
+            return self._send(400, b'{"error":"missing game identity (team and id or start required)"}', "application/json")
+
+        now = datetime.now(LOCAL)
+        games = all_games(now)
+        target_game = None
+
+        for g in games:
+            if g["team"] == team:
+                if event_id and str(g.get("id")) == str(event_id):
+                    target_game = g
+                    break
+                if start_str and g["start"] == start_str:
+                    target_game = g
+                    break
+
+        if not target_game:
+            kind = body.get("kind") or "baseball"
+            try:
+                s_dt = datetime.fromisoformat(start_str) if start_str else now
+            except ValueError:
+                return self._send(400, b'{"error":"invalid start time format"}', "application/json")
+            e_str = body.get("end")
+            try:
+                e_dt = datetime.fromisoformat(e_str) if e_str else s_dt + DURATION.get(kind, timedelta(hours=3))
+            except ValueError:
+                e_dt = s_dt + DURATION.get(kind, timedelta(hours=3))
+
+            target_game = {
+                "id": str(event_id or ""),
+                "team": team,
+                "kind": kind,
+                "name": body.get("name") or f"{team} Game",
+                "start": s_dt.isoformat(),
+                "end": e_dt.isoformat(),
+                "broadcasts": body.get("broadcasts") or [],
+            }
+
+        jf_channels = get_jellyfin_channels()
+        cid, cname = resolve_channel_id(target_game, jf_channels)
+        if not cid:
+            return self._send(422, json.dumps({
+                "ok": False,
+                "error": f"Cannot resolve channel for {target_game['name']} ({cname})"
+            }).encode(), "application/json")
+
+        try:
+            start_dt = datetime.fromisoformat(target_game["start"])
+            end_dt = datetime.fromisoformat(target_game["end"])
+        except ValueError:
+            return self._send(400, b'{"error":"invalid game start/end datetimes"}', "application/json")
+
+        t_start = start_dt - timedelta(minutes=5)
+        t_end = end_dt + timedelta(minutes=15)
+
+        existing_timers = get_existing_timers()
+        if is_overlapping_timer(cid, t_start, t_end, existing_timers):
+            return self._send(409, json.dumps({
+                "ok": False,
+                "error": f"An overlapping timer already exists on {cname} for {target_game['name']}"
+            }).encode(), "application/json")
+
+        ok, msg, payload = schedule_game_timer(target_game, cid, cname, dry_run=dry_run_req)
+        if ok:
+            with _lock:
+                _sched["at"] = None
+            return self._send(200, json.dumps({
+                "ok": True,
+                "message": f"Timer created for {target_game['name']} on {cname}",
+                "channel": cname,
+                "dryRun": dry_run_req,
+                "payload": payload
+            }).encode(), "application/json")
+        else:
+            return self._send(500, json.dumps({
+                "ok": False,
+                "error": f"Failed to create timer: {msg}"
+            }).encode(), "application/json")
 
     def _override(self):
         try:
-            hours = float(self._body().get("hours", 0))
+            body = self._body()
+            hours = float(body.get("hours", 0))
+            until_shutdown = bool(body.get("untilShutdown"))
         except (ValueError, TypeError):
             return self._send(400, b'{"error":"bad request"}', "application/json")
         OVERRIDE.parent.mkdir(parents=True, exist_ok=True)
         now = datetime.now(LOCAL)
+        if until_shutdown:
+            cutoff = keep_awake_cutoff(now)
+            OVERRIDE.write_text(cutoff.isoformat())
+            return self._send(200, json.dumps(
+                {"ok": True, "until": cutoff.isoformat()}).encode(), "application/json")
         if hours > 0:
             OVERRIDE.write_text((now + timedelta(hours=min(hours, 24))).isoformat())
             return self._send(200, json.dumps({"ok": True}).encode(),
                               "application/json")
 
         OVERRIDE.unlink(missing_ok=True)
-        # Cancelling after the nightly check has already run would otherwise do
-        # nothing until tomorrow -- the timer fired hours ago. Re-run the guard
-        # so "cancel" means what it looks like it means.
         rechecked = False
-        if now.time() >= SHUTDOWN_AT:
+        cutoff, _ = todays_power_off(now)
+        if now >= cutoff - SHUTDOWN_BUFFER:
             subprocess.Popen(["/usr/local/bin/dvr-clean-shutdown"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             rechecked = True
