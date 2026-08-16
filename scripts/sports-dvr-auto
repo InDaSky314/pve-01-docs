@@ -26,6 +26,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -557,6 +558,128 @@ def extend_active_timer(timer: dict[str, Any], new_end: datetime, dry_run: bool 
         return True
     logging.error("  [FAILED] Could not extend timer %s", tid)
     return False
+
+
+def check_uncategorized_timers(dry_run: bool = True) -> None:
+    """Backfill ProgramId on 'New' timers created before a matching EPG
+    program existed yet (a game scheduled further out than the provider's
+    EPG lookahead window -- confirmed real 2026-08-16, the Packers/Broncos
+    game 6 days out had zero EPG data for that date at scheduling time).
+    Runs every cycle; each pass retries, since EPG data fills in day by day
+    as the game approaches.
+
+    Root-caused 2026-08-16: Jellyfin's timer-update endpoint
+    (POST /LiveTv/Timers/{id}) returns 204 but does NOT actually persist a
+    newly-added ProgramId -- confirmed via a real throwaway timer (create
+    without ProgramId, POST an update with it added, re-GET showed
+    ProgramId still None). Update-in-place does not work; the only way to
+    backfill categorization is cancel + recreate.
+
+    Safety ordering matters here and is deliberately the OPPOSITE of
+    trigger_auto_restore's cancel-first pattern: that function is rescuing
+    an already-broken stalled recording, so cancelling first costs nothing
+    if the recreate then fails. Here the original timer is working fine --
+    cancelling it first for a purely cosmetic categorization improvement,
+    then failing to recreate it, would turn a working scheduled recording
+    into a missed one. So: create the new ProgramId-linked timer FIRST, and
+    only cancel the original if that succeeds. Worst case is a brief moment
+    where two timer objects exist for the same slot -- harmless, since
+    neither is "InProgress" yet (both New), so there's no real tuner
+    contention, only Status=InProgress recordings actually hold a tuner. If
+    creation fails for any reason (including Jellyfin rejecting the
+    would-be overlap), the original timer is left completely untouched and
+    this is retried next cycle."""
+    logging.info("=== Checking for uncategorized timers (ProgramId backfill) ===")
+    timers = get_existing_timers()
+    if not timers:
+        return
+
+    for t in timers:
+        if t.get("Status") != "New":
+            continue  # never touch InProgress/Completed/Cancelled timers
+        if t.get("ProgramId"):
+            continue  # already linked, nothing to do
+        tid = t.get("Id")
+        cid = t.get("ChannelId")
+        name = t.get("Name", "timer")
+        if not tid or not cid:
+            continue
+        try:
+            t_start = datetime.fromisoformat(str(t["StartDate"]).replace("Z", "+00:00"))
+        except (KeyError, ValueError, TypeError, AttributeError):
+            continue
+
+        # Bug found by Agy's review, 2026-08-16: t_start includes this
+        # timer's own pre-padding (typically -5 min). Feeding that straight
+        # into containment matching (p_start <= target < p_end) can land
+        # inside an EARLIER program's window -- e.g. a pregame show ending
+        # right around the real game's start -- and match the wrong
+        # program. Add the padding back so matching uses the real game
+        # start, not the padded recording-window start.
+        prepad = t.get("PrePaddingSeconds") or 0
+        nominal_start = t_start + timedelta(seconds=prepad)
+
+        program_id = find_matching_program_id(cid, nominal_start)
+        if not program_id:
+            continue  # still no EPG match yet -- try again next cycle
+
+        # Second bug found by Agy's review: if CREATE succeeds below but the
+        # DELETE of the original then fails, the original timer is left
+        # behind still lacking ProgramId -- every subsequent 5-minute cycle
+        # would find it again and create ANOTHER replacement, forever. This
+        # dedup guard checks whether a timer already linked to this exact
+        # ProgramId exists (i.e. a previous cycle's create already
+        # succeeded, only the cleanup delete is outstanding) before
+        # creating a new one -- in that case just retry the delete instead.
+        already_recreated = next(
+            (ot for ot in timers if ot.get("Id") != tid and ot.get("ProgramId") == program_id), None)
+
+        logging.info("[RECATEGORIZE] EPG data now available for previously-uncategorized "
+                     "timer '%s' -- ProgramId %s", name, program_id)
+        if dry_run:
+            action = "retry cancelling the original (a replacement already exists)" \
+                if already_recreated else \
+                "create a replacement timer with ProgramId, then cancel the original only if that succeeds"
+            logging.info("  [DRY-RUN] Would %s", action)
+            continue
+
+        if not already_recreated:
+            new_payload = dict(t)
+            new_payload["ProgramId"] = program_id
+            new_payload.pop("Id", None)          # let Jellyfin assign a fresh Id
+            new_payload.pop("ExternalId", None)  # tuner-assigned, not ours to set
+
+            create_res = jf_request("/emby/LiveTv/Timers", data=new_payload, method="POST")
+            if create_res is None:
+                logging.warning("  [SKIP] Could not create replacement timer for '%s' -- "
+                                "original left untouched, will retry next cycle", name)
+                continue
+
+        # Retry the cleanup delete a few times before giving up -- a
+        # transient failure here (vs. a hard, repeated one) shouldn't need
+        # a full extra 5-minute cycle (and the dedup guard above) to clear.
+        cancel_res = None
+        for attempt in range(3):
+            cancel_res = jf_request(f"/emby/LiveTv/Timers/{tid}", method="DELETE")
+            if cancel_res is not None:
+                break
+            time.sleep(2)
+
+        if cancel_res is not None:
+            log_event("recategorized", tid, name, {"program_id": program_id}, dry_run=dry_run)
+            logging.info("  [SUCCESS] Recreated '%s' with ProgramId %s, cancelled original", name, program_id)
+        else:
+            # Recreate succeeded (this cycle or a previous one) but
+            # cancelling the old one still failed after retries -- TWO
+            # timers now exist for the same game. Not a lost recording (the
+            # worst-case outcome this function is designed to avoid), and
+            # the dedup guard above prevents this from spiraling into more
+            # than one duplicate -- but it does need a human or a future
+            # cycle's retry to actually clean up. Log loudly rather than
+            # silently leaving it.
+            logging.error("  [PARTIAL] Replacement for '%s' exists but could not cancel "
+                          "original timer %s after 3 attempts -- BOTH NOW EXIST, will retry "
+                          "the cancel next cycle", name, tid)
 
 
 def run_auto_scheduler(dry_run: bool = True) -> None:
@@ -1261,69 +1384,84 @@ def check_stalled_recordings(dry_run: bool = True) -> None:
             "minutes_left_scheduled": round(minutes_left, 1), "file_path": path,
         }, dry_run=dry_run)
 
+        # Bug found 2026-08-16 (real incident: a live Brewers/Dodgers game
+        # sat genuinely dead for ~18 minutes with no further recovery
+        # attempt): STALL_ALERT_COOLDOWN was ORIGINALLY meant only to stop
+        # re-mailing the same stall every 5-minute cycle (see its comment).
+        # But the restore-trigger logic lived inside the same
+        # `if not already_alerted:` block, so once the first stall's email
+        # fired, EVERY later cycle -- including ones where the just-tried
+        # restore had failed or gone unconfirmed -- skipped re-attempting
+        # recovery too, for the full 3-hour window. These are two genuinely
+        # different concerns (don't spam email vs. keep trying to fix it)
+        # that got coupled by accident, not by design. Split them: restore
+        # attempts now run every cycle a stall is seen, gated only by
+        # whether a restore for this timer is already known-active
+        # (unchanged, existing_restore status check below) -- never by the
+        # email cooldown. Only the email send itself stays cooldown-gated.
         already_alerted = bool(alerted_at) and (
             now - datetime.fromisoformat(alerted_at) < STALL_ALERT_COOLDOWN)
-        if not already_alerted:
-            # Trigger Auto-restore
-            restore_note = ""
-            existing_restore = restore_state.get(tid)
-            if existing_restore and existing_restore.get("status") in ("restoring", "completed", "stitched"):
-                restore_note = f"Auto-restore status: Replacement recording already active or completed (Timer ID: {existing_restore.get('restore_timer_id')})."
-            else:
-                # Race condition check: re-stat original file right before triggering cancel/restore
-                latest_size = recording_file_size(path)
-                if latest_size is not None and (latest_size - size >= STALL_MIN_GROWTH_BYTES or latest_size - prev.get("size", size) >= STALL_MIN_GROWTH_BYTES):
-                    logging.info("Original recording '%s' recovered before restore was triggered (size grew from %d to %d bytes); skipping cancel/restore.", name, size, latest_size)
-                    log_event("stall_self_recovered", tid, name, {
-                        "size_before": size, "size_after": latest_size,
-                    }, dry_run=dry_run)
-                    state[tid] = {"size": latest_size, "checked_at": now.isoformat(), "alerted_at": None}
-                    continue
 
-                success, details, restore_tid, cancel_ok = trigger_auto_restore(t, dry_run=dry_run)
-                log_event("restore_triggered", tid, name, {
-                    "success": success, "details": details,
-                    "restore_timer_id": restore_tid, "cancel_original_success": cancel_ok,
+        restore_note = ""
+        existing_restore = restore_state.get(tid)
+        if existing_restore and existing_restore.get("status") in ("restoring", "completed", "stitched"):
+            restore_note = f"Auto-restore status: Replacement recording already active or completed (Timer ID: {existing_restore.get('restore_timer_id')})."
+        else:
+            # Race condition check: re-stat original file right before triggering cancel/restore
+            latest_size = recording_file_size(path)
+            if latest_size is not None and (latest_size - size >= STALL_MIN_GROWTH_BYTES or latest_size - prev.get("size", size) >= STALL_MIN_GROWTH_BYTES):
+                logging.info("Original recording '%s' recovered before restore was triggered (size grew from %d to %d bytes); skipping cancel/restore.", name, size, latest_size)
+                log_event("stall_self_recovered", tid, name, {
+                    "size_before": size, "size_after": latest_size,
                 }, dry_run=dry_run)
-                if success:
-                    if dry_run:
-                        restore_note = f"Auto-restore status: {details}."
-                    else:
-                        restore_note = f"Auto-restore status: {details}."
-                        restore_state[tid] = {
-                            "original_timer_id": tid,
-                            "original_file_path": path,
-                            "original_name": name,
-                            "original_end_date": t.get("EndDate"),
-                            "channel_id": t.get("ChannelId"),
-                            "cancel_original_success": cancel_ok,
-                            "restore_timer_id": restore_tid,
-                            "restore_file_path": None,
-                            "status": "restoring",
-                            "restored_at": now.isoformat(),
-                            "stitched_file_path": None,
-                            "error": None if cancel_ok else details,
-                        }
-                        save_restore_state(restore_state)
-                else:
-                    restore_note = f"Auto-restore status: Failed to start replacement recording ({details})."
-                    if not dry_run:
-                        restore_state[tid] = {
-                            "original_timer_id": tid,
-                            "original_file_path": path,
-                            "original_name": name,
-                            "original_end_date": t.get("EndDate"),
-                            "channel_id": t.get("ChannelId"),
-                            "cancel_original_success": cancel_ok,
-                            "restore_timer_id": None,
-                            "restore_file_path": None,
-                            "status": "failed_restore_creation",
-                            "restored_at": now.isoformat(),
-                            "stitched_file_path": None,
-                            "error": details,
-                        }
-                        save_restore_state(restore_state)
+                state[tid] = {"size": latest_size, "checked_at": now.isoformat(), "alerted_at": None}
+                continue
 
+            success, details, restore_tid, cancel_ok = trigger_auto_restore(t, dry_run=dry_run)
+            log_event("restore_triggered", tid, name, {
+                "success": success, "details": details,
+                "restore_timer_id": restore_tid, "cancel_original_success": cancel_ok,
+            }, dry_run=dry_run)
+            if success:
+                if dry_run:
+                    restore_note = f"Auto-restore status: {details}."
+                else:
+                    restore_note = f"Auto-restore status: {details}."
+                    restore_state[tid] = {
+                        "original_timer_id": tid,
+                        "original_file_path": path,
+                        "original_name": name,
+                        "original_end_date": t.get("EndDate"),
+                        "channel_id": t.get("ChannelId"),
+                        "cancel_original_success": cancel_ok,
+                        "restore_timer_id": restore_tid,
+                        "restore_file_path": None,
+                        "status": "restoring",
+                        "restored_at": now.isoformat(),
+                        "stitched_file_path": None,
+                        "error": None if cancel_ok else details,
+                    }
+                    save_restore_state(restore_state)
+            else:
+                restore_note = f"Auto-restore status: Failed to start replacement recording ({details})."
+                if not dry_run:
+                    restore_state[tid] = {
+                        "original_timer_id": tid,
+                        "original_file_path": path,
+                        "original_name": name,
+                        "original_end_date": t.get("EndDate"),
+                        "channel_id": t.get("ChannelId"),
+                        "cancel_original_success": cancel_ok,
+                        "restore_timer_id": None,
+                        "restore_file_path": None,
+                        "status": "failed_restore_creation",
+                        "restored_at": now.isoformat(),
+                        "stitched_file_path": None,
+                        "error": details,
+                    }
+                    save_restore_state(restore_state)
+
+        if not already_alerted:
             concurrency_note = check_concurrent_stream(t.get("ChannelId", ""))
             full_msg = f"{msg}\n\n{restore_note}\n\n{concurrency_note}"
             if dry_run:
@@ -1331,6 +1469,9 @@ def check_stalled_recordings(dry_run: bool = True) -> None:
             else:
                 notify(f"DVR: recording may have stalled -- {name}", [full_msg])
             state[tid]["alerted_at"] = now.isoformat()
+        else:
+            logging.info("  [SUPPRESSED] Stall email for '%s' suppressed (cooldown), but "
+                        "restore was still attempted: %s", name, restore_note)
 
     if api_timers is not None or disk_timers is not None:
         for tid in list(state.keys()):
@@ -1765,6 +1906,8 @@ def main() -> None:
                         help="Run the restore stitching check only")
     parser.add_argument("--cleanup-only", action="store_true",
                         help="Run the archived-segment cleanup check only")
+    parser.add_argument("--recategorize-only", action="store_true",
+                        help="Run the uncategorized-timer ProgramId backfill check only")
     parser.add_argument("--history", type=int, nargs="?", const=30, default=None, metavar="N",
                         help="Print the last N automation events (default 30) and exit -- "
                              "did extend/trim/stall/restore/stitch actually fire, and when.")
@@ -1788,12 +1931,15 @@ def main() -> None:
         check_restore_stitching(dry_run=dry_run)
     elif args.cleanup_only:
         check_archived_segment_cleanup(dry_run=dry_run)
+    elif args.recategorize_only:
+        check_uncategorized_timers(dry_run=dry_run)
     else:
         run_auto_scheduler(dry_run=dry_run)
         run_live_extender(dry_run=dry_run)
         check_stalled_recordings(dry_run=dry_run)
         check_restore_stitching(dry_run=dry_run)
         check_archived_segment_cleanup(dry_run=dry_run)
+        check_uncategorized_timers(dry_run=dry_run)
 
 
 if __name__ == "__main__":
