@@ -453,28 +453,68 @@ def is_overlapping_timer(channel_id: str, start: datetime, end: datetime, existi
     return False
 
 
+def find_matching_program_id(channel_id: str, game_start: datetime) -> str | None:
+    """Look up the real EPG Program for a game on this channel, matching by
+    start-time proximity (within 30 min). Returns the Program's Id, or None
+    if nothing close enough is found.
+
+    Root-caused 2026-08-16 (Agy independently traced Jellyfin's own server
+    source -- TimerInfoDto.cs, TimerInfo.cs, DefaultLiveTvService.cs,
+    RecordingsManager.cs -- see
+    agy-reports/20260816T190057Z-timerdto-investigation.md): "IsSports" is
+    NOT a writable field on the timer-creation DTO at all. It's a read-only
+    computed property on the server (`Tags.Contains("Sports")`), and Tags
+    only ever gets populated by copying it from a linked EPG Program --
+    either via an explicit ProgramId on timer creation, or Jellyfin's own
+    fallback (a +/-3 minute search around the timer's StartDate, which our
+    own -5min pre-padding offset broke anyway). The "IsSports": True field
+    this project sent for months (fixed here 2026-08-13, believed working,
+    actually a silent no-op the whole time -- confirmed via direct
+    inspection of a real one-off timer tonight, on-disk IsSports stayed
+    false despite the field being sent) never did anything. The only real
+    fix is linking to the actual Program via ProgramId."""
+    # Two match modes, both needed (Agy's review caught the gap, 2026-08-16):
+    # proximity to p_start handles normal pre-scheduling (the game's real
+    # start may be a few minutes off from ESPN's own listed time), but a
+    # restore triggered hours into a game needs containment matching
+    # (p_start <= target < p_end) instead -- a restore's "start" is deep
+    # into the game, nowhere near the program's own StartDate.
+    programs = jf_request(f"/LiveTv/Programs?ChannelIds={channel_id}&HasAired=false")
+    if not programs:
+        return None
+    best_id, best_diff = None, None
+    for p in programs.get("Items", []):
+        try:
+            p_start = datetime.fromisoformat(str(p["StartDate"]).replace("Z", "+00:00"))
+            p_end = datetime.fromisoformat(str(p["EndDate"]).replace("Z", "+00:00"))
+        except (KeyError, ValueError, TypeError, AttributeError):
+            continue
+        if p_start <= game_start < p_end:
+            return p.get("Id")
+        diff = abs((p_start - game_start).total_seconds())
+        if diff <= 1800 and (best_diff is None or diff < best_diff):
+            best_id, best_diff = p.get("Id"), diff
+    return best_id
+
+
 def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str, dry_run: bool = True) -> bool:
     """Create a Jellyfin LiveTv timer for a game."""
     start_iso = (game["start"] - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
     end_iso = (game["end"] + timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
     name = f"{game['team']}: {game['name']}"
 
+    program_id = find_matching_program_id(channel_id, game["start"])
+    if program_id:
+        logging.info("[SCHEDULE] Matched EPG program %s for %s -- recording will be correctly categorized", program_id, name)
+    else:
+        logging.warning("[SCHEDULE] No matching EPG program found within 30 min for %s -- timer will still be created, but won't auto-categorize as Sports", name)
+
     logging.info("[SCHEDULE] Proposed timer: %s on %s (%s to %s)", name, channel_name, start_iso, end_iso)
 
     if dry_run:
-        logging.info("  [DRY-RUN] Would call POST /emby/LiveTv/Timers")
+        logging.info("  [DRY-RUN] Would call POST /emby/LiveTv/Timers%s", f" with ProgramId={program_id}" if program_id else "")
         return True
 
-    # Bug found + fixed 2026-08-13 (real incident: the Aug 12 evening
-    # Brewers @ Padres game -- a completely clean, single-segment recording
-    # with no restore chain involved at all -- still landed in "Other"
-    # instead of "Sports"). This is the ROOT of the categorization issue:
-    # trigger_auto_restore() got the same fix the night before, but THIS
-    # function is what creates the very first timer for every game,
-    # restored or not, and it never set IsSports either. Every sports
-    # recording this system has ever scheduled has been affected, not just
-    # ones that needed a restore -- that earlier fix only covered half the
-    # actual problem.
     payload = {
         "Type": "Timer",
         "ChannelId": channel_id,
@@ -485,8 +525,9 @@ def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str
         "EndDate": end_iso,
         "PrePaddingSeconds": 300,
         "PostPaddingSeconds": 1800,
-        "IsSports": True,
     }
+    if program_id:
+        payload["ProgramId"] = program_id
     res = jf_request("/emby/LiveTv/Timers", data=payload, method="POST")
     if res is not None:
         logging.info("  [SUCCESS] Timer created for %s", name)
@@ -679,9 +720,19 @@ def file_exists_on_ct105(recording_path: str) -> bool:
 
 
 def derive_stitched_path(orig_path: str) -> str:
-    """Derive the stitched output filename alongside original."""
+    """Derive the stitched output filename alongside original, forcing .mkv.
+
+    Root-caused 2026-08-16 (Agy independently re-verified, see
+    agy-reports/20260816T182014Z-dvr-dashboard-and-stitch-review.md): raw .ts
+    segments from a watchdog-force-cancelled recording carry PTS
+    discontinuities; concatenating them via -c copy into another .ts left
+    Jellyfin/ffprobe reading only ~14 min of a real 116.5-min combined
+    recording -- MPEG-TS has no container-level duration field, so even a
+    +genpts-cleaned .ts still misreports. Only switching to .mkv (which
+    carries a real EBML duration header) fixed it in testing -- confirmed
+    empirically against real segments, +genpts alone was not enough."""
     p = Path(orig_path)
-    return str(p.with_name(f"{p.stem} (stitched){p.suffix}"))
+    return str(p.with_name(f"{p.stem} (stitched).mkv"))
 
 
 # Added 2026-08-12 per owner request: after a chain stitches successfully,
@@ -945,13 +996,23 @@ def trigger_auto_restore(timer: dict[str, Any], dry_run: bool = True) -> tuple[b
             msg += f" (WARNING: original timer cancel failed: {cancel_msg})"
         return True, msg, "dry-run-restore-id", cancel_ok
 
-    # Bug found + fixed 2026-08-12 (real incident: the Aug 12 Brewers @
-    # Padres restore chain landed in the "Other" library folder instead of
-    # "Sports"). This payload never carried IsSports/IsMovie/genre/priority
-    # from the original timer, so Jellyfin had nothing to categorize the
-    # restore recording by and defaulted it into a generic bucket. Copy the
-    # categorization fields straight from the original timer so a restored
-    # recording gets filed the same way the original would have.
+    # Bug found + fixed 2026-08-12, corrected 2026-08-16: the original fix
+    # here copied IsSports/IsMovie/IsKids/IsNews/IsSeries/Genres from the
+    # timer being restored, believing those were real, settable fields.
+    # Agy's source trace (agy-reports/20260816T190057Z-timerdto-
+    # investigation.md) found none of them exist on the timer-creation DTO
+    # at all -- they're silently discarded by Jellyfin's deserializer. The
+    # only field that actually links a timer to its EPG program (and
+    # thereby gets it correctly categorized) is ProgramId, which IS a real,
+    # persisted field -- inherit that from the original timer instead. Falls
+    # back to a fresh lookup if the original somehow didn't have one either
+    # (e.g. it predates this fix), rather than giving up silently.
+    program_id = timer.get("ProgramId")
+    if not program_id:
+        try:
+            program_id = find_matching_program_id(cid, datetime.fromisoformat(start_iso.replace("Z", "+00:00")))
+        except ValueError:
+            program_id = None
     payload = {
         "Type": "Timer",
         "ChannelId": cid,
@@ -962,14 +1023,10 @@ def trigger_auto_restore(timer: dict[str, Any], dry_run: bool = True) -> tuple[b
         "EndDate": end_iso,
         "PrePaddingSeconds": 0,
         "PostPaddingSeconds": 0,
-        "IsSports": timer.get("IsSports", False),
-        "IsMovie": timer.get("IsMovie", False),
-        "IsKids": timer.get("IsKids", False),
-        "IsNews": timer.get("IsNews", False),
-        "IsSeries": timer.get("IsSeries", False),
-        "Genres": timer.get("Genres", []),
         "Priority": timer.get("Priority", 0),
     }
+    if program_id:
+        payload["ProgramId"] = program_id
 
     res = jf_request("/emby/LiveTv/Timers", data=payload, method="POST")
     if res is None:
@@ -1311,9 +1368,11 @@ def perform_ffmpeg_concat(segment_paths: list[str], stitched_path: str) -> tuple
             "/usr/sbin/pct", "exec", "105", "--",
             "docker", "exec", "jellyfin",
             "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-y",
+            "-fflags", "+genpts",
             "-f", "concat", "-safe", "0",
             "-i", tmp_list_container,
             "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
             stitched_path
         ]
         res_ffmpeg = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=600)
