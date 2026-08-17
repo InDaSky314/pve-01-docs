@@ -147,13 +147,20 @@ def modernise(old):
         return old
     if old in FULL_NAME_OVERRIDES:
         return FULL_NAME_OVERRIDES[old]
+    # Real bug found + verified 2026-08-17: KEEP_PREFIX used to get
+    # checked against `old` BEFORE stripping DROP_PREFIX, so an input
+    # like "US: Milwaukee: WTMJ HD" never matched KEEP_PREFIX at all
+    # (the string starts with "US:", not a city name) and silently lost
+    # its market tag entirely -- confirmed directly: old logic produced
+    # market="" for that exact input, rest="Milwaukee: WTMJ HD" (the
+    # city name stuck inside rest instead of being extracted). Stripping
+    # DROP_PREFIX first fixes it: market="Milwaukee: ", rest="WTMJ HD".
     market = ""
-    m = KEEP_PREFIX.match(old)
+    rest = DROP_PREFIX.sub("", old).strip()
+    m = KEEP_PREFIX.match(rest)
     if m:
-        market = old[:m.end()] + " "
-        rest = old[m.end():].strip()
-    else:
-        rest = DROP_PREFIX.sub("", old).strip()
+        market = rest[:m.end()] + " "
+        rest = rest[m.end():].strip()
     rest = DROP_PREFIX.sub("", rest).strip()
     rest = rest.lstrip(": ").strip()
 
