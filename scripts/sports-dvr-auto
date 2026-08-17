@@ -1517,21 +1517,151 @@ def check_stalled_recordings(dry_run: bool = True) -> None:
     save_stall_state(state)
 
 
+def file_exists_in_jellyfin_container(container_path: str) -> bool:
+    """Check if a file exists inside CT105's jellyfin DOCKER container's own
+    filesystem (e.g. a /tmp/... scratch file) -- NOT the same thing as
+    file_exists_on_ct105(), which only resolves paths under
+    /media/recordings (the bind mount) and always returns False for
+    anything else, /tmp included. Found this the hard way: the first draft
+    of preremux_segment_on_ct105 called file_exists_on_ct105() on its own
+    /tmp/preremux_*.mkv output and it unconditionally reported "not found"
+    even though ffmpeg had genuinely succeeded, because that function
+    silently returns False for any path outside /media/recordings rather
+    than erroring -- caught by testing this fix against the real Aug 16
+    chain before deploying, not by code review alone."""
+    try:
+        res = subprocess.run(
+            ["/usr/sbin/pct", "exec", "105", "--", "docker", "exec", "jellyfin", "test", "-f", container_path],
+            timeout=15, check=False,
+        )
+        return res.returncode == 0
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
+# A single stalled-segment fragment shouldn't plausibly run longer than
+# this -- generous headroom above any real single stretch between stalls,
+# but tight enough to reject the exact corruption class this fix targets
+# (the Aug 16 incident's segment 0 misreported as 15.2h/54,739s). Used only
+# as a sanity ceiling on the *pre-remux* result, not a real duration limit.
+PREREMUX_SANITY_MAX_SECONDS = 6 * 3600
+
+
+def preremux_segment_on_ct105(src_path: str, dst_path: str, timeout_sec: int = 90) -> tuple[bool, str]:
+    """Remux one raw segment through a real ffmpeg pass (+genpts, -c copy,
+    avoid_negative_ts make_zero) into a new file, inside CT105's jellyfin
+    container, then sanity-check the result's own probed duration before
+    trusting it. Returns (success, error).
+
+    Added 2026-08-17 after a real incident: the Aug 16 Brewers @ Dodgers
+    game's chain-of-8 stitch produced a 62,337s (17.3h) file for what was
+    actually a ~3h10m game. Isolated to segment 0 alone -- ffprobe reported
+    54,739s for a segment whose own mtime span (22:05:01-22:10:16) and file
+    size/bitrate both implied ~5m11s. This is corrupted/wrapped PTS *within*
+    one segment, not merely missing PTS -- `ffprobe -fflags +genpts` alone
+    does NOT fix it (confirmed: still reported 54,739s), because that flag
+    only affects ffprobe's own interpretation, not the file. Only an actual
+    ffmpeg remux pass (decode timestamps, rewrite) fixes it -- confirmed:
+    the same segment remuxed this way correctly reports 311.4s afterward.
+
+    perform_ffmpeg_concat's existing single `+genpts` on the *concat*
+    operation was never enough for this class of bug -- concat's genpts can
+    fill gaps between inputs, but can't repair a wrong PTS already baked
+    into one input. Each segment must be individually remuxed BEFORE
+    concatenation, mirroring the per-file pre-remux process-queue.py already
+    does for comskip's single-file case (see process-queue.py's own
+    +genpts input-remux step, same root cause, different pipeline).
+
+    Agy review (20260817T050939Z-concat-preremux-review.md, APPROVE WITH
+    REFINEMENTS) flagged: (1) the default timeout needed to fit inside
+    sports-dvr-auto.service's TimeoutStartSec budget -- lowered from 300s to
+    90s, comfortably above the ~5-15s/segment observed in testing, with
+    TimeoutStartSec itself also raised (see deploy notes) rather than
+    relying on this alone; (2) -c copy can fix *missing/negative* PTS but
+    can't always repair severe internal corruption, so the fix needs to
+    verify its own output rather than trust ffmpeg's exit code alone --
+    that's the duration check below, which would have caught the exact
+    Aug 16 corruption automatically instead of silently propagating a
+    17.3h file into the final concat."""
+    try:
+        cmd = [
+            "/usr/sbin/pct", "exec", "105", "--",
+            "docker", "exec", "jellyfin",
+            "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-y", "-v", "error",
+            "-fflags", "+genpts",
+            "-i", src_path,
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            dst_path
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+        if res.returncode != 0:
+            return False, f"pre-remux of {src_path} exited {res.returncode}: {res.stderr.strip()}"
+        if not file_exists_in_jellyfin_container(dst_path):
+            return False, f"pre-remux of {src_path} reported success but {dst_path} not found on disk"
+
+        probe_cmd = [
+            "/usr/sbin/pct", "exec", "105", "--",
+            "docker", "exec", "jellyfin",
+            "/usr/lib/jellyfin-ffmpeg/ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            dst_path
+        ]
+        res_probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+        try:
+            probed_dur = float(res_probe.stdout.strip())
+        except (ValueError, AttributeError):
+            return False, (f"pre-remux of {src_path} produced a file but its duration could not be "
+                            f"probed afterward ({res_probe.stdout.strip()!r}); refusing to trust it")
+        if probed_dur <= 0 or probed_dur > PREREMUX_SANITY_MAX_SECONDS:
+            return False, (f"pre-remux of {src_path} produced an implausible duration "
+                            f"({probed_dur:.1f}s, sanity ceiling {PREREMUX_SANITY_MAX_SECONDS}s) -- "
+                            f"the remux ran but didn't actually repair the corruption; this segment "
+                            f"needs manual attention, not automatic stitching")
+        return True, ""
+    except Exception as exc:                                  # noqa: BLE001
+        return False, str(exc)
+
+
 def perform_ffmpeg_concat(segment_paths: list[str], stitched_path: str) -> tuple[bool, str]:
     """Execute ffmpeg concat demuxer inside CT105's jellyfin container.
 
     Generalized 2026-08-12 from a fixed original+restore pair to an ordered
     list of N segments -- real incident that day showed a chain of 4
     restores (5 segments total) for one game, and the old 2-file-only
-    version could only ever stitch the first pair, never the full chain."""
+    version could only ever stitch the first pair, never the full chain.
+
+    Rewritten 2026-08-17 to pre-remux every segment individually (see
+    preremux_segment_on_ct105's docstring) before concatenating -- a single
+    +genpts at the concat level cannot repair a segment with corrupted
+    internal PTS, only fill gaps between otherwise-clean inputs."""
     if len(segment_paths) < 2:
         return False, f"need at least 2 segments to concat, got {len(segment_paths)}"
-    escaped = [p.replace("'", "'\\''") for p in segment_paths]
-    concat_content = "".join(f"file '{p}'\n" for p in escaped)
 
-    tmp_list_container = f"/tmp/concat_{int(datetime.now().timestamp())}.txt"
-
+    # time_ns() rather than a 1-second-resolution timestamp -- Agy's review
+    # flagged the collision risk as pre-existing/unchanged from the old
+    # tmp_list_container naming, but since this now writes N+1 temp files
+    # per run instead of 1, tightening it here is cheap and removes the
+    # question entirely rather than just leaving it "acceptable."
+    run_tag = time.time_ns()
+    # Pre-populate every expected temp path up front (not appended only on
+    # success) so a mid-chain failure still cleans up every file actually
+    # written, not just the ones before the failure. Agy's review caught
+    # that the original append-after-success version would leak the
+    # in-flight file for whichever segment failed (rm -f on a path that was
+    # never created is a harmless no-op, so pre-populating is safe).
+    remuxed_paths: list[str] = [f"/tmp/preremux_{run_tag}_{i}.mkv" for i in range(len(segment_paths))]
     try:
+        for i, src in enumerate(segment_paths):
+            ok, err = preremux_segment_on_ct105(src, remuxed_paths[i])
+            if not ok:
+                return False, f"pre-remux step failed on segment {i+1}/{len(segment_paths)}: {err}"
+
+        escaped = [p.replace("'", "'\\''") for p in remuxed_paths]
+        concat_content = "".join(f"file '{p}'\n" for p in escaped)
+        tmp_list_container = f"/tmp/concat_{run_tag}.txt"
+
         write_cmd = [
             "/usr/sbin/pct", "exec", "105", "--",
             "docker", "exec", "-i", "jellyfin",
@@ -1565,11 +1695,12 @@ def perform_ffmpeg_concat(segment_paths: list[str], stitched_path: str) -> tuple
         return False, str(exc)
 
     finally:
+        cleanup_targets = remuxed_paths + [f"/tmp/concat_{run_tag}.txt"]
         try:
             subprocess.run([
                 "/usr/sbin/pct", "exec", "105", "--",
                 "docker", "exec", "jellyfin",
-                "rm", "-f", tmp_list_container
+                "rm", "-f", *cleanup_targets
             ], timeout=15, check=False)
         except Exception:                                     # noqa: BLE001
             pass
