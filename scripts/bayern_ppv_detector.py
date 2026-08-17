@@ -47,7 +47,7 @@ BAYERN_PATTERNS = [
 ]
 
 FALSE_POSITIVES = re.compile(
-    r"\b(women|frauen|II|amateure|u19|u17|basketball|bbl|highlights|replay|magazine)\b",
+    r"\b(women|frauen|amateure|u19|u17|basketball|bbl|highlights|replay|magazine)\b|\b(?:FC\s+)?Bayern(?:\s+M[uü]nchen|\s+Munich)?\s+II\b",
     re.IGNORECASE
 )
 
@@ -67,8 +67,9 @@ def fetch_espn_bayern_schedule():
     now = datetime.now(timezone.utc)
     
     for league_code, league_name in ESPN_LEAGUES:
-        # Check current/upcoming seasons
-        for season in [2025, 2026]:
+        # Dynamically query past, current, and upcoming seasons
+        current_year = now.year
+        for season in [current_year - 1, current_year, current_year + 1]:
             url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_code}/teams/132/schedule?season={season}"
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
             try:
@@ -89,14 +90,16 @@ def fetch_espn_bayern_schedule():
                     
                     name = ev.get("name", "")
                     short_name = ev.get("shortName", "")
-                    comps = ev.get("competitions", [{}])[0]
+                    comps_list = ev.get("competitions", [])
+                    comps = comps_list[0] if comps_list else {}
                     competitors = comps.get("competitors", [])
                     
                     opponent = "Unknown"
                     is_home = True
                     for team_info in competitors:
                         tname = team_info.get("team", {}).get("displayName", "")
-                        if "Bayern" not in tname:
+                        tid = str(team_info.get("id") or team_info.get("team", {}).get("id", ""))
+                        if tid != "132" and "Bayern" not in tname:
                             opponent = tname
                         else:
                             is_home = team_info.get("homeAway") == "home"
@@ -125,12 +128,14 @@ def fetch_espn_bayern_schedule():
                 dt_str = ev.get("date")
                 kickoff = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
                 if kickoff >= now - timedelta(hours=3):
-                    comps = ev.get("competitions", [{}])[0]
+                    comps_list = ev.get("competitions", [])
+                    comps = comps_list[0] if comps_list else {}
                     competitors = comps.get("competitors", [])
                     opponent = "Unknown"
                     for team_info in competitors:
                         tname = team_info.get("team", {}).get("displayName", "")
-                        if "Bayern" not in tname:
+                        tid = str(team_info.get("id") or team_info.get("team", {}).get("id", ""))
+                        if tid != "132" and "Bayern" not in tname:
                             opponent = tname
                     fixtures.append({
                         "id": ev.get("id"),
@@ -158,7 +163,10 @@ def fetch_provider_ppv_streams(cat_id):
     req = urllib.request.Request(url, headers={"User-Agent": "MediaCoreSync/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
-            return json.load(r)
+            data = json.load(r)
+            if isinstance(data, list):
+                return data
+            return []
     except Exception as exc:
         print(f"Error fetching category {cat_id}: {exc}")
         return []
@@ -166,10 +174,10 @@ def fetch_provider_ppv_streams(cat_id):
 
 def extract_channel_slot(raw_name: str) -> str:
     """Extract channel slot label from stream title (e.g. 'US: DAZN PPV 36' or 'GB: DAZN PPV 34')."""
-    m = re.search(r"\|\s*([A-Z]{2}:\s*[A-Z0-9\s+]+)$", raw_name, re.IGNORECASE)
+    m = re.search(r"\|\s*([A-Z]{2}:\s*[^|]+)$", raw_name, re.IGNORECASE)
     if m:
         return m.group(1).strip()
-    m2 = re.search(r"\b([A-Z]{2}:\s*[A-Z0-9\s+]+)$", raw_name, re.IGNORECASE)
+    m2 = re.search(r"\b([A-Z]{2}:\s*[^|]+)$", raw_name, re.IGNORECASE)
     if m2:
         return m2.group(1).strip()
     return raw_name.strip()
@@ -221,13 +229,14 @@ def match_stream_generic(stream, cat_info, team_patterns, false_positives_patter
             except ValueError:
                 pass
                 
-    if raw_name.startswith("Live"):
+    raw_lower = raw_name.lower().strip()
+    if raw_lower.startswith("live"):
         score += 20
         match_reasons.append("Stream is currently LIVE (+20 pts)")
-    elif raw_name.startswith("Next"):
+    elif raw_lower.startswith(("next", "upcoming")):
         score += 10
         match_reasons.append("Stream is upcoming/NEXT (+10 pts)")
-    elif raw_name.startswith("End"):
+    elif raw_lower.startswith(("end", "ended")):
         score -= 80
         match_reasons.append("Stream has ENDED (-80 pts)")
 
