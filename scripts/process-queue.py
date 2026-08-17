@@ -232,7 +232,16 @@ def process_one(container_path):
     # on it rather than trusting the number blindly.
     file_bytes = os.path.getsize(host_path)
     bitrate_kbps = (file_bytes * 8) / (orig_dur * 1000)
-    if bitrate_kbps < 100 or bitrate_kbps > 50000:
+    # Ceiling raised 50000->100000 (2026-08-17): this same session's own
+    # Bayern Munich PPV investigation found the provider tags some DAZN
+    # PPV streams "8K EXCLUSIVE" -- genuine 8K content commonly runs
+    # 40-100+ Mbps depending on codec/motion, which the old 50Mbps ceiling
+    # could have incorrectly rejected as "corrupted" the first time any
+    # such stream actually got recorded and comskip-processed. Raising an
+    # upper sanity bound is low-risk either way: it can only prevent a
+    # false rejection, it can't newly accept something that was already
+    # broken under the old ceiling.
+    if bitrate_kbps < 100 or bitrate_kbps > 100000:
         log(f"ERROR (input duration sanity check failed: {orig_dur:.0f}s for "
             f"{file_bytes/1e6:.1f}MB, implied bitrate {bitrate_kbps:.0f} kbps): {rel}")
         shutil.rmtree(job_work, ignore_errors=True)
