@@ -453,6 +453,17 @@ def our_match_keys(disp, aliases=None):
         # shadow the real name-based match.
         if re.fullmatch(r"[WK][A-Z]{2,4}", alias.upper()):
             keys.append(("call", alias.upper()))
+        # Real bug found + fixed 2026-08-17 (verified by tracing both this
+        # function and ext_channel_keys directly): an alias value like
+        # "scraped.hgtv.us" hashed whole here, but ext_channel_keys()
+        # below strips the trailing country suffix from the external
+        # channel's own id before hashing its stem -- "scraped.hgtv.us"
+        # vs "scraped.hgtv" never matched. Added the same stripped form
+        # here too (purely additive -- the original full-alias key stays)
+        # so aliasing actually works for the scrapers this was built for.
+        alias_stem = re.sub(r"\.(us(_locals\d*|_sports\d*)?|uk|de)$", "", alias, flags=re.I)
+        if alias_stem != alias:
+            keys.append(("name", norm_key(alias_stem.replace(".", " "))))
         keys.append(("name", norm_key(alias)))
     m = re.search(r"\(([WK][A-Z]{3})[^)]*\)", disp.upper())  # call sign in ()
     if m:
@@ -482,6 +493,13 @@ def ext_channel_keys(chan_id, names):
     k = norm_key(stem.replace(".", " "))
     if k:
         keys.add(("name", k))
+    # Also index the raw (un-stripped) chan_id -- complements the
+    # alias_stem fix in our_match_keys() above so a match works whether
+    # the alias value in config.json was written with or without the
+    # trailing country suffix.
+    k_raw = norm_key(chan_id.replace(".", " "))
+    if k_raw:
+        keys.add(("name", k_raw))
     return keys
 
 
@@ -501,7 +519,21 @@ def merge_external_epg(out, cfg, needy):
             pending = {x: d for x, d in want.items() if x not in fed}
             if not pending:
                 break
-            fed |= _merge_one_source(out, url, pending, aliases)
+            # Real bug found + fixed 2026-08-17: one bad external source
+            # (timeout, HTTP 4xx/5xx, malformed XML -- any of which can
+            # legitimately happen to any one of 19+ external EPG URLs on
+            # any given night) used to propagate an uncaught exception
+            # all the way up through build_epg() and crash the ENTIRE
+            # sync -- playlist, EPG, VOD, series, and the Jellyfin
+            # refresh trigger never ran, not just that one source's data
+            # going missing. Isolate each source's failure instead.
+            try:
+                fed |= _merge_one_source(out, url, pending, aliases)
+            except Exception as exc:                          # noqa: BLE001
+                src_name = url.rsplit("/", 1)[-1]
+                print(f"WARNING: external epg {src_name} failed ({exc}) — continuing with remaining sources")
+                loki_alert.push("epg-sync", f'msg="external epg source failed" error="{exc}"',
+                                level="warn", source=src_name)
     return fed
 
 
@@ -992,9 +1024,18 @@ def _build_series_library(shows_dir, chosen, base, user, pw):
                 rel_nfo = f"{sdir}/{stem}.nfo"
                 keep_files.add(rel_nfo)
                 wrote += write_if_changed(show_dir / rel_nfo, nfo)
-        # per-show cleanup of episodes that vanished upstream
+        # per-show cleanup of episodes that vanished upstream. Restricted
+        # to .strm/.nfo (found in review, 2026-08-17): keep_files only
+        # ever tracks those two extensions, so the old blanket
+        # "delete anything not in keep_files" also wiped Jellyfin's own
+        # fetched artwork (poster/fanart/thumb) and any external .srt/.vtt
+        # subtitles sitting in the same show folder, every time a show's
+        # info genuinely changed upstream -- not permanently broken
+        # (Jellyfin re-fetches on its next scan) but a real, needless
+        # waste of bandwidth/TMDB calls and a temporary missing-artwork
+        # flicker on every real update.
         for f in show_dir.rglob("*"):
-            if f.is_file() and str(f.relative_to(show_dir)) not in keep_files:
+            if f.is_file() and f.suffix in (".strm", ".nfo") and str(f.relative_to(show_dir)) not in keep_files:
                 f.unlink()
 
     # prune guard: same rule as VOD — partial provider answers must never
