@@ -54,8 +54,16 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    """Save notification state history."""
+    """Save notification state history. Prunes entries older than 7 days
+    so this file doesn't grow unbounded across an alert running forever
+    on a 15-min timer (found in review, 2026-08-17)."""
     try:
+        now = datetime.now(timezone.utc).timestamp()
+        if "notified" in state and isinstance(state["notified"], dict):
+            state["notified"] = {
+                k: v for k, v in state["notified"].items()
+                if (now - v.get("timestamp", 0)) < 604800
+            }
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         tmp = STATE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, indent=2))
