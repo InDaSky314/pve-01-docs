@@ -1182,25 +1182,61 @@ def trigger_auto_restore(timer: dict[str, Any], dry_run: bool = True) -> tuple[b
     # collects every candidate and prefers the one with the most recent
     # StartDate, since the timer we actually just asked Jellyfin to create
     # is definitionally the newest one that can possibly match.
+    #
+    # Bug found 2026-08-17 (real incident: a Brewers/Dodgers game restored
+    # 7 times in one night, and the resulting restore_state chain came out
+    # split into disconnected fragments instead of one continuous 8-segment
+    # story): this fallback matched on `tm.get("Name") == restore_name`,
+    # i.e. exactly "{orig_name} (restored)". That assumption broke the
+    # moment ProgramId linking (added earlier the same night, for correct
+    # Sports categorization) entered the picture -- once a timer carries a
+    # ProgramId, Jellyfin renames it to the linked EPG Program's own
+    # official title, silently dropping the "(restored)" suffix entirely
+    # (confirmed directly: a manually-created restore that night showed up
+    # live as plain "Milwaukee Brewers at Los Angeles Dodgers", no
+    # suffix). So whenever the initial POST response came back ambiguous
+    # AND a ProgramId was set, this fallback could never find the real
+    # timer it just created -- it was searching for a name that no longer
+    # existed. Dropped the name filter entirely; ChannelId + very-recent
+    # StartDate is sufficient and doesn't depend on any naming assumption
+    # that a different code path can silently invalidate.
     if not restore_tid:
+        # Agy's review caught a real bug in an earlier draft here: a
+        # one-sided "StartDate >= now - 90s" check has no upper bound, so
+        # it would also match a genuinely different, unrelated timer
+        # scheduled for LATER on the same channel (e.g. tomorrow's game) --
+        # and sort(reverse=True) would then pick that wrong future timer
+        # over the real one. The window must be symmetric: close to "now"
+        # in EITHER direction, not just "not too far in the past".
         timers = get_existing_timers() or read_live_timers()
-        candidates = [tm for tm in (timers or [])
-                      if tm.get("Name") == restore_name
-                      and (tm.get("ChannelId") == cid or tm.get("ExternalChannelId") == cid)]
+        candidates = []
+        for tm in (timers or []):
+            if tm.get("ChannelId") != cid and tm.get("ExternalChannelId") != cid:
+                continue
+            try:
+                tm_start = datetime.fromisoformat(tm.get("StartDate", "").replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                continue
+            diff_sec = abs((tm_start - now).total_seconds())
+            if diff_sec <= 90:
+                candidates.append((tm, diff_sec))
         if candidates:
-            def _start_key(tm: dict[str, Any]) -> datetime:
-                try:
-                    return datetime.fromisoformat(tm.get("StartDate", "").replace("Z", "+00:00"))
-                except (ValueError, AttributeError):
-                    return datetime.min.replace(tzinfo=timezone.utc)
-            candidates.sort(key=_start_key, reverse=True)
-            restore_tid = candidates[0].get("Id")
+            # Secondary signal: if we sent a ProgramId, a candidate that
+            # actually carries it back is an exact match, immune to both
+            # naming AND near-simultaneous-timer ambiguity -- prefer it
+            # over pure time-proximity when available.
+            if program_id:
+                prog_matches = [c for c in candidates if c[0].get("ProgramId") == program_id]
+                if prog_matches:
+                    candidates = prog_matches
+            candidates.sort(key=lambda c: c[1])
+            restore_tid = candidates[0][0].get("Id")
             if len(candidates) > 1:
                 logging.warning(
-                    "[AUTO-RESTORE] %d timers matched name+channel for '%s' -- picked the most "
-                    "recently-started one (%s). Others: %s",
-                    len(candidates), restore_name, restore_tid,
-                    [c.get("Id") for c in candidates[1:]])
+                    "[AUTO-RESTORE] %d timers matched channel+recency for '%s' -- picked the "
+                    "closest to now (%s, diff=%.1fs). Others: %s",
+                    len(candidates), restore_name, restore_tid, candidates[0][1],
+                    [c[0].get("Id") for c in candidates[1:]])
 
     if restore_tid:
         logging.info("  [SUCCESS] Auto-restore timer created for '%s' (Id: %s)", restore_name, restore_tid)
