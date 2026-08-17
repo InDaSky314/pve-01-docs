@@ -483,7 +483,17 @@ def find_matching_program_id(channel_id: str, game_start: datetime) -> str | Non
     programs = jf_request(f"/LiveTv/Programs?ChannelIds={channel_id}&HasAired=false")
     if not programs:
         return None
+    # Real bug found + verified 2026-08-17 (mirrored from dvr-dashboard's
+    # identical copy of this function, same review): returning on the
+    # first containment hit made this order-dependent on whatever order
+    # the API returns programs in -- reproduced directly with a loose
+    # all-day placeholder block that CONTAINS game_start but happens to
+    # appear before the real, tighter proximity match. Now falls back to
+    # containment only when no proximity match exists at all (the real
+    # reason it was added: a mid-game restore lookup, where game_start is
+    # hours past every program's own start).
     best_id, best_diff = None, None
+    containment_id = None
     for p in programs.get("Items", []):
         try:
             p_start = datetime.fromisoformat(str(p["StartDate"]).replace("Z", "+00:00"))
@@ -491,11 +501,11 @@ def find_matching_program_id(channel_id: str, game_start: datetime) -> str | Non
         except (KeyError, ValueError, TypeError, AttributeError):
             continue
         if p_start <= game_start < p_end:
-            return p.get("Id")
+            containment_id = p.get("Id")
         diff = abs((p_start - game_start).total_seconds())
         if diff <= 1800 and (best_diff is None or diff < best_diff):
             best_id, best_diff = p.get("Id"), diff
-    return best_id
+    return best_id or containment_id
 
 
 def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str, dry_run: bool = True) -> bool:
@@ -537,13 +547,24 @@ def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str
     return False
 
 
-def extend_active_timer(timer: dict[str, Any], new_end: datetime, dry_run: bool = True) -> bool:
-    """Update EndDate of an existing timer in Jellyfin."""
+def extend_active_timer(timer: dict[str, Any], new_end: datetime, dry_run: bool = True,
+                        post_padding_seconds: int | None = None) -> bool:
+    """Update EndDate of an existing timer in Jellyfin.
+
+    post_padding_seconds: pass 0 when TRIMMING a timer for a game that's
+    already final (found in review, 2026-08-17) -- the timer's original
+    PostPaddingSeconds (typically 1800s/30min, meant to catch a live
+    game running long) survives a naive dict(timer) copy otherwise, so a
+    'trim to now+5min' would actually still record until now+5min+30min,
+    since Jellyfin adds padding on top of EndDate. Leave it None (keep
+    the original padding) for the EXTEND case, where the game is still
+    in progress and the padding is still exactly what you want."""
     tid = timer["Id"]
     new_end_iso = new_end.strftime("%Y-%m-%dT%H:%M:%SZ")
     timer_name = timer.get("Name", "Timer")
 
-    logging.info("[EXTEND] Extending timer %s (%s) to %s", timer_name, tid, new_end_iso)
+    logging.info("[EXTEND] Extending timer %s (%s) to %s%s", timer_name, tid, new_end_iso,
+                 f" (PostPadding: {post_padding_seconds}s)" if post_padding_seconds is not None else "")
 
     if dry_run:
         logging.info("  [DRY-RUN] Would call POST /emby/LiveTv/Timers/%s", tid)
@@ -551,6 +572,8 @@ def extend_active_timer(timer: dict[str, Any], new_end: datetime, dry_run: bool 
 
     updated_timer = dict(timer)
     updated_timer["EndDate"] = new_end_iso
+    if post_padding_seconds is not None:
+        updated_timer["PostPaddingSeconds"] = post_padding_seconds
 
     res = jf_request(f"/emby/LiveTv/Timers/{tid}", data=updated_timer, method="POST")
     if res is not None:
@@ -757,7 +780,7 @@ def run_live_extender(dry_run: bool = True) -> None:
                     new_end = now + timedelta(minutes=5)
                     logging.info("Game '%s' is FINAL (%s). Trimming remaining %.1f min timer.",
                                  game["name"], game["status_detail"], time_left)
-                    ok = extend_active_timer(timer, new_end, dry_run=dry_run)
+                    ok = extend_active_timer(timer, new_end, dry_run=dry_run, post_padding_seconds=0)
                     log_event("trim", timer.get("Id"), game["name"], {
                         "success": ok, "game_status": game["status_detail"],
                         "old_end": timer["EndDate"], "new_end": new_end.isoformat(),
@@ -890,12 +913,21 @@ def _unique_dest(real_dest: str) -> str:
 def archive_segments(segment_paths: list[str], root_path: str) -> tuple[list[str], list[str]]:
     """Move raw segments out of /media/recordings into SEGMENT_ARCHIVE_DIR.
 
-    root_path (segment_paths[0], where derive_stitched_path also puts the
-    combined output) is special: its folder must NOT be moved wholesale --
-    the stitched file lives right there and needs to stay put for Jellyfin
-    to see it. Only the root's own raw .ts (and matching .nfo, if any) get
-    moved as individual files; every other segment has its own dedicated
-    folder from its own restore attempt and is safe to move whole.
+    Rewritten 2026-08-17 (real bug found in review, verified before fixing):
+    the old version moved segment 2+ wholesale by parent FOLDER, on the
+    assumption that "every other segment has its own dedicated folder from
+    its own restore attempt." That assumption was true before today's
+    ProgramId-linking fix -- Jellyfin used to name a restored timer with a
+    "(restored)" suffix, giving it its own folder. ProgramId linking makes
+    Jellyfin rename the restored timer to the Program's own official title
+    instead, dropping that suffix -- so as of today, every segment in a
+    chain (root AND every restore) shares the SAME folder, which is also
+    exactly where derive_stitched_path() puts the combined output. Moving
+    that shared folder wholesale on a segment 2+ pass would have moved the
+    freshly-created stitched .mkv itself into the archive dir, right out of
+    the DVR library, on the very next real stall+restore+stitch cycle.
+    Fixed by always moving individual files (.ts + matching .nfo), the same
+    safe approach the old code already used correctly for the root case.
 
     Returns (archived_destination_paths, failed_source_paths)."""
     archived, failed = [], []
@@ -911,32 +943,20 @@ def archive_segments(segment_paths: list[str], root_path: str) -> tuple[list[str
             failed.append(p)
             continue
         try:
-            if p == root_path:
-                # Move just this file (+ its .nfo if present), not the folder.
-                real_src = _real_path(p)
-                real_dest = _unique_dest(f"{_real_path(SEGMENT_ARCHIVE_DIR)}/{Path(p).name}")
-                mv_res = subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "mv", real_src, real_dest],
-                                        capture_output=True, text=True, timeout=30, check=False)
-                if mv_res.returncode != 0:
-                    logging.error("archive_segments: mv failed for %s -> %s: %s", real_src, real_dest, mv_res.stderr)
-                    failed.append(p)
-                    continue
-                archived.append(real_dest)
-                nfo_src = str(Path(real_src).with_suffix(".nfo"))
-                if subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "test", "-f", nfo_src],
-                                  timeout=10, check=False).returncode == 0:
-                    subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "mv", nfo_src,
-                                   str(Path(real_dest).with_suffix(".nfo"))], timeout=15, check=False)
-            else:
-                real_folder = _real_path(str(Path(p).parent))
-                real_dest = _unique_dest(f"{_real_path(SEGMENT_ARCHIVE_DIR)}/{Path(real_folder).name}")
-                mv_res = subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "mv", real_folder, real_dest],
-                                        capture_output=True, text=True, timeout=30, check=False)
-                if mv_res.returncode == 0:
-                    archived.append(real_dest)
-                else:
-                    logging.error("archive_segments: mv failed for %s -> %s: %s", real_folder, real_dest, mv_res.stderr)
-                    failed.append(p)
+            real_src = _real_path(p)
+            real_dest = _unique_dest(f"{_real_path(SEGMENT_ARCHIVE_DIR)}/{Path(p).name}")
+            mv_res = subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "mv", real_src, real_dest],
+                                    capture_output=True, text=True, timeout=30, check=False)
+            if mv_res.returncode != 0:
+                logging.error("archive_segments: mv failed for %s -> %s: %s", real_src, real_dest, mv_res.stderr)
+                failed.append(p)
+                continue
+            archived.append(real_dest)
+            nfo_src = str(Path(real_src).with_suffix(".nfo"))
+            if subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "test", "-f", nfo_src],
+                              timeout=10, check=False).returncode == 0:
+                subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "mv", nfo_src,
+                               str(Path(real_dest).with_suffix(".nfo"))], timeout=15, check=False)
         except Exception as exc:                              # noqa: BLE001
             logging.error("archive_segments: exception archiving %s: %s", p, exc)
             failed.append(p)
