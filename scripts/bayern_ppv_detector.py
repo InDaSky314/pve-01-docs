@@ -164,35 +164,44 @@ def fetch_provider_ppv_streams(cat_id):
         return []
 
 
-def match_stream_for_bayern(stream, cat_info, espn_fixture=None):
+def extract_channel_slot(raw_name: str) -> str:
+    """Extract channel slot label from stream title (e.g. 'US: DAZN PPV 36' or 'GB: DAZN PPV 34')."""
+    m = re.search(r"\|\s*([A-Z]{2}:\s*[A-Z0-9\s+]+)$", raw_name, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m2 = re.search(r"\b([A-Z]{2}:\s*[A-Z0-9\s+]+)$", raw_name, re.IGNORECASE)
+    if m2:
+        return m2.group(1).strip()
+    return raw_name.strip()
+
+
+def match_stream_generic(stream, cat_info, team_patterns, false_positives_pattern=None, espn_fixture=None):
     """
-    Evaluates a provider stream for Bayern Munich match criteria.
-    Returns details if matched, else None.
+    Generic evaluator for provider stream match criteria.
+    Returns match dictionary if matched, else None.
     """
     raw_name = stream.get("name", "")
     stream_id = stream.get("stream_id")
     
-    # 1. Negative Filter: Reject false positives (Women, Amateure, Basketball)
-    if FALSE_POSITIVES.search(raw_name):
+    if false_positives_pattern and false_positives_pattern.search(raw_name):
         return None
         
-    # 2. Positive Filter: Must match Bayern pattern
-    bayern_matched = any(p.search(raw_name) for p in BAYERN_PATTERNS)
-    if not bayern_matched:
+    matched_team = False
+    for p in team_patterns:
+        if p.search(raw_name):
+            matched_team = True
+            break
+    if not matched_team:
         return None
         
     score = cat_info["priority"]
     match_reasons = [f"Category: {cat_info['name']} (+{cat_info['priority']} pts)"]
     
-    # 3. ESPN Fixture Cross-Reference (if ESPN fixture available)
     if espn_fixture:
-        opp = espn_fixture["opponent"]
+        opp = espn_fixture.get("opponent", "")
         opp_keywords = [w for w in re.findall(r"\w+", opp) if len(w) > 3 and w.lower() not in ["fc", "vfb", "tsv", "1.fc", "sv", "sc"]]
-        
-        opp_matched = False
         for kw in opp_keywords:
             if re.search(rf"\b{re.escape(kw)}\b", raw_name, re.IGNORECASE):
-                opp_matched = True
                 score += 50
                 match_reasons.append(f"Opponent match '{kw}' (+50 pts)")
                 break
@@ -212,22 +221,33 @@ def match_stream_for_bayern(stream, cat_info, espn_fixture=None):
             except ValueError:
                 pass
                 
-    # 4. Status Check ("Live" vs "Upcoming" vs "End")
     if raw_name.startswith("Live"):
         score += 20
         match_reasons.append("Stream is currently LIVE (+20 pts)")
+    elif raw_name.startswith("Next"):
+        score += 10
+        match_reasons.append("Stream is upcoming/NEXT (+10 pts)")
     elif raw_name.startswith("End"):
         score -= 80
         match_reasons.append("Stream has ENDED (-80 pts)")
 
+    channel_slot = extract_channel_slot(raw_name)
+
     return {
         "stream_id": stream_id,
         "raw_name": raw_name,
+        "channel_slot": channel_slot,
         "category": cat_info["name"],
         "lang": cat_info["lang"],
         "score": score,
         "reasons": match_reasons,
     }
+
+
+def match_stream_for_bayern(stream, cat_info, espn_fixture=None):
+    """Evaluates a provider stream for Bayern Munich match criteria."""
+    return match_stream_generic(stream, cat_info, BAYERN_PATTERNS, FALSE_POSITIVES, espn_fixture)
+
 
 
 def main():

@@ -20,6 +20,7 @@ import base64
 import hmac
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -294,9 +295,142 @@ def get_jellyfin_channels() -> dict[str, str]:
     return mapping
 
 
+# --- Dynamic PPV team support (Bayern Munich Phase 3, added 2026-08-17) ---
+# Some teams (currently just Bayern Munich's English broadcasts) don't air on
+# a fixed linear channel -- they air on a dynamically-renamed PPV event slot
+# that only gets labeled with the real match info shortly before kickoff.
+# resolve_channel_id() below special-cases these teams to scan the live
+# provider catalog for a labeled match instead of doing a static name lookup.
+# Matching logic (regex patterns, category list, scoring) mirrors
+# bayern_ppv_detector.py / bayern_ppv_alert.py (Phase 1/2, see
+# /root/pve-01-docs/docs/bayern-bundesliga-dvr-design.md) -- duplicated here
+# rather than imported, matching this project's existing convention of each
+# deployed script carrying its own copy of small shared logic rather than a
+# cross-repo import dependency.
+DYNAMIC_PPV_TEAMS = {"Bayern Munich"}
+
+XTREAM_BASE = "http://cf.teltv.xyz"
+XTREAM_USER = "c21fa33845e9"
+XTREAM_PASS = "3e110912e1"
+
+PPV_TARGET_CATEGORIES = {
+    573: {"name": "US| DAZN PPV", "priority": 100},
+    575: {"name": "UK| DAZN PPV VIP", "priority": 90},
+    1441: {"name": "UK| SKY SPORT+ PPV", "priority": 85},
+    1811: {"name": "UK| DAZN PPV", "priority": 80},
+    1137: {"name": "DE| BUNDESLIGA HD/4K", "priority": 40},
+    433: {"name": "DE| DAZN PPV", "priority": 30},
+}
+
+PPV_TEAM_PATTERNS = {
+    "Bayern Munich": [re.compile(r"\b(Bayern\s+M[uü]nchen|Bayern\s+Munich|FC\s+Bayern|Bayern)\b", re.IGNORECASE)],
+}
+PPV_FALSE_POSITIVES = re.compile(
+    r"\b(women|frauen|\bII\b|amateure|u19|u17|basketball|bbl|highlights|replay|magazine)\b",
+    re.IGNORECASE
+)
+# Agy's review (20260817T074620Z-bayern-phase3-review.md) caught that this
+# candidate's opponent-cross-reference scoring dropped the kickoff-alignment
+# and live/next-state bonuses bayern_ppv_detector.py's original scoring uses
+# (+40/+10-20 there), leaving max achievable score = category priority + 50.
+# At the original 150-point threshold that made Category 573 (US DAZN,
+# priority 100) barely pass (150) while every UK category (575/1441/1811,
+# priority 80-90) could never pass at all (max 130-140) -- confirmed by
+# direct arithmetic, not just Agy's claim. Lowered to 130 so the still-solid
+# category+opponent signal is enough; FALSE_POSITIVES already gates out
+# highlights/replay/wrong-competition matches before scoring even runs.
+PPV_MATCH_THRESHOLD = 130
+
+
+def _ppv_fetch_streams(cat_id: int) -> list[dict]:
+    url = (f"{XTREAM_BASE}/player_api.php?username={XTREAM_USER}&password={XTREAM_PASS}"
+           f"&action=get_live_streams&category_id={cat_id}")
+    req = urllib.request.Request(url, headers={"User-Agent": "DVRDashboard/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r)
+    except Exception:                                       # noqa: BLE001
+        return []
+
+
+def _ppv_curated_channel_for_stream(stream_id: str) -> tuple[str | None, str | None]:
+    """Cross-reference Threadfin's own curated xepg entries (inside CT105) to
+    find which already-active curated channel carries this exact live
+    stream_id right now. Returns (tvg_chno, channel_name) or (None, None).
+    Only DAZN-PPV-group entries are searched (the curated set from Phase 1)."""
+    try:
+        raw = pct("cat", "/srv/media-core/threadfin/conf/xepg.json", timeout=20)
+        xepg = json.loads(raw)
+    except Exception:                                       # noqa: BLE001
+        return None, None
+    needle = f"/{stream_id}.ts"
+    for entry in xepg.values():
+        if entry.get("group-title") != "DAZN PPV":
+            continue
+        if entry.get("url", "").endswith(needle):
+            return entry.get("tvg-chno"), entry.get("name")
+    return None, None
+
+
+def resolve_dynamic_ppv_channel(team: str, game: dict[str, Any],
+                                 jf_channels: dict[str, str]) -> tuple[str | None, str]:
+    """Scan the live PPV provider catalog right now for a labeled match for
+    `team`, matching bayern_ppv_detector.py's logic. Returns
+    (jellyfin_channel_id, channel_name) on a confident match, or
+    (None, human-readable reason) otherwise -- the reason surfaces directly
+    in the dashboard's error toast via _record_game's 422 response."""
+    patterns = PPV_TEAM_PATTERNS.get(team)
+    if not patterns:
+        return None, f"No PPV matching patterns configured for {team!r}"
+
+    best: tuple[int, dict, dict] | None = None
+    for cat_id, cat_info in PPV_TARGET_CATEGORIES.items():
+        for stream in _ppv_fetch_streams(cat_id):
+            name = stream.get("name", "")
+            if PPV_FALSE_POSITIVES.search(name):
+                continue
+            if not any(p.search(name) for p in patterns):
+                continue
+            score = cat_info["priority"]
+            # Opponent cross-reference boost, same idea as the standalone
+            # detector -- game['name'] is ESPN's own short match name, so any
+            # word in it besides the team's own name is a reasonable
+            # opponent-keyword source to look for in the stream title.
+            for word in re.findall(r"\w+", game.get("name", "")):
+                lw = word.lower()
+                if len(word) > 3 and lw not in ("bayern", "munich", "fc"):
+                    if re.search(rf"\b{re.escape(word)}\b", name, re.IGNORECASE):
+                        score += 50
+                        break
+            if best is None or score > best[0]:
+                best = (score, stream, cat_info)
+
+    if best is None:
+        return None, ("No live PPV slot found for this match yet -- providers often don't "
+                       "label the slot until shortly before kickoff. Try again closer to game time.")
+
+    score, stream, cat_info = best
+    if score < PPV_MATCH_THRESHOLD:
+        return None, f"Best match scored {score} (below the {PPV_MATCH_THRESHOLD}-point confidence threshold)"
+
+    stream_id = str(stream.get("stream_id", ""))
+    tvg_chno, curated_name = _ppv_curated_channel_for_stream(stream_id)
+    if not curated_name:
+        return None, (f"Matched provider stream {stream_id!r} ({stream.get('name','')!r}, score {score}) "
+                       "but it isn't one of the curated DAZN PPV channels in Jellyfin -- may need a "
+                       "lineup sync (xtream-sync.py) if the provider added slots since Phase 1 was set up.")
+
+    cid = jf_channels.get(curated_name) or jf_channels.get(curated_name.lower())
+    if not cid:
+        return None, f"Curated channel {curated_name!r} matched but isn't visible in Jellyfin yet -- try a guide refresh"
+    return cid, curated_name
+
+
 def resolve_channel_id(game: dict[str, Any], jf_channels: dict[str, str]) -> tuple[str | None, str]:
     """Resolve ESPN broadcast network to Jellyfin channel ID and channel name."""
     team = game.get("team", "")
+    if team in DYNAMIC_PPV_TEAMS:
+        return resolve_dynamic_ppv_channel(team, game, jf_channels)
     broadcasts = game.get("broadcasts") or []
 
     for bc in broadcasts:
@@ -428,13 +562,29 @@ def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str
 UPCOMING_DAYS = 10
 DURATION = {"football": timedelta(hours=3, minutes=45),
             "basketball": timedelta(hours=2, minutes=45),
-            "baseball": timedelta(hours=3, minutes=15)}
+            "baseball": timedelta(hours=3, minutes=15),
+            # Design doc's own risk-mitigation note (bayern-bundesliga-dvr-design.md
+            # section 4.2): baseline 2h30m for soccer, deliberately no arbitrary
+            # 4-hour buffer that would risk capturing an adjacent PPV event on the
+            # same dynamic slot once this match ends.
+            "soccer": timedelta(hours=2, minutes=30)}
 TEAMS = [
     ("Packers",            "football/nfl",                       "gb"),
     ("Badgers Football",   "football/college-football",          "275"),
     ("Badgers Basketball", "basketball/mens-college-basketball", "275"),
     ("Bucks",              "basketball/nba",                     "mil"),
     ("Brewers",            "baseball/mlb",                       "mil"),
+    # Bayern Munich, added 2026-08-17 (Phase 3): all three competitions ESPN
+    # tracks for team 132, same set bayern_ppv_detector.py already covers
+    # (confirmed 2026-08-17: Champions League was already in scope, no gap).
+    # Three separate TEAMS rows under the same label is fine -- all_games()'s
+    # own dedup key is (label, event id), and ESPN gives each competition's
+    # matches distinct event IDs, so this just accumulates all three
+    # competitions' fixtures under one "Bayern Munich" schedule entry with no
+    # special-case code needed anywhere else.
+    ("Bayern Munich",      "soccer/ger.1",                       "132"),
+    ("Bayern Munich",      "soccer/ger.pokal",                   "132"),
+    ("Bayern Munich",      "soccer/uefa.champions",              "132"),
 ]
 
 LINKS = [
@@ -622,6 +772,81 @@ def all_games(now: datetime) -> list[dict]:
                 "broadcasts": broadcast_names,
                 "needsPower": outside_window(start, end),
             })
+
+    # Scoreboard fallback for dynamic-PPV teams (Bayern Munich Phase 3, added
+    # 2026-08-17). Agy's review (20260817T074620Z-bayern-phase3-review.md)
+    # found -- and I independently confirmed with direct curl calls -- that
+    # ESPN's own /schedule endpoint doesn't reliably carry soccer fixtures
+    # the way it does for the US-sports TEAMS entries above:
+    # soccer/ger.pokal?seasontype=1 returns HTTP 400, and
+    # soccer/ger.1?seasontype=2 returns 0 events, even though the real
+    # upcoming Bayern-Stuttgart match (2026-08-28) is sitting right there on
+    # /scoreboard. Without this, the match would never appear in the
+    # dashboard for the "Record" button to attach to at all. Deliberately a
+    # separate small block rather than folding into the loop above -- keeps
+    # the working US-sports path completely untouched, at the cost of a
+    # short bit of duplicated event-parsing.
+    dynamic_leagues = {sport for label, sport, _ in TEAMS if label in DYNAMIC_PPV_TEAMS}
+    for sport in dynamic_leagues:
+        try:
+            req = urllib.request.Request(
+                f"https://site.api.espn.com/apis/site/v2/sports/{sport}/scoreboard")
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.load(r)
+        except Exception:                                   # noqa: BLE001
+            continue
+        kind = sport.split("/")[0]
+        for ev in data.get("events", []):
+            # Match against the FULL name ("VfB Stuttgart at Bayern Munich"),
+            # not shortName ("VFB @ MUN") -- found by testing this against
+            # the real live scoreboard response: ESPN's abbreviated
+            # shortName doesn't contain "Bayern" at all for this fixture, so
+            # matching shortName first (as the display-name convention below
+            # does) silently missed every match. Full `name` is only used
+            # for the regex check; the stored/displayed "name" field below
+            # still prefers shortName, same convention as the rest of this
+            # file.
+            full_name = ev.get("name") or ev.get("shortName") or ""
+            disp_name = ev.get("shortName") or ev.get("name") or "game"
+            matched_label = next(
+                (lbl for lbl in DYNAMIC_PPV_TEAMS
+                 if any(p.search(full_name) for p in PPV_TEAM_PATTERNS.get(lbl, []))),
+                None)
+            if not matched_label:
+                continue
+            try:
+                start = datetime.fromisoformat(
+                    ev["date"].replace("Z", "+00:00")).astimezone(LOCAL)
+            except (KeyError, ValueError):
+                continue
+            # ESPN's UEFA-competition /scoreboard endpoints returned a whole
+            # group-stage slate (Sept 2025 - Mar 2026), not just "today"'s
+            # games the way NFL/NBA scoreboard calls typically do -- found
+            # by testing this against the real live response (10 events,
+            # mostly long-since-completed by the current date). Filter to
+            # future or very-recently-started matches only, same bound the
+            # standalone bayern_ppv_detector.py already uses.
+            if start < now - timedelta(hours=3):
+                continue
+            key = (matched_label, ev.get("id") or start.isoformat())
+            if key in seen:
+                continue
+            seen.add(key)
+            comp = (ev.get("competitions") or [{}])[0]
+            done = bool(((comp.get("status") or {}).get("type") or {}).get("completed"))
+            end = start + DURATION[kind]
+            out.append({
+                "id": str(ev.get("id") or ""),
+                "team": matched_label, "kind": kind, "season": "",
+                "name": disp_name,
+                "start": start.isoformat(), "end": end.isoformat(),
+                "done": done, "score": "",
+                # No fixed broadcast -- resolve_dynamic_ppv_channel() looks
+                # this up live at record-click time instead.
+                "broadcasts": [],
+                "needsPower": outside_window(start, end),
+            })
+
     out.sort(key=lambda g: g["start"])
     with _lock:
         _sched.update(at=now, games=out)
@@ -900,7 +1125,8 @@ const TEAM_BADGES = {
   'Badgers Football': 'CFB',
   'Badgers Basketball': 'NCAAM',
   'Bucks': 'NBA',
-  'Brewers': 'MLB'
+  'Brewers': 'MLB',
+  'Bayern Munich': 'BUN'
 };
 let SPORTS_CONFIG = {};
 
