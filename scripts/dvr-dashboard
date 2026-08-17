@@ -934,7 +934,11 @@ def schedule() -> dict:
     recs, problems = recordings(now)
     games = [dict(g) for g in all_games(now)]
     tag_recordings(games, recs)
-    return {"now": now.isoformat(), "teams": [t[0] for t in TEAMS],
+    # dict.fromkeys() dedupes while preserving first-seen order -- needed
+    # since a team can have multiple TEAMS rows (Bayern Munich has 3, one
+    # per ESPN competition: Bundesliga/DFB-Pokal/Champions League), which
+    # would otherwise render as duplicate filter pills in the UI.
+    return {"now": now.isoformat(), "teams": list(dict.fromkeys(t[0] for t in TEAMS)),
             "games": games, "problems": problems}
 
 
