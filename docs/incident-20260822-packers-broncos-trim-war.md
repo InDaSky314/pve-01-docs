@@ -79,8 +79,27 @@ then concat. Result: 4.96 GB / 2h14m `(stitched).ts`, playability spot-checked
 at 3 seek points, raw segments moved to `/media/segments-archive` via
 `archive_segments()`, stitched file queued for comskip.
 
-Note for a future hardening pass: `preremux_segment_on_ct105` should
-`-map 0:0 -map 0:1` (or map by codec validity) instead of copying all
-streams, and fall back to split-stream extraction on mux failure — the
-phantom-PID + torn-tail combination will recur on any recording that dies
-mid-write.
+## Hardening (landed same day, 2026-08-22)
+
+`preremux_segment_on_ct105` now survives the phantom-PID + torn-tail
+combination automatically:
+
+1. **`_probe_valid_stream_maps()`** — ffprobe the segment first and `-map`
+   only the first video stream and the first audio stream with
+   `channels > 0`, skipping the provider's phantom 0-channel PIDs. Falls
+   back to unmapped copy if the probe itself fails.
+2. Single-pass remux now runs with `-err_detect ignore_err
+   -fflags +genpts+discardcorrupt`.
+3. **`_preremux_split_stream_fallback()`** — if the single pass still fails,
+   extract video (→ mpegts) and audio (→ raw ADTS) separately, then
+   recombine with video copied and **audio re-encoded** (aac 160k). The
+   re-encode is mandatory, not an optimization: torn AAC frames survive a
+   bitstream copy and break the matroska mux, but the decoder skips them.
+   The output must be genuine matroska — during testing, an mpegts-content
+   temp made the downstream mkv concat **silently truncate the stitch at
+   that segment** ("Can't write packet with unknown timestamp"), which
+   would have been a worse failure than the one being fixed.
+
+All three verified against the real 8/21 torn segment (recovered at its full
+1980.9s), a healthy segment (fast path unchanged), and a mixed
+healthy+recovered concat (correct 3608.3s total, no truncation).
