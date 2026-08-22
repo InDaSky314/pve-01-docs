@@ -1664,6 +1664,121 @@ def file_exists_in_jellyfin_container(container_path: str) -> bool:
 PREREMUX_SANITY_MAX_SECONDS = 6 * 3600
 
 
+def _probe_valid_stream_maps(src_path: str) -> list[str]:
+    """Return explicit ffmpeg -map args selecting only the REAL streams in a
+    segment: the first video stream, and the first audio stream that
+    actually has channels.
+
+    Added 2026-08-22 (Packers@Broncos salvage): the provider muxes phantom
+    audio PIDs into some feeds -- NFL Network HD carried two extra AAC
+    streams (tagged eng/spa) with channels=0, sample_rate=0, profile
+    unknown. A blanket `-c copy` tries to copy those too, and the tail
+    segment of a recording that died mid-write failed EVERY container mux
+    (mkv AND mpegts) because of them. Mapping only the valid streams is
+    what made the salvage work. Returns [] on probe failure so the caller
+    can fall back to unmapped copy (old behavior) rather than refusing."""
+    probe_cmd = [
+        "/usr/sbin/pct", "exec", "105", "--",
+        "docker", "exec", "jellyfin",
+        "/usr/lib/jellyfin-ffmpeg/ffprobe", "-v", "error",
+        "-show_entries", "stream=index,codec_type,channels",
+        "-of", "csv=p=0", src_path,
+    ]
+    try:
+        res = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=60)
+        if res.returncode != 0:
+            return []
+        video_idx = audio_idx = None
+        for line in res.stdout.strip().splitlines():
+            parts = line.strip().split(",")
+            if len(parts) < 2:
+                continue
+            idx, ctype = parts[0], parts[1]
+            channels = parts[2] if len(parts) > 2 else ""
+            if ctype == "video" and video_idx is None:
+                video_idx = idx
+            elif ctype == "audio" and audio_idx is None:
+                try:
+                    if int(channels) > 0:
+                        audio_idx = idx
+                except ValueError:
+                    pass
+        if video_idx is None:
+            return []
+        maps = ["-map", f"0:{video_idx}"]
+        if audio_idx is not None:
+            maps += ["-map", f"0:{audio_idx}"]
+        return maps
+    except Exception:                                          # noqa: BLE001
+        return []
+
+
+def _preremux_split_stream_fallback(src_path: str, dst_path: str, maps: list[str],
+                                    timeout_sec: int) -> tuple[bool, str]:
+    """Last-resort segment repair: extract video and audio SEPARATELY, then
+    mux them back together.
+
+    Added 2026-08-22 (Packers@Broncos salvage, verified against the real
+    torn segment): the final segment of a recording that dies mid-write can
+    carry a torn AAC packet that kills a combined `-c copy` remux in every
+    container -- yet the exact same file demuxes cleanly one stream at a
+    time (video -> mpegts, audio -> raw ADTS), and the two extracted
+    streams then mux together without complaint. The single-pass path
+    fails because the demuxer aborts the whole job on the first stream
+    error; per-stream extraction contains the damage to reading, where
+    ignore_err actually works. The recombine copies video but RE-ENCODES
+    audio (aac 160k): the torn AAC frames survive a bitstream copy and
+    still offend the matroska muxer, but the decoder skips them cleanly
+    (verified against the real 8/21 segment: copy-mux to mkv failed;
+    re-encode produced a true matroska at the full 1980.9s). Output MUST
+    be genuine matroska -- an mpegts-content temp poisons the downstream
+    mkv concat, which silently truncates the stitch at that segment
+    ("Can't write packet with unknown timestamp", reproduced directly
+    during testing before this landed)."""
+    tag = time.time_ns()
+    tmp_v = f"/tmp/preremux_split_{tag}_v.ts"
+    tmp_a = f"/tmp/preremux_split_{tag}_a.aac"
+    base = ["/usr/sbin/pct", "exec", "105", "--", "docker", "exec", "jellyfin",
+            "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-y", "-v", "error",
+            "-err_detect", "ignore_err", "-fflags", "+genpts+discardcorrupt"]
+    v_map = maps[:2] if maps else ["-map", "0:v:0"]
+    a_map = maps[2:4] if len(maps) >= 4 else ["-map", "0:a:0?"]
+    try:
+        res = subprocess.run(base + ["-i", src_path, *v_map, "-c", "copy",
+                                     "-avoid_negative_ts", "make_zero", "-f", "mpegts", tmp_v],
+                             capture_output=True, text=True, timeout=timeout_sec)
+        if res.returncode != 0:
+            return False, f"split-stream video extraction failed: {res.stderr.strip()[-300:]}"
+        have_audio = False
+        res = subprocess.run(base + ["-i", src_path, *a_map, "-c", "copy", "-f", "adts", tmp_a],
+                             capture_output=True, text=True, timeout=timeout_sec)
+        have_audio = res.returncode == 0
+        mux_inputs = ["-fflags", "+genpts", "-i", tmp_v]
+        mux_maps = ["-map", "0:0"]
+        codec_args = ["-c:v", "copy"]
+        if have_audio:
+            mux_inputs += ["-fflags", "+genpts+discardcorrupt", "-err_detect", "ignore_err", "-i", tmp_a]
+            mux_maps += ["-map", "1:0"]
+            # re-encode, don't copy: see docstring -- torn AAC frames
+            # survive a copy and break the mkv mux; the decoder skips them
+            codec_args += ["-c:a", "aac", "-b:a", "160k"]
+        mux_cmd = ["/usr/sbin/pct", "exec", "105", "--", "docker", "exec", "jellyfin",
+                   "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-y", "-v", "error", *mux_inputs,
+                   *mux_maps, *codec_args, "-avoid_negative_ts", "make_zero", dst_path]
+        res = subprocess.run(mux_cmd, capture_output=True, text=True, timeout=timeout_sec)
+        if res.returncode != 0:
+            return False, f"split-stream recombine failed: {res.stderr.strip()[-300:]}"
+        return True, "" if have_audio else "recovered video-only (audio unrecoverable)"
+    except Exception as exc:                                   # noqa: BLE001
+        return False, str(exc)
+    finally:
+        try:
+            subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "docker", "exec",
+                            "jellyfin", "rm", "-f", tmp_v, tmp_a], timeout=15, check=False)
+        except Exception:                                      # noqa: BLE001
+            pass
+
+
 def preremux_segment_on_ct105(src_path: str, dst_path: str, timeout_sec: int = 90) -> tuple[bool, str]:
     """Remux one raw segment through a real ffmpeg pass (+genpts, -c copy,
     avoid_negative_ts make_zero) into a new file, inside CT105's jellyfin
@@ -1700,20 +1815,37 @@ def preremux_segment_on_ct105(src_path: str, dst_path: str, timeout_sec: int = 9
     that's the duration check below, which would have caught the exact
     Aug 16 corruption automatically instead of silently propagating a
     17.3h file into the final concat."""
+    # Hardened 2026-08-22 (Packers@Broncos salvage, verified against the real
+    # failing segment): (1) map only the probed-valid streams -- the provider
+    # muxes phantom 0-channel audio PIDs that a blanket -c copy trips over
+    # (see _probe_valid_stream_maps); (2) tolerate torn packets in the read
+    # path (+discardcorrupt, ignore_err) -- the tail segment of a recording
+    # that dies mid-write always has one; (3) if the single-pass remux still
+    # fails, fall back to per-stream extraction and recombine
+    # (_preremux_split_stream_fallback) instead of failing the whole stitch.
     try:
+        maps = _probe_valid_stream_maps(src_path)
         cmd = [
             "/usr/sbin/pct", "exec", "105", "--",
             "docker", "exec", "jellyfin",
             "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-y", "-v", "error",
-            "-fflags", "+genpts",
+            "-err_detect", "ignore_err",
+            "-fflags", "+genpts+discardcorrupt",
             "-i", src_path,
+            *maps,
             "-c", "copy",
             "-avoid_negative_ts", "make_zero",
             dst_path
         ]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
         if res.returncode != 0:
-            return False, f"pre-remux of {src_path} exited {res.returncode}: {res.stderr.strip()}"
+            logging.warning("Pre-remux single-pass failed for %s (rc=%s) -- trying "
+                            "split-stream fallback", src_path, res.returncode)
+            ok, err = _preremux_split_stream_fallback(src_path, dst_path, maps, timeout_sec)
+            if not ok:
+                return False, f"pre-remux of {src_path} failed single-pass AND split-stream fallback: {err}"
+            if err:
+                logging.warning("Pre-remux fallback note for %s: %s", src_path, err)
         if not file_exists_in_jellyfin_container(dst_path):
             return False, f"pre-remux of {src_path} reported success but {dst_path} not found on disk"
 
