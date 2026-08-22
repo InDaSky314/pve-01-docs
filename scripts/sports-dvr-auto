@@ -132,6 +132,21 @@ NETWORK_CHANNEL_MAP = {
     "ACC Network": "ACC Network HD",
     "TBS": "TBS HD",
     "TNT": "TNT West 4K",
+    # Added 2026-08-22: ESPN lists Packers preseason carriage as
+    # "Packers TV Network" (sometimes alongside "NFL Net" and the opposing
+    # market's affiliate). Without this mapping the 8/21 Broncos game fell
+    # through to NFL Network HD, and the 8/28 Cardinals game (Packers TV
+    # Network ONLY) was skipped as Unmapped and would have been missed
+    # entirely. WGBA NBC 26 is the Packers TV Network's Green Bay affiliate.
+    "Packers TV Network": "Green Bay: NBC 26 (WGBA)",
+}
+
+# Broadcast strings that resolve to a team's own/local carriage and should
+# win over any national cable simulcast, regardless of the order ESPN lists
+# them in (2026-08-22: ESPN listed ['NFL Net', 'Packers TV Network', ...]
+# and the first-match loop picked NFL Network over the local broadcast).
+TEAM_NETWORK_BROADCASTS = {
+    "Packers": ("Packers TV Network",),
 }
 
 RSN_DEFAULTS = {
@@ -362,6 +377,31 @@ def resolve_channel_id(game: dict[str, Any], jf_channels: dict[str, str]) -> tup
     """Resolve ESPN broadcast network to Jellyfin channel ID and channel name."""
     team = game["team"]
     broadcasts = game["broadcasts"]
+
+    # Local-carriage priority (added 2026-08-22): ESPN's broadcast list is
+    # unordered from our point of view -- for the 8/21 Packers@Broncos game
+    # it was ['NFL Net', 'Packers TV Network', 'KUSA-TV (9NEWS)'], and the
+    # first-match loop below locked onto NFL Network before ever considering
+    # the local broadcast. Reorder so the team's own network (and, for teams
+    # with a LOCAL_MARKET_PREFERENCE, any broadcast that resolves to a
+    # channel in that market) is tried FIRST; national cable is the fallback,
+    # not the default.
+    team_networks = TEAM_NETWORK_BROADCASTS.get(team, ())
+    preferred_market_global = LOCAL_MARKET_PREFERENCE.get(team)
+
+    def _broadcast_priority(bc: str) -> int:
+        if bc in team_networks:
+            return 0
+        if preferred_market_global:
+            mapped = NETWORK_CHANNEL_MAP.get(bc, "")
+            if preferred_market_global.lower() in mapped.lower():
+                return 1
+            if any(bc.lower() in n.lower() and preferred_market_global.lower() in n.lower()
+                   for n in jf_channels):
+                return 1
+        return 2
+
+    broadcasts = sorted(broadcasts, key=_broadcast_priority)
 
     if team in RSN_DEFAULTS:
         rsn_name = RSN_DEFAULTS[team]
@@ -740,16 +780,52 @@ def run_auto_scheduler(dry_run: bool = True) -> None:
         schedule_game_timer(game, cid, cname, dry_run=dry_run)
 
 
+def candidate_channel_ids(game: dict[str, Any], jf_channels: dict[str, str]) -> set[str]:
+    """Every Jellyfin channel ID this game could plausibly be recorded on.
+
+    Added 2026-08-22 after the Packers@Broncos incident: run_live_extender
+    used to match games to timers by TIME OVERLAP ALONE. On 8/21 the
+    Braves@Brewers game went Final while its ESPN window still overlapped
+    the Packers timer's window on the clock -- so every 5-minute cycle
+    "trimmed" the live NFL recording to now+5min. Each trim killed the
+    recording, the stall watchdog restored it, the fresh timer got trimmed
+    again... 8 forced restarts in one night, and when a trim finally won the
+    race against the extender (early 2nd quarter), the timer completed,
+    fell out of the watchdog's InProgress filter, and the second half was
+    never recorded. All 8 "stalls" that night were self-inflicted; Threadfin
+    logged zero upstream errors. A timer must now be on a channel this game
+    could actually air on before extend/trim will touch it."""
+    ids: set[str] = set()
+    team = game["team"]
+    if team in RSN_DEFAULTS:
+        cid = jf_channels.get(RSN_DEFAULTS[team]) or jf_channels.get(RSN_DEFAULTS[team].lower())
+        if cid:
+            ids.add(cid)
+    for bc in game["broadcasts"]:
+        mapped = NETWORK_CHANNEL_MAP.get(bc)
+        if mapped:
+            cid = jf_channels.get(mapped) or jf_channels.get(mapped.lower())
+            if cid:
+                ids.add(cid)
+        for ch_name, cid in jf_channels.items():
+            if bc.lower() in ch_name.lower():
+                ids.add(cid)
+    return ids
+
+
 def run_live_extender(dry_run: bool = True) -> None:
     """Check live games and auto-extend active Jellyfin timers."""
     logging.info("=== Starting Live Game Auto-Extender ===")
     games = fetch_espn_schedule()
     timers = get_existing_timers()
+    jf_channels = get_jellyfin_channels()
     now = datetime.now(timezone.utc)
 
     for game in games:
         if game["state"] not in ("in", "post") and not (game["start"] <= now <= game["end"] + timedelta(hours=2)):
             continue
+
+        allowed_cids = candidate_channel_ids(game, jf_channels)
 
         for timer in timers:
             try:
@@ -759,6 +835,13 @@ def run_live_extender(dry_run: bool = True) -> None:
                 continue
 
             if not (t_start <= game["end"] and t_end >= game["start"]):
+                continue
+
+            # See candidate_channel_ids docstring (2026-08-22): time overlap
+            # alone is NOT ownership. Only touch timers on a channel this
+            # game could actually be airing on.
+            t_cid = timer.get("ChannelId") or timer.get("ExternalChannelId")
+            if t_cid not in allowed_cids:
                 continue
 
             if game["state"] == "in" and not game["completed"]:
@@ -1220,7 +1303,21 @@ def trigger_auto_restore(timer: dict[str, Any], dry_run: bool = True) -> tuple[b
     # existed. Dropped the name filter entirely; ChannelId + very-recent
     # StartDate is sufficient and doesn't depend on any naming assumption
     # that a different code path can silently invalidate.
-    if not restore_tid:
+    # Bug found 2026-08-22 (Packers@Broncos incident): all 8 restores that
+    # night created real, working timers (the segments exist on disk), yet
+    # every single confirmation below failed -- the POST response carried no
+    # Id and the fallback search ran IMMEDIATELY after the POST, before
+    # Jellyfin listed the new timer. One-shot polling right after a write is
+    # a race we always lose under load. Because no restore_timer_id was ever
+    # confirmed, recording-restore-state.json never got a chain entry, so
+    # the multi-segment stitcher had nothing to stitch and comskip processed
+    # 9 raw fragments instead of one stitched game. Retry the search a few
+    # times with a short sleep before declaring failure.
+    for confirm_attempt in range(4):
+        if restore_tid:
+            break
+        if confirm_attempt:
+            time.sleep(5)
         # Agy's review caught a real bug in an earlier draft here: a
         # one-sided "StartDate >= now - 90s" check has no upper bound, so
         # it would also match a genuinely different, unrelated timer
