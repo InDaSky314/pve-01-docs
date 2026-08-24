@@ -23,6 +23,7 @@ import argparse
 import json
 import logging
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -85,6 +86,7 @@ DEFAULT_SPORTS_CONFIG = {
     "Badgers Basketball": True,
     "Bucks": True,
     "Brewers": False,
+    "Bayern Munich": True,
 }
 
 # Baseline durations per sport
@@ -92,15 +94,25 @@ DURATIONS = {
     "baseball": timedelta(hours=3, minutes=15),
     "football": timedelta(hours=3, minutes=45),
     "basketball": timedelta(hours=2, minutes=45),
+    # Design doc's risk-mitigation note (bayern-bundesliga-dvr-design.md
+    # 4.2): 2h30m baseline for soccer, deliberately no oversized buffer that
+    # would risk capturing an adjacent PPV event on the same dynamic slot.
+    "soccer": timedelta(hours=2, minutes=30),
 }
 
-# The 5 teams followed by the owner
+# The teams followed by the owner
 TEAMS = [
     ("Packers",            "football/nfl",                       "gb"),
     ("Badgers Football",   "football/college-football",          "275"),
     ("Badgers Basketball", "basketball/mens-college-basketball", "275"),
     ("Bucks",              "basketball/nba",                     "mil"),
     ("Brewers",            "baseball/mlb",                       "mil"),
+    # Bayern Munich (auto-record phase, added 2026-08-24): same three
+    # competitions the dashboard's TEAMS list and bayern_ppv_detector.py
+    # already track. Dedup across the three rows is by event id (seen_ids).
+    ("Bayern Munich",      "soccer/ger.1",                       "132"),
+    ("Bayern Munich",      "soccer/ger.pokal",                   "132"),
+    ("Bayern Munich",      "soccer/uefa.champions",              "132"),
 ]
 
 # ESPN season types: Preseason=1, Regular=2, Postseason=3
@@ -174,6 +186,125 @@ LOCAL_MARKET_PREFERENCE = {
 }
 
 STREAMING_NETWORKS = {"Peacock", "Netflix", "Prime Video", "Apple TV", "Hulu"}
+
+# --- Dynamic PPV team support (Bayern Munich auto-record, added 2026-08-24) ---
+# Ported from dvr-dashboard's Phase 3 implementation (2026-08-17), same
+# duplication-over-import convention. Bayern's English broadcasts air on
+# dynamically-labeled PPV slots that only get the real match name shortly
+# before kickoff, so channel resolution is deferred until close to game time
+# (PPV_RESOLVE_WINDOW) and retried every scheduler cycle until a confident
+# match appears.
+DYNAMIC_PPV_TEAMS = {"Bayern Munich"}
+PPV_RESOLVE_WINDOW = timedelta(hours=6)
+
+XTREAM_BASE = "http://cf.teltv.xyz"
+XTREAM_USER = "c21fa33845e9"
+XTREAM_PASS = "3e110912e1"
+
+PPV_TARGET_CATEGORIES = {
+    573: {"name": "US| DAZN PPV", "priority": 100},
+    575: {"name": "UK| DAZN PPV VIP", "priority": 90},
+    1441: {"name": "UK| SKY SPORT+ PPV", "priority": 85},
+    1811: {"name": "UK| DAZN PPV", "priority": 80},
+    1137: {"name": "DE| BUNDESLIGA HD/4K", "priority": 40},
+    433: {"name": "DE| DAZN PPV", "priority": 30},
+}
+
+PPV_TEAM_PATTERNS = {
+    "Bayern Munich": [re.compile(r"\b(Bayern\s+M[uü]nchen|Bayern\s+Munich|FC\s+Bayern|Bayern)\b", re.IGNORECASE)],
+}
+PPV_FALSE_POSITIVES = re.compile(
+    r"\b(women|frauen|\bII\b|amateure|u19|u17|basketball|bbl|highlights|replay|magazine)\b",
+    re.IGNORECASE
+)
+# See dvr-dashboard for the threshold arithmetic (Agy's Phase 3 review,
+# 20260817T074620Z): max achievable score is category priority + 50, so 130
+# lets every English category pass on category+opponent signal alone.
+PPV_MATCH_THRESHOLD = 130
+
+
+def _ppv_fetch_streams(cat_id: int) -> list[dict]:
+    url = (f"{XTREAM_BASE}/player_api.php?username={XTREAM_USER}&password={XTREAM_PASS}"
+           f"&action=get_live_streams&category_id={cat_id}")
+    req = urllib.request.Request(url, headers={"User-Agent": "SportsDVRAuto/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r)
+    except Exception:                                       # noqa: BLE001
+        return []
+
+
+def _ppv_curated_channel_for_stream(stream_id: str) -> str | None:
+    """Find which curated DAZN-PPV Threadfin channel carries this provider
+    stream_id right now, by reading CT105's xepg.json. Returns the curated
+    channel name or None."""
+    try:
+        raw = subprocess.run(
+            ["/usr/sbin/pct", "exec", "105", "--", "cat",
+             "/srv/media-core/threadfin/conf/xepg.json"],
+            capture_output=True, text=True, timeout=20, check=True,
+        ).stdout
+        xepg = json.loads(raw)
+    except Exception:                                       # noqa: BLE001
+        return None
+    needle = f"/{stream_id}.ts"
+    for entry in xepg.values():
+        if entry.get("group-title") != "DAZN PPV":
+            continue
+        if entry.get("url", "").endswith(needle):
+            return entry.get("name")
+    return None
+
+
+def resolve_dynamic_ppv_channel(team: str, game: dict[str, Any],
+                                 jf_channels: dict[str, str]) -> tuple[str | None, str]:
+    """Scan the live PPV provider catalog for a labeled match for `team`.
+    Returns (jellyfin_channel_id, channel_name) on a confident match, or
+    (None, human-readable skip reason)."""
+    now = datetime.now(timezone.utc)
+    if game["start"] - now > PPV_RESOLVE_WINDOW:
+        return None, (f"PPV slot not expected to be labeled yet "
+                       f"(game is {(game['start'] - now).total_seconds() / 3600:.1f}h out; "
+                       f"resolution starts {PPV_RESOLVE_WINDOW.total_seconds() / 3600:.0f}h before kickoff)")
+    patterns = PPV_TEAM_PATTERNS.get(team)
+    if not patterns:
+        return None, f"No PPV matching patterns configured for {team!r}"
+
+    best: tuple[int, dict, dict] | None = None
+    for cat_id, cat_info in PPV_TARGET_CATEGORIES.items():
+        for stream in _ppv_fetch_streams(cat_id):
+            name = stream.get("name", "")
+            if PPV_FALSE_POSITIVES.search(name):
+                continue
+            if not any(p.search(name) for p in patterns):
+                continue
+            score = cat_info["priority"]
+            for word in re.findall(r"\w+", game.get("name", "")):
+                lw = word.lower()
+                if len(word) > 3 and lw not in ("bayern", "munich", "fc"):
+                    if re.search(rf"\b{re.escape(word)}\b", name, re.IGNORECASE):
+                        score += 50
+                        break
+            if best is None or score > best[0]:
+                best = (score, stream, cat_info)
+
+    if best is None:
+        return None, "No live PPV slot labeled for this match yet -- retrying every cycle until kickoff"
+    score, stream, cat_info = best
+    if score < PPV_MATCH_THRESHOLD:
+        return None, f"Best PPV match scored {score} (below {PPV_MATCH_THRESHOLD} confidence threshold)"
+
+    stream_id = str(stream.get("stream_id", ""))
+    curated_name = _ppv_curated_channel_for_stream(stream_id)
+    if not curated_name:
+        return None, (f"Matched provider stream {stream_id!r} ({stream.get('name', '')!r}, score {score}) "
+                       "but it isn't one of the curated DAZN PPV channels -- may need a lineup sync")
+    cid = jf_channels.get(curated_name) or jf_channels.get(curated_name.lower())
+    if not cid:
+        return None, f"Curated channel {curated_name!r} matched but isn't visible in Jellyfin yet"
+    logging.info("[PPV] Resolved %s -> curated channel %r (provider stream %s, score %d)",
+                 game.get("name", "?"), curated_name, stream_id, score)
+    return cid, curated_name
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -274,6 +405,8 @@ def fetch_espn_schedule() -> list[dict[str, Any]]:
     seen_ids: set[str] = set()
 
     for team_label, sport_path, team_id in TEAMS:
+        if team_label in DYNAMIC_PPV_TEAMS:
+            continue  # soccer fixtures come from the /scoreboard block below
         kind = sport_path.split("/")[0]
         for stype in SEASON_TYPES:
             url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/teams/{team_id}/schedule?seasontype={stype}"
@@ -327,6 +460,69 @@ def fetch_espn_schedule() -> list[dict[str, Any]]:
                     "status_detail": status_type.get("detail") or status_type.get("shortDetail") or "",
                 })
 
+    # Scoreboard fallback for dynamic-PPV teams (ported 2026-08-24 from
+    # dvr-dashboard's Phase 3 block, where this was found the hard way):
+    # ESPN's /schedule endpoint doesn't reliably carry soccer fixtures --
+    # ger.pokal?seasontype=1 returns HTTP 400 and ger.1?seasontype=2 returns
+    # 0 events even while the real upcoming match sits on /scoreboard.
+    # Without this, no Bayern fixture ever reaches the auto-scheduler.
+    now_utc = datetime.now(timezone.utc)
+    dynamic_leagues = {sport for label, sport, _ in TEAMS if label in DYNAMIC_PPV_TEAMS}
+    for sport_path in dynamic_leagues:
+        try:
+            req = urllib.request.Request(
+                f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/scoreboard")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.load(resp)
+        except Exception as exc:                              # noqa: BLE001
+            # ger.pokal's scoreboard 400s outside active cup rounds -- routine.
+            logging.debug("ESPN scoreboard fetch failed for %s: %s", sport_path, exc)
+            continue
+        kind = sport_path.split("/")[0]
+        for ev in data.get("events", []):
+            # Match on the FULL name; shortName ("VFB @ MUN") doesn't
+            # contain "Bayern" at all (confirmed against the live response
+            # during Phase 3).
+            full_name = ev.get("name") or ev.get("shortName") or ""
+            matched_label = next(
+                (lbl for lbl in DYNAMIC_PPV_TEAMS
+                 if any(p.search(full_name) for p in PPV_TEAM_PATTERNS.get(lbl, []))),
+                None)
+            if not matched_label:
+                continue
+            event_id = ev.get("id")
+            if not event_id or event_id in seen_ids:
+                continue
+            try:
+                start_dt = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
+            except (KeyError, ValueError):
+                continue
+            # UEFA scoreboards return whole-slate fixture lists, not just
+            # today's -- keep future/recently-started matches only.
+            if start_dt < now_utc - timedelta(hours=3):
+                continue
+            seen_ids.add(event_id)
+            comp = (ev.get("competitions") or [{}])[0]
+            status_type = ((comp.get("status") or {}).get("type") or {})
+            broadcast_names = []
+            for bc in comp.get("broadcasts") or []:
+                for n in bc.get("names") or []:
+                    if n and n not in broadcast_names:
+                        broadcast_names.append(n)
+            games.append({
+                "id": event_id,
+                "team": matched_label,
+                "kind": kind,
+                "name": full_name,
+                "shortName": ev.get("shortName") or "",
+                "start": start_dt,
+                "end": start_dt + DURATIONS.get(kind, timedelta(hours=3)),
+                "broadcasts": broadcast_names,
+                "state": status_type.get("state", "pre"),
+                "completed": bool(status_type.get("completed", False)),
+                "status_detail": status_type.get("detail") or status_type.get("shortDetail") or "",
+            })
+
     games.sort(key=lambda g: g["start"])
     return games
 
@@ -376,6 +572,8 @@ def get_jellyfin_channels() -> dict[str, str]:
 def resolve_channel_id(game: dict[str, Any], jf_channels: dict[str, str]) -> tuple[str | None, str]:
     """Resolve ESPN broadcast network to Jellyfin channel ID and channel name."""
     team = game["team"]
+    if team in DYNAMIC_PPV_TEAMS:
+        return resolve_dynamic_ppv_channel(team, game, jf_channels)
     broadcasts = game["broadcasts"]
 
     # Local-carriage priority (added 2026-08-22): ESPN's broadcast list is
@@ -475,13 +673,22 @@ def get_existing_timers() -> list[dict[str, Any]]:
     return res.get("Items", []) if res else []
 
 
-def is_overlapping_timer(channel_id: str, start: datetime, end: datetime, existing_timers: list[dict[str, Any]]) -> bool:
-    """Check if an existing timer overlaps the given time range on the same channel."""
+def is_overlapping_timer(channel_id: str, start: datetime, end: datetime, existing_timers: list[dict[str, Any]],
+                         timer_name: str | None = None) -> bool:
+    """Check if an existing timer overlaps the given time range on the same
+    channel -- or, when timer_name is given, an identically-named timer in
+    the same window on ANY channel (2026-08-24 audit: a broadcast remap
+    between scheduler runs, like the 8/22 NFL-Network->WGBA fix, would
+    otherwise create a second timer for the same game on the new channel
+    while the old one kept recording the old channel)."""
     for t in existing_timers:
         if t.get("Status") in ("Completed", "Cancelled", "Error"):
             continue
-        t_cid = t.get("ChannelId")
-        if t_cid != channel_id:
+        # ChannelId is the API GUID; ExternalChannelId (hdhr_*) is checked
+        # too in case a DTO ever arrives with only the external id set.
+        t_cid = t.get("ChannelId") or t.get("ExternalChannelId")
+        same_name = bool(timer_name) and t.get("Name") == timer_name
+        if t_cid != channel_id and not same_name:
             continue
         try:
             t_start = datetime.fromisoformat(t["StartDate"].replace("Z", "+00:00"))
@@ -523,6 +730,16 @@ def find_matching_program_id(channel_id: str, game_start: datetime) -> str | Non
     programs = jf_request(f"/LiveTv/Programs?ChannelIds={channel_id}&HasAired=false")
     if not programs:
         return None
+    # Verified live 2026-08-24 (Agy's audit F-02, reproduced directly): if
+    # channel_id isn't a real Jellyfin channel GUID (e.g. an "hdhr_*"
+    # ExternalChannelId, which is what the on-disk timers.json carries),
+    # Jellyfin SILENTLY IGNORES the ChannelIds filter and returns every
+    # program in the system (19,984 at test time) -- proximity matching then
+    # binds to whatever airs closest on ANY channel (test hit: a Hallmark
+    # movie for a Packers query). Post-filter on the returned programs' own
+    # ChannelId so a bad id can only ever produce "no match", never a
+    # cross-channel mis-link. Normal callers pass API GUIDs and are
+    # unaffected; the disk-fallback restore path is the one this protects.
     # Real bug found + verified 2026-08-17 (mirrored from dvr-dashboard's
     # identical copy of this function, same review): returning on the
     # first containment hit made this order-dependent on whatever order
@@ -535,6 +752,8 @@ def find_matching_program_id(channel_id: str, game_start: datetime) -> str | Non
     best_id, best_diff = None, None
     containment_id = None
     for p in programs.get("Items", []):
+        if p.get("ChannelId") != channel_id:
+            continue
         try:
             p_start = datetime.fromisoformat(str(p["StartDate"]).replace("Z", "+00:00"))
             p_end = datetime.fromisoformat(str(p["EndDate"]).replace("Z", "+00:00"))
@@ -745,13 +964,14 @@ def check_uncategorized_timers(dry_run: bool = True) -> None:
                           "the cancel next cycle", name, tid)
 
 
-def run_auto_scheduler(dry_run: bool = True) -> None:
+def run_auto_scheduler(dry_run: bool = True, games: list[dict[str, Any]] | None = None) -> None:
     """Proactively schedule upcoming games, checking sports-config.json for per-team on/off state."""
     logging.info("=== Starting Sports DVR Auto-Scheduler ===")
     sports_config = load_sports_config()
     logging.info("Active sports recording state: %s", sports_config)
 
-    games = fetch_espn_schedule()
+    if games is None:
+        games = fetch_espn_schedule()
     jf_channels = get_jellyfin_channels()
     existing_timers = get_existing_timers()
 
@@ -773,7 +993,8 @@ def run_auto_scheduler(dry_run: bool = True) -> None:
             logging.info("Skip %s (%s): %s", game["name"], game["team"], cname)
             continue
 
-        if is_overlapping_timer(cid, game["start"], game["end"], existing_timers):
+        if is_overlapping_timer(cid, game["start"], game["end"], existing_timers,
+                                timer_name=f"{game['team']}: {game['name']}"):
             logging.info("Skip %s (%s): Overlapping timer already exists on %s", game["name"], game["team"], cname)
             continue
 
@@ -797,6 +1018,15 @@ def candidate_channel_ids(game: dict[str, Any], jf_channels: dict[str, str]) -> 
     could actually air on before extend/trim will touch it."""
     ids: set[str] = set()
     team = game["team"]
+    if team in DYNAMIC_PPV_TEAMS:
+        # A dynamic-PPV game can be recording on any curated DAZN PPV slot
+        # or (German-feed fallback) any Sky Bundesliga channel -- the
+        # extender/watchdog must recognize its timers on all of them.
+        for ch_name, cid in jf_channels.items():
+            lname = ch_name.lower()
+            if lname.startswith("dazn ppv") or "bundesliga" in lname:
+                ids.add(cid)
+        return ids
     if team in RSN_DEFAULTS:
         cid = jf_channels.get(RSN_DEFAULTS[team]) or jf_channels.get(RSN_DEFAULTS[team].lower())
         if cid:
@@ -813,10 +1043,39 @@ def candidate_channel_ids(game: dict[str, Any], jf_channels: dict[str, str]) -> 
     return ids
 
 
-def run_live_extender(dry_run: bool = True) -> None:
+def _timer_matches_game_identity(timer: dict[str, Any], game: dict[str, Any]) -> bool:
+    """True only when the timer's own name positively identifies this game.
+
+    Added 2026-08-24 (joint audit, finding F-01): candidate_channel_ids()
+    alone still allows a cross-game trim war between two games that can air
+    on the SAME channel -- e.g. back-to-back games on FOX, or an RSN
+    doubleheader. The 2026-08-22 gate proved a timer is on a *plausible*
+    channel for the game; it never proved the timer is *this game's* timer.
+    Trims are destructive (they end a recording), so a trim now requires
+    the timer's name to actually name this game: the team key (timer names
+    from schedule_game_timer are '{team}: {espn short name}'), or at least
+    two distinct word tokens from ESPN's own game name (covers EPG-titled
+    timers like 'Milwaukee Brewers at Los Angeles Dodgers'). A generic
+    EPG-titled timer ('Live: NFL Football') matches neither -- it simply
+    never gets trimmed, and the worst case is recording the timer's normal
+    post-padding. Losing a trim is minutes of extra footage; a wrong trim
+    is the rest of the game, which is exactly what happened on 8/21."""
+    tn = timer.get("Name", "").lower()
+    if not tn:
+        return False
+    team = game.get("team", "").lower()
+    if team and team.split()[0] in tn:
+        return True
+    tokens = {w.lower() for w in re.findall(r"[A-Za-z]{3,}", game.get("name", ""))}
+    tokens -= {"live", "the", "and"}
+    return sum(1 for w in tokens if w in tn) >= 2
+
+
+def run_live_extender(dry_run: bool = True, games: list[dict[str, Any]] | None = None) -> None:
     """Check live games and auto-extend active Jellyfin timers."""
     logging.info("=== Starting Live Game Auto-Extender ===")
-    games = fetch_espn_schedule()
+    if games is None:
+        games = fetch_espn_schedule()
     timers = get_existing_timers()
     jf_channels = get_jellyfin_channels()
     now = datetime.now(timezone.utc)
@@ -858,6 +1117,25 @@ def run_live_extender(dry_run: bool = True) -> None:
                     }, dry_run=dry_run)
 
             elif game["state"] == "post" or game["completed"]:
+                # Destructive action: see _timer_matches_game_identity.
+                if not _timer_matches_game_identity(timer, game):
+                    logging.info("Skip trim of timer '%s' for final game '%s': timer name does "
+                                 "not positively identify this game (channel-plausible only).",
+                                 timer.get("Name", "?"), game["name"])
+                    continue
+                # Doubleheader guard (same team, same channel, consecutive
+                # games -- identity match alone can't tell them apart): only
+                # trim a timer whose nominal start belongs to THIS game's
+                # slot, or that started mid-window (a restore timer).
+                prepad = timer.get("PrePaddingSeconds") or 0
+                nominal_start = t_start + timedelta(seconds=prepad)
+                in_window = game["start"] <= t_start <= game["end"]
+                near_start = abs((nominal_start - game["start"]).total_seconds()) <= 5400
+                if not (in_window or near_start):
+                    logging.info("Skip trim of timer '%s' for final game '%s': timer start %s "
+                                 "outside this game's slot (likely the next game on this channel).",
+                                 timer.get("Name", "?"), game["name"], timer.get("StartDate"))
+                    continue
                 time_left = (t_end - now).total_seconds() / 60
                 if time_left > 10:
                     new_end = now + timedelta(minutes=5)
@@ -1040,10 +1318,46 @@ def archive_segments(segment_paths: list[str], root_path: str) -> tuple[list[str
                               timeout=10, check=False).returncode == 0:
                 subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "mv", nfo_src,
                                str(Path(real_dest).with_suffix(".nfo"))], timeout=15, check=False)
+            # 2026-08-24 audit (F-05): each raw fragment was independently
+            # comskip'd as it finalized, leaving orphaned partial cuts under
+            # "Commercial Free/<Category>/<Game>/" after the fragments
+            # themselves were archived. Mirror process-queue.py's
+            # output_path_for() (recordings/<rel>.ts -> recordings/
+            # "Commercial Free"/<rel>.mkv) and remove the cut that belongs
+            # to this exact fragment. The stitched file's own cut is safe:
+            # its name carries "(stitched)", which never equals a fragment
+            # name being archived here.
+            rel = p[len("/media/recordings/"):]
+            frag_cut = _real_path("/media/recordings/Commercial Free/" +
+                                  str(Path(rel).with_suffix(".mkv")))
+            subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "rm", "-f", frag_cut],
+                           timeout=15, check=False)
         except Exception as exc:                              # noqa: BLE001
             logging.error("archive_segments: exception archiving %s: %s", p, exc)
             failed.append(p)
     return archived, failed
+
+
+def enqueue_for_comskip(container_path: str) -> bool:
+    """Append a finished recording (container-side path) to the comskip
+    post-processing queue on CT105 -- the same queue Jellyfin's own
+    on-recording-finished.sh hook feeds.
+
+    Added 2026-08-24 (audit F-05): stitched files are written by ffmpeg, not
+    finalized by Jellyfin, so the DVR hook never fires for them and they
+    never received commercial removal at all. Same atomic-append (O_APPEND
+    single short write) the hook itself relies on."""
+    real_queue = _real_path("/media/recordings/.postprocess/queue")
+    res = subprocess.run(
+        ["/usr/sbin/pct", "exec", "105", "--", "sh", "-c",
+         f"echo {shlex.quote(container_path)} >> {shlex.quote(real_queue)}"],
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    if res.returncode != 0:
+        logging.error("enqueue_for_comskip failed for %s: %s", container_path, res.stderr)
+        return False
+    logging.info("Queued stitched file for commercial removal: %s", container_path)
+    return True
 
 
 def notify(subject: str, body: list[str]) -> None:
@@ -2016,6 +2330,38 @@ def check_restore_stitching(dry_run: bool = True) -> None:
     live_timer_map = {t["Id"]: t for t in timers if "Id" in t}
     updated = False
 
+    # Reconciliation pre-pass (2026-08-24 audit, F-06): a chain whose restore
+    # timer POST succeeded but whose id-confirmation search failed gets
+    # marked failed_restore_creation with restore_timer_id=None -- and was
+    # then permanently ignored, stranding real on-disk segments unstitched
+    # (all 8 restores on 8/21 hit exactly this before the retry fix; a
+    # confirmation can still lose all 4 retries under load). The restore
+    # timer, if it really was created, is findable later by its
+    # deterministic name. Adopt it and put the chain back in play.
+    for tid, entry in restore_state.items():
+        if entry.get("status") != "failed_restore_creation" or entry.get("restore_timer_id"):
+            continue
+        expected_name = f"{entry.get('original_name')} (restored)"
+        adopted = None
+        for lt in timers:
+            if lt.get("Name") != expected_name or not lt.get("Id"):
+                continue
+            try:
+                lt_start = datetime.fromisoformat(str(lt["StartDate"]).replace("Z", "+00:00"))
+                restored_at = datetime.fromisoformat(str(entry.get("restored_at")))
+            except (KeyError, ValueError, TypeError):
+                continue
+            if abs((lt_start - restored_at).total_seconds()) <= 600:
+                adopted = lt["Id"]
+                break
+        if adopted:
+            logging.info("Reconciled unconfirmed restore for '%s': adopted timer %s found by name.",
+                         entry.get("original_name"), adopted)
+            entry["restore_timer_id"] = adopted
+            entry["status"] = "restoring"
+            entry["error"] = None
+            updated = True
+
     # Only process chain ROOTS -- an entry that is itself nobody else's
     # restore_timer_id. Every other entry belongs to some root's chain and
     # gets handled when that root is processed.
@@ -2056,7 +2402,35 @@ def check_restore_stitching(dry_run: bool = True) -> None:
             if s["path"]:
                 continue
             live = live_timer_map.get(tid)
-            if live is None or live.get("Status") in ("InProgress", "Scheduled"):
+            if live is not None:
+                if live.get("Status") in ("InProgress", "Scheduled"):
+                    pending.append(s)
+                continue
+            # live is None: this timer id never made it into timers.json (or
+            # was purged). Treating that as "pending" wedged chains FOREVER
+            # (2026-08-24 audit F-03: the 8/16 Brewers chain looped '1/4
+            # pending' every 5 minutes for 8 days -- the chain tail is never
+            # itself a restore_state key, so resolve_segment has no fallback
+            # for it). Recover the segment from disk by its deterministic
+            # restore name; if there's no file either, only keep waiting
+            # while the game could still plausibly be recording, then let it
+            # fall through to the terminal missing-segment handling below.
+            parent = next((e for e in restore_state.values()
+                           if e.get("restore_timer_id") == tid), None)
+            if parent and parent.get("original_name"):
+                disk_path = resolve_active_recording_path(
+                    f"{parent['original_name']} (restored)")
+                if disk_path:
+                    logging.info("Chain segment %s for '%s' has no live timer entry; "
+                                 "recovered its file from disk: %s", tid, base_name, disk_path)
+                    s["path"] = disk_path
+                    continue
+            end_raw = re.sub(r"\.\d+", "", str(root_entry.get("original_end_date", "")))
+            try:
+                end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+            except ValueError:
+                end_dt = None
+            if end_dt is None or now < end_dt + timedelta(hours=2):
                 pending.append(s)
         if pending:
             logging.info("Chain for '%s' has %d/%d segment(s) still pending -- will retry next cycle.",
@@ -2164,6 +2538,11 @@ def check_restore_stitching(dry_run: bool = True) -> None:
                 archived, archive_failed = archive_segments(paths, paths[0])
                 if not dry_run:
                     jf_request("/Library/Refresh", method="POST")
+                    # Audit F-05 (2026-08-24): hand the stitched file to the
+                    # comskip pipeline -- Jellyfin's own hook never fires for
+                    # ffmpeg-written files, so this was the only recording
+                    # type that never got commercial removal.
+                    enqueue_for_comskip(stitched_path)
                 # Persisted so check_archived_segment_cleanup can find these
                 # later -- added 2026-08-12 alongside the cleanup mechanism.
                 root_entry["archived_segment_paths"] = archived
@@ -2350,8 +2729,11 @@ def main() -> None:
     elif args.recategorize_only:
         check_uncategorized_timers(dry_run=dry_run)
     else:
-        run_auto_scheduler(dry_run=dry_run)
-        run_live_extender(dry_run=dry_run)
+        # One ESPN fetch shared by both consumers (audit F-07: the schedule
+        # was fetched twice per 5-minute cycle, ~30 HTTP requests/cycle).
+        games = fetch_espn_schedule()
+        run_auto_scheduler(dry_run=dry_run, games=games)
+        run_live_extender(dry_run=dry_run, games=games)
         check_stalled_recordings(dry_run=dry_run)
         check_restore_stitching(dry_run=dry_run)
         check_archived_segment_cleanup(dry_run=dry_run)

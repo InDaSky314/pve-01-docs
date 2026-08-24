@@ -141,6 +141,11 @@ DEFAULT_SPORTS_CONFIG = {
     "Badgers Basketball": True,
     "Bucks": True,
     "Brewers": False,
+    # Added 2026-08-24: auto-record via sports-dvr-auto's dynamic-PPV
+    # resolution (the scheduler resolves the labeled PPV slot starting 6h
+    # before kickoff and creates the timer the moment a confident match
+    # appears). The toggle governs that path like any other team.
+    "Bayern Munich": True,
 }
 
 CT = "105"
@@ -186,6 +191,19 @@ NETWORK_CHANNEL_MAP = {
 RSN_DEFAULTS = {
     "Brewers": "Milwaukee Brewers HD",
     "Bucks": "Milwaukee Bucks HD",
+}
+
+# The curated lineup has separate local-market blocks (Madison, Green Bay,
+# Milwaukee locals all exist as distinct channels) -- found in review,
+# 2026-08-17: the fuzzy substring fallback below picks whichever
+# same-network channel happens to iterate first, which for a Packers game
+# broadcast on a national/regional affiliate (FOX, NBC, ...) isn't
+# guaranteed to be the Green Bay one. Worst case is recording a different
+# market's feed of the same game rather than a wrong game entirely, but
+# worth getting right given how much of this project already treats team
+# broadcast markets deliberately (RSN_DEFAULTS, etc).
+LOCAL_MARKET_PREFERENCE = {
+    "Packers": "Green Bay",
 }
 
 STREAMING_NETWORKS = {"Peacock", "Netflix", "Prime Video", "Apple TV", "Hulu"}
@@ -442,15 +460,22 @@ def resolve_channel_id(game: dict[str, Any], jf_channels: dict[str, str]) -> tup
         if "Bucks" in bc and "Milwaukee Bucks HD" in jf_channels:
             return jf_channels["Milwaukee Bucks HD"], "Milwaukee Bucks HD"
 
+        preferred_market = LOCAL_MARKET_PREFERENCE.get(team)
+        if preferred_market:
+            local_matches = [(cid, ch_name) for ch_name, cid in jf_channels.items()
+                             if bc.lower() in ch_name.lower() and preferred_market.lower() in ch_name.lower()]
+            if local_matches:
+                return local_matches[0]
+
         mapped_name = NETWORK_CHANNEL_MAP.get(bc)
         if mapped_name and (mapped_name in jf_channels or mapped_name.lower() in jf_channels):
             cid = jf_channels.get(mapped_name) or jf_channels.get(mapped_name.lower())
             if cid:
                 return cid, mapped_name
 
-        for ch_name, cid in jf_channels.items():
-            if bc.lower() in ch_name.lower():
-                return cid, ch_name
+        matches = [(cid, ch_name) for ch_name, cid in jf_channels.items() if bc.lower() in ch_name.lower()]
+        if matches:
+            return matches[0]
 
     if team in RSN_DEFAULTS:
         rsn_name = RSN_DEFAULTS[team]
@@ -506,19 +531,39 @@ def find_matching_program_id(channel_id: str, game_start: datetime) -> str | Non
     programs = jf_request(f"/LiveTv/Programs?ChannelIds={channel_id}&HasAired=false")
     if not programs:
         return None
+    # Real bug found + verified 2026-08-17: returning immediately on the
+    # first containment hit made this order-dependent on whatever order
+    # the API happens to return programs in -- reproduced directly: a
+    # loose all-day placeholder block that happens to CONTAIN game_start
+    # but appear before the real, much tighter proximity-matched program
+    # in the response would win, even though the proximity match is
+    # obviously the correct one. Now tracks both and only falls back to
+    # containment if no proximity match exists at all (the real reason
+    # containment was added: a mid-game restore lookup, where game_start
+    # is hours past every program's own start, so proximity can never
+    # match to begin with).
     best_id, best_diff = None, None
+    containment_id = None
     for p in programs.get("Items", []):
+        # Verified live 2026-08-24 (audit F-02, mirrored from
+        # sports-dvr-auto's copy of this helper): a non-GUID channel_id
+        # (e.g. "hdhr_*") makes Jellyfin silently ignore the ChannelIds
+        # filter and return every program in the system, so proximity
+        # matching binds to a random show on another channel. Post-filter
+        # so a bad id can only produce "no match", never a mis-link.
+        if p.get("ChannelId") != channel_id:
+            continue
         try:
             p_start = datetime.fromisoformat(str(p["StartDate"]).replace("Z", "+00:00"))
             p_end = datetime.fromisoformat(str(p["EndDate"]).replace("Z", "+00:00"))
         except (KeyError, ValueError, TypeError, AttributeError):
             continue
         if p_start <= game_start < p_end:
-            return p.get("Id")
+            containment_id = p.get("Id")
         diff = abs((p_start - game_start).total_seconds())
         if diff <= 1800 and (best_diff is None or diff < best_diff):
             best_id, best_diff = p.get("Id"), diff
-    return best_id
+    return best_id or containment_id
 
 
 def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str, dry_run: bool = False) -> tuple[bool, str, dict[str, Any]]:
@@ -854,14 +899,14 @@ def all_games(now: datetime) -> list[dict]:
 
 
 def channel_names() -> dict[str, str]:
+    # Was 2 separate `pct exec` forks (cat + curl) per call -- expensive,
+    # given this runs on every dashboard poll. jf_request() already does
+    # the same thing with a cached token over a direct HTTP call, the
+    # same pattern already used everywhere else in this file (found in
+    # review, 2026-08-17).
     out: dict[str, str] = {}
-    try:
-        key = pct("cat", JELLYFIN_KEY_FILE).strip()
-        raw = pct("curl", "-s", "--max-time", "10",
-                  f"{JELLYFIN_URL}/emby/LiveTv/Channels?Limit=2000",
-                  "-H", f'Authorization: MediaBrowser Token="{key}"')
-        data = json.loads(raw)
-    except Exception:                                       # noqa: BLE001
+    data = jf_request("/emby/LiveTv/Channels?Limit=2000")
+    if not data or not isinstance(data, dict):
         return out
     for c in data.get("Items", []):
         number = c.get("Number") or c.get("ChannelNumber")
