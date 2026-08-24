@@ -1,0 +1,13 @@
+[Unit]
+Description=Sports DVR fast stall watchdog (recording health only)
+Documentation=file:///root/pve-01-docs/docs/sports-dvr-auto.md
+
+[Service]
+Type=oneshot
+# Only the stall check: no ESPN calls, no scheduling, no stitching. Measured
+# ~3.8s wall / <0.05s CPU per run (the wall time is pct exec attach latency,
+# not load), so a 90s cadence costs a few percent of one core on the N5105.
+ExecStart=/usr/bin/flock -n /run/sports-dvr-stallwatch.lock /usr/bin/python3 /usr/local/bin/sports-dvr-auto --stall-check-only --apply
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
