@@ -197,6 +197,34 @@ STREAMING_NETWORKS = {"Peacock", "Netflix", "Prime Video", "Apple TV", "Hulu"}
 DYNAMIC_PPV_TEAMS = {"Bayern Munich"}
 PPV_RESOLVE_WINDOW = timedelta(hours=6)
 
+# Linear-channel safety net for dynamic-PPV teams (added 2026-08-24 per owner
+# request, generalized from the one-off timer hand-created for the 8/28
+# Stuttgart match). The English PPV slot can't be resolved until hours before
+# kickoff and might never get labeled at all, so EVERY dynamic-PPV fixture
+# also gets a timer on a fixed linear channel booked days ahead. It carries
+# the wrong-language commentary, so it is deliberately disposable:
+# check_ppv_fallback_cancellation() drops it the moment the English
+# recording is PROVEN to be capturing bytes. Net effect: the match is never
+# missed, and in the normal case the owner never sees the fallback at all.
+DYNAMIC_PPV_FALLBACK = {
+    # No EPG is published for the Sky Bundesliga channels in this lineup
+    # (verified 2026-08-24: zero programmes across all 34 in the fixture
+    # window), so the channel can't be chosen per-match from guide data --
+    # Sky's main Bundesliga channel is the correct default for a Bayern
+    # fixture. A wrong-channel fallback costs nothing the English path
+    # doesn't already cover; a missing fallback costs the match.
+    "Bayern Munich": "Sky Sport Bundesliga 1 HD (720P)",
+}
+# Suffix that marks a timer as a disposable fallback. Kept as "(German feed)"
+# so the timer hand-created for 8/28 before this automation existed is picked
+# up by it rather than being orphaned or duplicated.
+PPV_FALLBACK_MARKER = "(German feed)"
+# The English recording must have written at least this much before the
+# fallback is dropped. A timer flipping to InProgress proves only that
+# Jellyfin started -- not that the provider is actually delivering. 50 MB is
+# a few seconds of HD, comfortably above "opened the file and stalled".
+PPV_FALLBACK_MIN_BYTES = 50_000_000
+
 XTREAM_BASE = "http://cf.teltv.xyz"
 XTREAM_USER = "c21fa33845e9"
 XTREAM_PASS = "3e110912e1"
@@ -223,15 +251,36 @@ PPV_FALSE_POSITIVES = re.compile(
 PPV_MATCH_THRESHOLD = 130
 
 
-def _ppv_fetch_streams(cat_id: int) -> list[dict]:
+def _ppv_fetch_streams(cat_id: int) -> tuple[list[dict], str | None]:
+    """Returns (streams, error). The error is reported rather than swallowed
+    (2026-08-24): this provider returns HTTP 403 for a "Python-urllib/*"
+    User-Agent -- verified directly, a custom UA on the identical URL returns
+    200 -- so a future refactor that drops the UA header, or any provider
+    outage, would have silently yielded [] and been indistinguishable from
+    "no slot labeled yet". That would have quietly downgraded a match to the
+    German fallback with nothing logged as wrong."""
     url = (f"{XTREAM_BASE}/player_api.php?username={XTREAM_USER}&password={XTREAM_PASS}"
            f"&action=get_live_streams&category_id={cat_id}")
     req = urllib.request.Request(url, headers={"User-Agent": "SportsDVRAuto/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
-            return json.load(r)
-    except Exception:                                       # noqa: BLE001
-        return []
+            return json.load(r), None
+    except Exception as exc:                                # noqa: BLE001
+        return [], f"cat {cat_id}: {exc}"
+
+
+# Provider slot labels carry a status prefix before the first "|" --
+# confirmed live 2026-08-24 across all six PPV categories, only two values
+# occur: "Live" (event in progress) and "End" (event finished). The original
+# Phase 3 port ignored this entirely, so a slot still labeled
+# "End | Bayern Munich vs ..." from a PREVIOUS fixture could out-score and
+# steal the booking from the real upcoming match.
+_PPV_STATUS_RE = re.compile(r"^\s*(live|end)\s*\|", re.IGNORECASE)
+
+
+def _ppv_slot_status(name: str) -> str | None:
+    m = _PPV_STATUS_RE.match(name or "")
+    return m.group(1).lower() if m else None
 
 
 def _ppv_curated_channel_for_stream(stream_id: str) -> str | None:
@@ -271,14 +320,28 @@ def resolve_dynamic_ppv_channel(team: str, game: dict[str, Any],
         return None, f"No PPV matching patterns configured for {team!r}"
 
     best: tuple[int, dict, dict] | None = None
+    errors: list[str] = []
+    fetched_any = False
     for cat_id, cat_info in PPV_TARGET_CATEGORIES.items():
-        for stream in _ppv_fetch_streams(cat_id):
+        streams, err = _ppv_fetch_streams(cat_id)
+        if err:
+            errors.append(err)
+            continue
+        fetched_any = True
+        for stream in streams:
             name = stream.get("name", "")
             if PPV_FALSE_POSITIVES.search(name):
                 continue
             if not any(p.search(name) for p in patterns):
                 continue
+            # A finished event's slot is never the right booking target.
+            status = _ppv_slot_status(name)
+            if status == "end":
+                logging.info("[PPV] Ignoring finished slot %r", name[:70])
+                continue
             score = cat_info["priority"]
+            if status == "live":
+                score += 20
             for word in re.findall(r"\w+", game.get("name", "")):
                 lw = word.lower()
                 if len(word) > 3 and lw not in ("bayern", "munich", "fc"):
@@ -287,6 +350,19 @@ def resolve_dynamic_ppv_channel(team: str, game: dict[str, Any],
                         break
             if best is None or score > best[0]:
                 best = (score, stream, cat_info)
+
+    if not fetched_any:
+        # Every category failed: this is a provider/network/credential
+        # problem, NOT "the slot isn't labeled yet". Say so loudly, because
+        # the quiet version of this silently costs the English recording.
+        msg = f"PPV provider unreachable -- all {len(PPV_TARGET_CATEGORIES)} category fetches failed: {errors[:3]}"
+        logging.error("[PPV] %s", msg)
+        log_event("ppv_provider_unreachable", None, game.get("name", ""),
+                  {"errors": errors}, dry_run=False)
+        return None, msg
+    if errors:
+        logging.warning("[PPV] %d of %d category fetches failed (continuing with the rest): %s",
+                        len(errors), len(PPV_TARGET_CATEGORIES), errors[:3])
 
     if best is None:
         return None, "No live PPV slot labeled for this match yet -- retrying every cycle until kickoff"
@@ -297,8 +373,27 @@ def resolve_dynamic_ppv_channel(team: str, game: dict[str, Any],
     stream_id = str(stream.get("stream_id", ""))
     curated_name = _ppv_curated_channel_for_stream(stream_id)
     if not curated_name:
-        return None, (f"Matched provider stream {stream_id!r} ({stream.get('name', '')!r}, score {score}) "
-                       "but it isn't one of the curated DAZN PPV channels -- may need a lineup sync")
+        # Measured 2026-08-24: the curated "DAZN PPV NN" block covers
+        # category 573 (US DAZN) essentially completely -- 99 of 100 slots
+        # map -- and covers categories 575/1441/1811 NOT AT ALL (0 of 235).
+        # So a confident match on a UK slot dies right here. That is a
+        # lineup-coverage gap, not a transient miss: it will not fix itself
+        # on the next cycle, and it is the difference between getting the
+        # English recording and silently falling back to German commentary.
+        # Alert instead of logging it like an ordinary skip.
+        msg = (f"PPV slot for this match was FOUND and scored {score} "
+               f"({stream.get('name', '')!r}, provider stream {stream_id}) but that stream is not in "
+               "the curated DAZN PPV channel block, so it cannot be recorded. The curated block "
+               "currently covers the US DAZN category only; UK categories are not carried. "
+               "Fix: add those slots to the live lineup (xtream-sync live_selections) and re-sync.")
+        logging.error("[PPV] %s", msg)
+        log_event("ppv_slot_unmapped", None, game.get("name", ""),
+                  {"stream_id": stream_id, "stream_name": stream.get("name", ""),
+                   "score": score, "category": cat_info.get("name")}, dry_run=False)
+        notify(f"DVR: English PPV slot found but NOT recordable -- {game.get('name', '')}",
+               [msg, "", "The German-feed fallback timer is still in place, so the match will "
+                        "still be captured -- with German commentary."])
+        return None, msg
     cid = jf_channels.get(curated_name) or jf_channels.get(curated_name.lower())
     if not cid:
         return None, f"Curated channel {curated_name!r} matched but isn't visible in Jellyfin yet"
@@ -767,11 +862,21 @@ def find_matching_program_id(channel_id: str, game_start: datetime) -> str | Non
     return best_id or containment_id
 
 
-def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str, dry_run: bool = True) -> bool:
-    """Create a Jellyfin LiveTv timer for a game."""
+def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str, dry_run: bool = True,
+                        name_suffix: str = "") -> bool:
+    """Create a Jellyfin LiveTv timer for a game.
+
+    name_suffix marks a timer as something other than the primary recording
+    (currently only PPV_FALLBACK_MARKER). The name is load-bearing in two
+    places: _timer_matches_game_identity uses it to authorize trims, and
+    check_ppv_fallback_cancellation uses the suffix to find disposable
+    fallbacks -- so it must stay derived from the same
+    "{team}: {game name}" base the primary timer uses."""
     start_iso = (game["start"] - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
     end_iso = (game["end"] + timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
     name = f"{game['team']}: {game['name']}"
+    if name_suffix:
+        name = f"{name} {name_suffix}"
 
     program_id = find_matching_program_id(channel_id, game["start"])
     if program_id:
@@ -988,6 +1093,14 @@ def run_auto_scheduler(dry_run: bool = True, games: list[dict[str, Any]] | None 
             logging.info("Skip %s (%s): Auto-record toggled OFF in %s", game["name"], team, SPORTS_CONFIG_FILE)
             continue
 
+        # Book the linear safety net first: the English PPV slot usually
+        # can't resolve until hours before kickoff (and may never label at
+        # all), so the fallback must not be gated behind that resolution
+        # succeeding.
+        if game["team"] in DYNAMIC_PPV_FALLBACK:
+            if ensure_dynamic_ppv_fallback(game, jf_channels, existing_timers, dry_run=dry_run):
+                existing_timers = get_existing_timers()
+
         cid, cname = resolve_channel_id(game, jf_channels)
         if not cid:
             logging.info("Skip %s (%s): %s", game["name"], game["team"], cname)
@@ -999,6 +1112,111 @@ def run_auto_scheduler(dry_run: bool = True, games: list[dict[str, Any]] | None 
             continue
 
         schedule_game_timer(game, cid, cname, dry_run=dry_run)
+
+
+def ensure_dynamic_ppv_fallback(game: dict[str, Any], jf_channels: dict[str, str],
+                                 existing_timers: list[dict[str, Any]], dry_run: bool = True) -> bool:
+    """Make sure a dynamic-PPV fixture has its linear-channel safety net
+    booked. Idempotent: returns False (and creates nothing) if a live
+    fallback timer for this match already exists."""
+    team = game["team"]
+    ch_name = DYNAMIC_PPV_FALLBACK.get(team)
+    if not ch_name:
+        return False
+    cid = jf_channels.get(ch_name) or jf_channels.get(ch_name.lower())
+    if not cid:
+        logging.warning("[FALLBACK] %s not in the Jellyfin lineup -- cannot book a fallback for %s",
+                        ch_name, game["name"])
+        return False
+
+    want = f"{team}: {game['name']} {PPV_FALLBACK_MARKER}"
+    for t in existing_timers:
+        if t.get("Name") == want and t.get("Status") not in ("Completed", "Cancelled", "Error"):
+            return False
+
+    logging.info("[FALLBACK] Booking linear safety net for %s on %s", game["name"], ch_name)
+    ok = schedule_game_timer(game, cid, ch_name, dry_run=dry_run, name_suffix=PPV_FALLBACK_MARKER)
+    log_event("ppv_fallback_scheduled", None, want, {
+        "success": ok, "channel": ch_name, "game_start": game["start"].isoformat(),
+    }, dry_run=dry_run)
+    return ok
+
+
+def check_ppv_fallback_cancellation(dry_run: bool = True) -> None:
+    """Drop a linear fallback timer once the English PPV recording for the
+    same match is PROVEN to be capturing.
+
+    Deliberately conservative, because a wrong cancel loses the match
+    entirely while a late cancel only costs a duplicate recording. All four
+    must hold before anything is cancelled: the sibling timer is
+    Status=InProgress, it is on a curated PPV channel (not just any
+    channel), its window actually overlaps the fallback's, and its file on
+    disk has passed PPV_FALLBACK_MIN_BYTES. A timer that merely flipped to
+    InProgress proves Jellyfin started, not that the provider is
+    delivering -- which is exactly the failure mode the fallback exists
+    for."""
+    logging.info("=== Checking PPV fallback timers for cancellation ===")
+    timers = get_existing_timers()
+    if not timers:
+        return
+    fallbacks = [t for t in timers
+                 if PPV_FALLBACK_MARKER in (t.get("Name") or "")
+                 and t.get("Status") in ("New", "InProgress")]
+    if not fallbacks:
+        logging.info("No live PPV fallback timers to evaluate.")
+        return
+
+    jf_channels = get_jellyfin_channels()
+    ppv_ids = {cid for name, cid in jf_channels.items() if name.lower().startswith("dazn ppv")}
+    logging.info("Evaluating %d fallback timer(s) against %d curated PPV channel(s): %s",
+                 len(fallbacks), len(ppv_ids), [f.get("Name") for f in fallbacks])
+
+    for fb in fallbacks:
+        try:
+            fb_start = datetime.fromisoformat(str(fb["StartDate"]).replace("Z", "+00:00"))
+            fb_end = datetime.fromisoformat(str(fb["EndDate"]).replace("Z", "+00:00"))
+        except (KeyError, ValueError):
+            continue
+        base = (fb.get("Name") or "").replace(PPV_FALLBACK_MARKER, "").strip()
+
+        for t in timers:
+            if t.get("Id") == fb.get("Id") or t.get("Status") != "InProgress":
+                continue
+            if PPV_FALLBACK_MARKER in (t.get("Name") or ""):
+                continue
+            t_cid = t.get("ChannelId") or t.get("ExternalChannelId")
+            if t_cid not in ppv_ids:
+                continue
+            try:
+                t_start = datetime.fromisoformat(str(t["StartDate"]).replace("Z", "+00:00"))
+                t_end = datetime.fromisoformat(str(t["EndDate"]).replace("Z", "+00:00"))
+            except (KeyError, ValueError):
+                continue
+            if not (t_start <= fb_end and t_end >= fb_start):
+                continue
+
+            path = t.get("RecordingPath") or resolve_active_recording_path(t.get("Name", ""))
+            size = recording_file_size(path) if path else None
+            if size is None or size < PPV_FALLBACK_MIN_BYTES:
+                logging.info("[FALLBACK] English recording %r for %r not proven yet "
+                             "(%s bytes so far) -- keeping the fallback.",
+                             t.get("Name"), base,
+                             "unknown" if size is None else f"{size:,}")
+                continue
+
+            logging.info("[FALLBACK] English PPV recording %r confirmed capturing (%s bytes). "
+                         "Cancelling fallback %r.", t.get("Name"), f"{size:,}", fb.get("Name"))
+            ok, msg = cancel_live_timer(fb["Id"], dry_run=dry_run)
+            log_event("ppv_fallback_cancelled", fb.get("Id"), fb.get("Name", ""), {
+                "success": ok, "detail": msg, "english_timer": t.get("Id"),
+                "english_name": t.get("Name"), "english_bytes": size,
+            }, dry_run=dry_run)
+            if ok and not dry_run:
+                notify(f"DVR: dropped German fallback -- {base}",
+                       [f"The English PPV recording '{t.get('Name')}' is confirmed capturing "
+                        f"({size:,} bytes), so the German-feed safety-net timer was cancelled.",
+                        "", "Nothing else to do -- the English recording continues normally."])
+            break
 
 
 def candidate_channel_ids(game: dict[str, Any], jf_channels: dict[str, str]) -> set[str]:
@@ -2701,6 +2919,8 @@ def main() -> None:
                         help="Run the restore stitching check only")
     parser.add_argument("--cleanup-only", action="store_true",
                         help="Run the archived-segment cleanup check only")
+    parser.add_argument("--fallback-check-only", action="store_true",
+                        help="Only evaluate PPV fallback timers for cancellation")
     parser.add_argument("--recategorize-only", action="store_true",
                         help="Run the uncategorized-timer ProgramId backfill check only")
     parser.add_argument("--history", type=int, nargs="?", const=30, default=None, metavar="N",
@@ -2726,6 +2946,8 @@ def main() -> None:
         check_restore_stitching(dry_run=dry_run)
     elif args.cleanup_only:
         check_archived_segment_cleanup(dry_run=dry_run)
+    elif args.fallback_check_only:
+        check_ppv_fallback_cancellation(dry_run=dry_run)
     elif args.recategorize_only:
         check_uncategorized_timers(dry_run=dry_run)
     else:
@@ -2734,6 +2956,7 @@ def main() -> None:
         games = fetch_espn_schedule()
         run_auto_scheduler(dry_run=dry_run, games=games)
         run_live_extender(dry_run=dry_run, games=games)
+        check_ppv_fallback_cancellation(dry_run=dry_run)
         check_stalled_recordings(dry_run=dry_run)
         check_restore_stitching(dry_run=dry_run)
         check_archived_segment_cleanup(dry_run=dry_run)
