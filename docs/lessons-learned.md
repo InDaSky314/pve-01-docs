@@ -650,3 +650,56 @@ the kind of action that can degrade or interrupt someone else's real
 viewing. Ask first, every time, before creating a timer or opening a
 live tap on shared infra, regardless of which device the test itself
 targets.
+
+## DVR / Jellyfin API gotchas (2026-08-24 joint audit)
+
+**Jellyfin's `/LiveTv/Programs?ChannelIds=X` SILENTLY IGNORES the filter when
+X isn't a real channel GUID** — it returns the ENTIRE lineup (19,984 programs
+at test time) with HTTP 200, not an error and not an empty set. Any
+"closest match" logic downstream then binds to a random program on an
+unrelated channel (a live test matched a Hallmark movie for a Packers
+lookup). This is a live trap because the two timer sources carry DIFFERENT
+id forms: the REST API's timer DTO has `ChannelId` = GUID with `hdhr_*` in
+`ExternalChannelId`, while the on-disk `timers.json` has `ChannelId` =
+`hdhr_*`. Code that accepts a timer from either source must never assume the
+id form. Always post-filter API results on the field you asked to filter by
+rather than trusting the server honored the filter.
+
+**A mixed-content ("None" CollectionType) Jellyfin library with
+`EnableAutomaticSeriesGrouping=true` will TV-scrape your literal folder
+names.** The DVR's `/media/recordings/Sports` folder got matched to the 1998
+ABC sitcom *Sports Night* (TMDB 2003): every game folder became a "Season",
+every recording an "Episode", and the show's poster replaced the category
+art. The fix is per-library: `EnableAutomaticSeriesGrouping=false` AND
+per-type `TypeOptions` with empty `MetadataFetchers`/`ImageFetchers` (setting
+`EnableInternetProviders=false` alone was NOT sufficient — the TypeOptions
+carried their own fetcher lists). Note the bad poster lives in Jellyfin's
+metadata DB, not on disk: deleting `folder.jpg` does not fix it, and a
+plain `/Library/Refresh` does not clear it either — the folder items need an
+explicit `POST /Items/{id}/Refresh?ImageRefreshMode=FullRefresh&ReplaceAllImages=true`.
+
+**`POST /api/override` on dvr-dashboard silently CAPS at 24h
+(`min(hours, 24)`) and a shorter POST OVERWRITES a longer existing hold.**
+Asking for 106 hours yields 24. For a multi-day keep-awake (e.g. covering a
+game 4 days out), write the ISO timestamp directly to
+`/var/lib/dvr-dashboard/override-until` instead, and re-check
+`/api/status`'s `override` field afterwards to confirm what actually stuck.
+
+**Agy's audit findings need per-claim verification, not per-report
+verification.** In one report: the "silently ignores ChannelIds" finding was
+REAL and reproduced exactly as described; the "timer is scheduled on
+hdhr_106" claim was imprecise (true of the on-disk copy, false of the API
+timer it was describing); and the "`Sports/folder.jpg` IS the Sports Night
+poster, delete it" claim was flat wrong — that file was legitimate artwork
+and deleting it would have destroyed real art while leaving the actual
+problem (the metadata DB entry) untouched. A high-quality report is not
+uniformly high-quality; check the specific claim you are about to act on,
+especially any claim whose remedy is destructive.
+
+**When a "destructive vs. lossy" tradeoff exists in automation, prefer the
+lossy side.** The trim-war fix requires a timer's NAME to positively
+identify the game before a trim (which ends a recording) may touch it.
+A generic EPG-titled timer ("Live: NFL Football") therefore never gets
+trimmed — it just records its normal post-padding. Losing a trim costs
+minutes of extra footage; a wrong trim cost the entire second half of the
+8/21 Packers game.
