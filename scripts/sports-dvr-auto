@@ -76,7 +76,30 @@ STALL_MIN_GROWTH_BYTES = 2_000_000
 # STALL_MIN_GROWTH_BYTES in a shorter window, so false-positive risk creeps up slightly
 # for any channel far slower than the ~30MB/min this was calibrated against -- untested
 # at this specific interval for that case.
-STALL_MIN_CHECK_GAP = timedelta(minutes=4)
+# Tightened 2026-08-24 from 4min to 80s, paired with the dedicated
+# sports-dvr-stallwatch.timer (90s) added the same day. Detection latency
+# drops from 4-9 min to roughly 90s-3min, which on a live game is the
+# difference between losing a play and losing a drive.
+#
+# Why this is safe at a much shorter interval, with the real numbers this
+# time (the old comment above admitted it was calibrated but untested):
+# measured against this system's own recordings, a healthy stream writes
+# ~600-750 KB/s (Packers@Steelers: 12.5 GB / 4h40m = 745 KB/s; the stitched
+# NFL file: 617 KB/s). Independently, Agy measured 17-35 Mbps on other
+# samples -- higher still. Even taking the LOWEST figure, 80 seconds of
+# healthy recording is ~48 MB, so the unchanged 2 MB threshold is under 5%
+# of expected throughput. A channel would have to collapse to a twentieth of
+# normal bitrate to trip it.
+#
+# The remaining risk at a short interval is not a slow channel, it is a
+# brief provider hiccup that would have self-healed -- and a false restore
+# is expensive (it splits the recording and forces a stitch). That is what
+# STALL_STRIKES_REQUIRED below is for: confirm, then act.
+STALL_MIN_CHECK_GAP = timedelta(seconds=80)
+# Consecutive stalled samples required before a restore is triggered. Two
+# samples at an 80s floor means a stall must persist ~160s to be believed,
+# while a one-off hiccup between samples costs nothing at all.
+STALL_STRIKES_REQUIRED = 2
 STALL_ALERT_COOLDOWN = timedelta(hours=3)  # don't re-mail every cycle for the same stall
 MAILTO = "nathan.karras@gmail.com"
 
@@ -2052,10 +2075,21 @@ def check_stalled_recordings(dry_run: bool = True) -> None:
         alerted_at = prev.get("alerted_at")
 
         if grew >= STALL_MIN_GROWTH_BYTES:
-            state[tid] = {"size": size, "checked_at": now.isoformat(), "alerted_at": None}
+            # Healthy sample clears any accumulated strikes: a hiccup that
+            # recovers on its own must not carry credit toward a later
+            # unrelated restore.
+            state[tid] = {"size": size, "checked_at": now.isoformat(), "alerted_at": None,
+                          "strikes": 0}
             continue
 
-        state[tid] = {"size": size, "checked_at": now.isoformat(), "alerted_at": alerted_at}
+        strikes = int(prev.get("strikes", 0)) + 1
+        state[tid] = {"size": size, "checked_at": now.isoformat(), "alerted_at": alerted_at,
+                      "strikes": strikes}
+        if strikes < STALL_STRIKES_REQUIRED:
+            logging.info("Recording %r looks stalled (%d bytes in %.0fs) -- strike %d of %d, "
+                         "re-checking next cycle before acting.",
+                         name, grew, elapsed.total_seconds(), strikes, STALL_STRIKES_REQUIRED)
+            continue
 
         minutes_left = (t_end - now).total_seconds() / 60
         msg = (f"Recording '{name}' has grown only {grew} bytes in the last "
@@ -2099,7 +2133,8 @@ def check_stalled_recordings(dry_run: bool = True) -> None:
                 log_event("stall_self_recovered", tid, name, {
                     "size_before": size, "size_after": latest_size,
                 }, dry_run=dry_run)
-                state[tid] = {"size": latest_size, "checked_at": now.isoformat(), "alerted_at": None}
+                state[tid] = {"size": latest_size, "checked_at": now.isoformat(), "alerted_at": None,
+                              "strikes": 0}
                 continue
 
             success, details, restore_tid, cancel_ok = trigger_auto_restore(t, dry_run=dry_run)
