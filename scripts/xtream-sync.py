@@ -244,20 +244,29 @@ def atomic_write(path, data):
     tmp.replace(path)
 
 
-def slot_display(raw, label):
+def slot_display(raw, label, display_label=None):
     """Stable display name for event-slot channels ("MLB 12", "UEFA 04").
 
     PPV slot names carry the current event ("MLB 12 | Brewers x Cardinals
     start:…") and change all day; Threadfin keys channels by name, so the
     playlist must use the invariant slot part. Returns None for names that
     don't look like a slot (e.g. "MLB: MLB NETWORK" league channels).
+
+    display_label (config: "slot_name") decouples the string we SEARCH for
+    in the provider's name from the string we DISPLAY. Added 2026-08-25:
+    the provider numbers its US and GB DAZN slots identically ("US: DAZN
+    PPV 7" vs "GB: DAZN PPV 7"), so both rendered as "DAZN PPV 07" and the
+    (group, name) dedup silently dropped every GB slot -- measured as 99
+    US slots carried and 0 GB. Threadfin keys channels by name, so they
+    genuinely cannot share one; the GB block now displays as "DAZN PPV GB
+    NN" while still being FOUND by the provider's own "DAZN PPV" wording.
     """
     clean = clean_channel_name(raw)
     m = re.search(rf"{re.escape(label)}\s*[|:\- ]*(\d{{1,3}}|4K)\b", clean, re.I)
     if not m:
         return None
     num = m.group(1).upper()
-    return f"{label} {num.zfill(2) if num.isdigit() else num}"
+    return f"{display_label or label} {num.zfill(2) if num.isdigit() else num}"
 
 
 def resolve_xid(s, claimed_epgids):
@@ -302,6 +311,7 @@ def build_playlist(base, user, pw, cfg):
         region = sel.get("epg_region")
         mode = sel.get("epg_mode")
         slot = sel.get("slot")
+        slot_name = sel.get("slot_name")
         next_chno = sel.get("start_chno") or next_chno
 
         # explicit stream-id selections (v7 owner picks): listed order is
@@ -317,7 +327,7 @@ def build_playlist(base, user, pw, cfg):
                 if s["stream_id"] in seen_ids:
                     continue
                 raw = s.get("name") or ""
-                sname = slot and slot_display(raw, slot)
+                sname = slot and slot_display(raw, slot, slot_name)
                 if isinstance(sel["ids"], dict):
                     # curated name from config.json — already in house style
                     disp = sel["ids"][sid]
@@ -360,7 +370,7 @@ def build_playlist(base, user, pw, cfg):
                     continue
                 if nexc_rx and nexc_rx.search(raw):
                     continue
-                sname = slot and slot_display(raw, slot)
+                sname = slot and slot_display(raw, slot, slot_name)
                 disp = sname or modernise_name(clean_channel_name(raw))
                 if (sel["group"], disp) in seen_names:
                     continue
