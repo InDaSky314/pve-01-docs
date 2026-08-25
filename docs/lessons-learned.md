@@ -703,3 +703,50 @@ A generic EPG-titled timer ("Live: NFL Football") therefore never gets
 trimmed — it just records its normal post-padding. Losing a trim costs
 minutes of extra footage; a wrong trim cost the entire second half of the
 8/21 Packers game.
+
+## UniFi / network segmentation traps (2026-08-25)
+
+**A UniFi OS console admin is not a Linux account.** `pve01-automation`
+exists in mongo `ace.admin` and authenticates the API; it will never appear
+in `/etc/passwd`. Checking the wrong user store and reporting "no such
+account" is a wrong answer stated confidently — when someone says an account
+exists, find out *which* store before contradicting them.
+
+**Never verify a client-affecting network change from the router itself.**
+Router-originated traffic bypasses policy-based routing entirely. Both
+`ping`/`ip route get` from the gateway and `curl --interface <lan-ip>` gave
+confident false passes this session — one of them hid a live outage where
+LAN clients could not reach another subnet at all. Verify from a real client,
+or from `conntrack` / mangle counters, and say the check is inconclusive when
+it can only be run from the router.
+
+**UniFi's `UBIOS_local_network` set only holds that controller's own
+subnets.** A traffic route matching `INTERNET` therefore does NOT protect
+traffic to other private networks reached via its WAN — those get marked and
+pushed into the VPN, where a commercial provider drops RFC1918. In a
+multi-router chain this silently severs LAN-to-LAN. Static routes added via
+`/rest/routing` land in `main` and do not fix it, because marked traffic
+never consults `main`; the route has to go into the VPN's own table.
+
+**Before re-tagging an SSID's VLAN, look at who is actually on it.** An SSID
+named `IOT` here was the main household network carrying 12 of 16 clients.
+Retagging it as designed would have moved the whole family onto the IoT
+segment. SSID names describe intent, not reality — check `stat/sta` first.
+
+**UniFi device removal is `cmd/sitemgr`, not `cmd/devmgr`.** `devmgr` accepts
+`delete-device`, returns `{"meta":{"rc":"ok"}}`, and does nothing at all. An
+`rc: ok` is not proof the thing happened — re-read state afterwards.
+
+**A commercial VPN can be worse than the native WAN even for the same
+country.** Routing a German LAN through a German VPN exit swaps a residential
+ISP address for a datacenter one: identical geolocation, but more CAPTCHAs,
+frequent bank/government blocks, and throughput capped by the router's CPU.
+Ask what the tunnel actually buys before building it — here the answer was
+"nothing", and the right move was to leave it configured but disabled.
+
+**Reuse existing VPN credentials before asking for new ones.** The GL routers
+already carried a 71-peer Surfshark WireGuard list (`uci show wireguard`)
+covering every endpoint needed, so no account login was required. The
+assumption that they were stale was wrong — both handshook first try. Test
+with a throwaway `wg` interface (no routing changes) before designing around
+"the credentials are probably dead".
