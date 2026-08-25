@@ -218,6 +218,18 @@ STREAMING_NETWORKS = {"Peacock", "Netflix", "Prime Video", "Apple TV", "Hulu"}
 # (PPV_RESOLVE_WINDOW) and retried every scheduler cycle until a confident
 # match appears.
 DYNAMIC_PPV_TEAMS = {"Bayern Munich"}
+
+# Threadfin group-titles holding curated PPV event slots, and the matching
+# channel-name prefixes. Extended 2026-08-25 when the GB DAZN and Sky
+# Sports+ blocks were added to the lineup -- before that only the US DAZN
+# block existed, which is why a match carried on a UK slot could be scored
+# confidently and then not be recordable at all.
+PPV_GROUP_TITLES = {"DAZN PPV", "DAZN PPV GB", "Sky Sports+ PPV"}
+PPV_CHANNEL_PREFIXES = ("dazn ppv", "dazn ppv gb", "sky sports+ event")
+
+
+def is_ppv_channel_name(name: str) -> bool:
+    return (name or "").lower().startswith(PPV_CHANNEL_PREFIXES)
 PPV_RESOLVE_WINDOW = timedelta(hours=6)
 
 # Linear-channel safety net for dynamic-PPV teams (added 2026-08-24 per owner
@@ -247,6 +259,26 @@ PPV_FALLBACK_MARKER = "(German feed)"
 # Jellyfin started -- not that the provider is actually delivering. 50 MB is
 # a few seconds of HD, comfortably above "opened the file and stalled".
 PPV_FALLBACK_MIN_BYTES = 50_000_000
+
+# --- Probe-then-commit sequencing (owner's design, 2026-08-25) ---
+# The provider entitlement is ONE concurrent stream (owner-confirmed), and
+# Threadfin advertises TunerCount=1 to Jellyfin (verified in
+# /discover.json), so the English PPV recording and the German fallback can
+# NEVER run at the same time -- one of them has to be given up BEFORE
+# kickoff. A labeled PPV slot is not proof the slot actually carries the
+# match, so committing blind risks recording nothing.
+#
+# The sequencing: once a slot is confidently identified, start the English
+# recording EARLY -- during pregame -- so the channel gets PROVEN while
+# there is still time to change our minds. If bytes flow, we keep it (and
+# gain the pregame). If they don't, we cancel it and put the German
+# fallback back, with minutes to spare before kickoff. Worst realistic
+# case is losing a little pregame, never the match.
+PPV_PROBE_LEAD = timedelta(minutes=40)        # begin probing this far out
+PPV_PROBE_VERDICT_AFTER = timedelta(minutes=4)  # judge the probe after this long
+PPV_PROBE_ABANDON_BY = timedelta(minutes=8)   # must be back on a fallback by kickoff-8m
+PPV_PROBE_MIN_BYTES = 20_000_000              # bytes that prove the channel is live
+PPV_PROBE_STATE_FILE = Path("/var/lib/dvr-dashboard/ppv-probe-state.json")
 
 XTREAM_BASE = "http://cf.teltv.xyz"
 XTREAM_USER = "c21fa33845e9"
@@ -321,7 +353,7 @@ def _ppv_curated_channel_for_stream(stream_id: str) -> str | None:
         return None
     needle = f"/{stream_id}.ts"
     for entry in xepg.values():
-        if entry.get("group-title") != "DAZN PPV":
+        if entry.get("group-title") not in PPV_GROUP_TITLES:
             continue
         if entry.get("url", "").endswith(needle):
             return entry.get("name")
@@ -1165,6 +1197,185 @@ def ensure_dynamic_ppv_fallback(game: dict[str, Any], jf_channels: dict[str, str
     return ok
 
 
+def _load_probe_state() -> dict[str, Any]:
+    try:
+        return json.loads(PPV_PROBE_STATE_FILE.read_text())
+    except Exception:                                       # noqa: BLE001
+        return {}
+
+
+def _save_probe_state(state: dict[str, Any]) -> None:
+    try:
+        PPV_PROBE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PPV_PROBE_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        tmp.replace(PPV_PROBE_STATE_FILE)
+    except Exception as exc:                                # noqa: BLE001
+        logging.error("Could not save PPV probe state: %s", exc)
+
+
+def run_ppv_probe_commit(dry_run: bool = True, games: list[dict[str, Any]] | None = None) -> None:
+    """Prove the English PPV channel during pregame, then commit to it or
+    put the German fallback back -- the owner's sequencing, 2026-08-25.
+
+    Ordering is the whole safety story here, and it is deliberately the
+    same create-before-cancel discipline check_uncategorized_timers uses:
+    the English timer must EXIST before the German one is cancelled, so any
+    failure leaves the guaranteed capture untouched. The reverse order
+    would turn one bad API call into a missed match."""
+    if games is None:
+        games = fetch_espn_schedule()
+    now = datetime.now(timezone.utc)
+    candidates = [g for g in games
+                  if g["team"] in DYNAMIC_PPV_TEAMS
+                  and g["state"] not in ("post",)
+                  and not g["completed"]
+                  and timedelta(0) < (g["start"] - now) <= PPV_PROBE_LEAD]
+    if not candidates:
+        return
+
+    logging.info("=== PPV probe/commit: %d fixture(s) inside the %d-min pregame window ===",
+                 len(candidates), int(PPV_PROBE_LEAD.total_seconds() // 60))
+    state = _load_probe_state()
+    jf_channels = get_jellyfin_channels()
+    changed = False
+
+    for game in candidates:
+        gid = str(game["id"])
+        entry = state.get(gid, {})
+        if entry.get("phase") in ("committed", "reverted"):
+            continue
+        timers = get_existing_timers()
+        base_name = f"{game['team']}: {game['name']}"
+        fb_name = f"{base_name} {PPV_FALLBACK_MARKER}"
+        english = next((t for t in timers
+                        if t.get("Name") == base_name
+                        and t.get("Status") in ("New", "InProgress")), None)
+        fallback = next((t for t in timers
+                         if t.get("Name") == fb_name
+                         and t.get("Status") in ("New", "InProgress")), None)
+        mins_to_kick = (game["start"] - now).total_seconds() / 60
+
+        # --- Phase 1: start the probe (which is simply the real English
+        # recording, started early) ---
+        if not entry.get("phase"):
+            cid, why = resolve_dynamic_ppv_channel(game["team"], game, jf_channels)
+            if not cid:
+                logging.info("[PROBE] %s: no confident English slot yet (%s)", game["name"], why)
+                continue
+            if english:
+                entry = {"phase": "probing", "started_at": now.isoformat(),
+                         "english_timer": english.get("Id"), "channel": cid}
+                state[gid] = entry; changed = True
+            else:
+                logging.info("[PROBE] %s: starting English recording NOW on %s to prove the "
+                             "channel (%.0f min before kickoff).", game["name"], why, mins_to_kick)
+                probe_game = dict(game)
+                probe_game["start"] = now + timedelta(seconds=30)
+                ok = schedule_game_timer(probe_game, cid, why, dry_run=dry_run)
+                if not ok:
+                    logging.error("[PROBE] %s: could not create the English timer -- leaving the "
+                                  "German fallback exactly as it is.", game["name"])
+                    continue
+                created = next((t for t in get_existing_timers()
+                                if t.get("Name") == base_name
+                                and t.get("Status") in ("New", "InProgress")), None)
+                if not created and not dry_run:
+                    logging.error("[PROBE] %s: English timer not confirmed after create -- "
+                                  "keeping the German fallback, will retry next cycle.", game["name"])
+                    continue
+                entry = {"phase": "probing", "started_at": now.isoformat(),
+                         "english_timer": (created or {}).get("Id"), "channel": cid}
+                state[gid] = entry; changed = True
+                log_event("ppv_probe_started", (created or {}).get("Id"), base_name,
+                          {"channel": why, "minutes_to_kickoff": round(mins_to_kick, 1)},
+                          dry_run=dry_run)
+            # Only now, with the English timer real, release the tuner.
+            if fallback:
+                logging.info("[PROBE] Releasing the single tuner: cancelling %r for the probe.", fb_name)
+                cancel_live_timer(fallback["Id"], dry_run=dry_run)
+                log_event("ppv_fallback_cancelled_for_probe", fallback.get("Id"), fb_name,
+                          {"reason": "probe_started"}, dry_run=dry_run)
+            continue
+
+        # --- Phase 2: judge the probe ---
+        if entry.get("phase") == "probing":
+            try:
+                started = datetime.fromisoformat(entry["started_at"])
+            except (KeyError, ValueError):
+                started = now
+            elapsed = now - started
+            path = (english or {}).get("RecordingPath") or resolve_active_recording_path(base_name)
+            size = recording_file_size(path) if path else None
+
+            if size is not None and size >= PPV_PROBE_MIN_BYTES:
+                logging.info("[PROBE] %s: PROVEN -- English channel wrote %s bytes. Committing; "
+                             "the German fallback stays cancelled.", game["name"], f"{size:,}")
+                entry["phase"] = "committed"; entry["proved_bytes"] = size
+                state[gid] = entry; changed = True
+                log_event("ppv_probe_committed", entry.get("english_timer"), base_name,
+                          {"bytes": size, "minutes_to_kickoff": round(mins_to_kick, 1)},
+                          dry_run=dry_run)
+                if not dry_run:
+                    notify(f"DVR: English feed confirmed -- {game['name']}",
+                           [f"The English PPV channel is confirmed recording ({size:,} bytes) "
+                            f"{mins_to_kick:.0f} minutes before kickoff.",
+                            "", "The German fallback has been released (only one stream is "
+                                "available), and the English recording continues through the match."])
+                continue
+
+            if elapsed < PPV_PROBE_VERDICT_AFTER and mins_to_kick > PPV_PROBE_ABANDON_BY.total_seconds() / 60:
+                logging.info("[PROBE] %s: %s bytes after %.0fs -- still giving it time.",
+                             game["name"], "no" if size is None else f"{size:,}",
+                             elapsed.total_seconds())
+                continue
+
+            # Verdict: the English slot did not deliver. Put the fallback back.
+            logging.warning("[PROBE] %s: English channel did NOT deliver (%s bytes after %.0fs). "
+                            "Reverting to the German feed.", game["name"],
+                            "no" if size is None else f"{size:,}", elapsed.total_seconds())
+            # Re-book the fallback BEFORE dropping the English timer. Found
+            # by the scenario test: cancelling first and then failing to
+            # re-book (e.g. the linear channel has dropped out of the
+            # lineup) leaves the match with NO recording at all -- strictly
+            # worse than the wrong-language recording this is meant to
+            # restore. A useless English timer is still better than nothing,
+            # so if the fallback cannot be created we keep it and retry.
+            if not fallback:
+                if not ensure_dynamic_ppv_fallback(game, jf_channels,
+                                                    get_existing_timers(), dry_run=dry_run):
+                    logging.error("[PROBE] %s: could not re-book the German fallback -- KEEPING "
+                                  "the English timer rather than leaving the match unrecorded. "
+                                  "Will retry next cycle.", game["name"])
+                    log_event("ppv_probe_revert_blocked", entry.get("english_timer"), base_name,
+                              {"reason": "fallback_unavailable"}, dry_run=dry_run)
+                    if not dry_run:
+                        notify(f"DVR: ACTION NEEDED -- cannot fall back for {game['name']}",
+                               ["The English PPV slot produced no video, but the German fallback "
+                                "channel could not be booked either (not in the Jellyfin lineup).",
+                                "", "The English timer has been LEFT IN PLACE so something is "
+                                "recording, but it may capture nothing. Worth checking the lineup "
+                                "before kickoff."])
+                    continue
+            if english:
+                cancel_live_timer(english["Id"], dry_run=dry_run)
+            entry["phase"] = "reverted"; entry["reverted_at"] = now.isoformat()
+            state[gid] = entry; changed = True
+            log_event("ppv_probe_reverted", entry.get("english_timer"), base_name,
+                      {"bytes": size, "elapsed_seconds": round(elapsed.total_seconds()),
+                       "minutes_to_kickoff": round(mins_to_kick, 1)}, dry_run=dry_run)
+            if not dry_run:
+                notify(f"DVR: fell back to the German feed -- {game['name']}",
+                       [f"The English PPV slot was labeled for this match but produced no video "
+                        f"during a {elapsed.total_seconds():.0f}s pregame test, so it was dropped "
+                        f"and the German-feed recording was restored with "
+                        f"{mins_to_kick:.0f} minutes to spare.",
+                        "", "The match will be captured with German commentary."])
+
+    if changed:
+        _save_probe_state(state)
+
+
 def check_ppv_fallback_cancellation(dry_run: bool = True) -> None:
     """Drop a linear fallback timer once the English PPV recording for the
     same match is PROVEN to be capturing.
@@ -1190,7 +1401,7 @@ def check_ppv_fallback_cancellation(dry_run: bool = True) -> None:
         return
 
     jf_channels = get_jellyfin_channels()
-    ppv_ids = {cid for name, cid in jf_channels.items() if name.lower().startswith("dazn ppv")}
+    ppv_ids = {cid for name, cid in jf_channels.items() if is_ppv_channel_name(name)}
     logging.info("Evaluating %d fallback timer(s) against %d curated PPV channel(s): %s",
                  len(fallbacks), len(ppv_ids), [f.get("Name") for f in fallbacks])
 
@@ -1265,7 +1476,7 @@ def candidate_channel_ids(game: dict[str, Any], jf_channels: dict[str, str]) -> 
         # extender/watchdog must recognize its timers on all of them.
         for ch_name, cid in jf_channels.items():
             lname = ch_name.lower()
-            if lname.startswith("dazn ppv") or "bundesliga" in lname:
+            if is_ppv_channel_name(ch_name) or "bundesliga" in lname:
                 ids.add(cid)
         return ids
     if team in RSN_DEFAULTS:
@@ -2954,6 +3165,8 @@ def main() -> None:
                         help="Run the restore stitching check only")
     parser.add_argument("--cleanup-only", action="store_true",
                         help="Run the archived-segment cleanup check only")
+    parser.add_argument("--probe-only", action="store_true",
+                        help="Only run the PPV pregame probe/commit sequencing")
     parser.add_argument("--fallback-check-only", action="store_true",
                         help="Only evaluate PPV fallback timers for cancellation")
     parser.add_argument("--recategorize-only", action="store_true",
@@ -2981,6 +3194,8 @@ def main() -> None:
         check_restore_stitching(dry_run=dry_run)
     elif args.cleanup_only:
         check_archived_segment_cleanup(dry_run=dry_run)
+    elif args.probe_only:
+        run_ppv_probe_commit(dry_run=dry_run)
     elif args.fallback_check_only:
         check_ppv_fallback_cancellation(dry_run=dry_run)
     elif args.recategorize_only:
@@ -2991,6 +3206,9 @@ def main() -> None:
         games = fetch_espn_schedule()
         run_auto_scheduler(dry_run=dry_run, games=games)
         run_live_extender(dry_run=dry_run, games=games)
+        # Probe/commit runs BEFORE the plain fallback check: it owns the
+        # pregame decision, and once it commits, the fallback is already gone.
+        run_ppv_probe_commit(dry_run=dry_run, games=games)
         check_ppv_fallback_cancellation(dry_run=dry_run)
         check_stalled_recordings(dry_run=dry_run)
         check_restore_stitching(dry_run=dry_run)
