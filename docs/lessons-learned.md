@@ -750,3 +750,52 @@ covering every endpoint needed, so no account login was required. The
 assumption that they were stale was wrong — both handshook first try. Test
 with a throwaway `wg` interface (no routing changes) before designing around
 "the credentials are probably dead".
+
+## VPN-routed VLANs and UniFi zones (2026-08-26)
+
+**A VLAN behind a VPN traffic route needs explicit DNS servers.** UniFi marks
+port-53 traffic into the tunnel, so clients handed the *gateway* as DNS have
+their queries pushed into WireGuard and dropped. The visible symptom is not
+"no internet" — it is phones showing **"Sign in to network"**, because the
+captive-portal probe fails while ordinary connectivity still works. Measured
+proof: unrouted VLANs answered 7 records via the gateway, the routed one
+answered 0.
+
+**The WireGuard `.conf` `DNS =` line does nothing on UniFi.** It is a
+client-side directive for wg-quick-style clients; UniFi consumes the conf for
+routing only and never propagates it to DHCP. It must be set on the VLAN.
+
+**Check the country of every resolver a VPN provider gives you.** Surfshark's
+config pairs a US resolver (162.252.172.57, New York) with a *German* one
+(149.154.159.92, Frankfurt). Using both on a US-exit SSID means intermittently
+resolving via German DNS while presenting a US IP — the exact mismatch
+streaming services treat as proxy evidence. Pair the resolver country to the
+exit country, and re-check when the exit changes.
+
+**UniFi's predefined firewall policies cannot be edited via the API.** PUT
+returns `api.err.FirewallPolicyNotFound` and custom overrides fail schema
+validation; they have to be overridden in the UI. Also, on zone-firewall
+firmware the classic `/rest/firewallrule` endpoint is dead — every write
+returns `FirewallRuleIndexOutOfRange` no matter the index. Zones and policies
+live under `/v2/api/site/default/firewall/...`.
+
+**`/data/on_boot.d/` is the durable hook on UniFi OS.** Runtime `ip route`
+additions to VPN policy tables do not survive a reboot (confirmed by a real
+reboot test), but `/data` survives both reboots and firmware upgrades. Note
+the inverse, also confirmed: binaries *outside* `/data` (e.g. Tailscale's) are
+wiped by firmware upgrades while their `/data` config and node state survive —
+so a broken package after an upgrade usually needs a reinstall, not a reconfig.
+
+**`sudo cmd > /root/file` redirects as the calling user, not root.** It fails
+with Permission denied and the command never runs. Use
+`sudo bash -c 'cmd > /root/file'`. Cost a full 10-minute benchmark run.
+
+**Benchmark from a host that egresses natively.** 9.1 tunnels every pve-01
+container by source, so a test tunnel started there is VPN-inside-VPN and the
+numbers are meaningless. The UDR was the only native-exit vantage point — and
+also the more representative one, since that is where the tunnel being
+measured actually runs.
+
+**One benchmark run is not a ranking.** Three sweeps disagreed on the ordering
+within the top five US endpoints while agreeing strongly on the east/west
+split. Report what survives repetition; call the rest tied.
