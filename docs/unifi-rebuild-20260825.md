@@ -144,3 +144,51 @@ otherwise.
 | VLANs 20/40, WG tunnels | delete the `networkconf` entries |
 | LAN bypass routes | runtime only — clear on reboot/re-provision |
 | Forgotten clients | names restorable from the snapshot; devices themselves return on reconnect |
+
+## Reboot persistence test — 2026-08-26 07:33 (owner-approved, executed live)
+
+Rebooted the UDR and diffed a captured baseline against post-reboot state.
+Harness: `/root/udr-verify.sh` (baseline|check) and `/root/udr-reboot-test.sh`
+(pre-flights for in-progress DVR recordings and refuses to reboot if any are
+running, or if that state can't be determined).
+
+**Back in ~120 s via the LAN path.** Tailscale fallback was not needed.
+
+Survived byte-for-byte: both WireGuard tunnels (up and handshaking within
+2 min), all SSIDs (`Allianz`, `Lambeau`, `IOT` on VLAN 20), all networks/VLANs,
+the IoT firewall zone, Tailscale on the UDR, and the Swiss IPTV egress from
+CT105 (unaffected — that path never touches this router).
+
+**Did NOT survive — as predicted:** all 8 LAN-bypass routes in wg policy
+tables 178/179. The diff contained nothing else but timestamps. This confirms
+the earlier suspicion as fact: those routes are runtime-only.
+
+Durable fix installed: **`/data/on_boot.d/20-lan-bypass.sh`** (the same
+`on_boot.d` mechanism Tailscale uses). Two things learned writing it:
+
+- A wg policy table only exists while its traffic route is **enabled**. Table
+  178 is currently absent because the Frankfurt route is disabled — that is
+  normal, not a fault. A first draft gated its wait-loop on table 178 having
+  content and would have stalled ~5 min at every boot; it now checks each
+  table independently and skips missing ones.
+- Verified live: `table 179 default=1 bypass=1` (active route, bypass applied),
+  `table 178 default=0 bypass=0` (disabled route, correctly skipped).
+
+Also fixed this session: **Tailscale on the UDR was dead again after the
+2026-08-19 firmware build.** Root cause was NOT the OS-version check from the
+previous incident — that `'5'` patch is still intact. The upgrade wiped the
+binaries (which live outside `/data`) while `/data/tailscale/` config and
+`tailscaled.state` survived, so `manage.sh install` + `start` restored it with
+the same node identity and IP (`100.114.159.40`), no re-auth.
+`tailscale-install.timer` is enabled and is meant to auto-repair this; it did
+not fire, which is the thing to investigate if it recurs.
+
+**Inter-VLAN isolation** was implemented via the zone-based firewall: a new
+`IoT` zone holds VLAN 20 + VLAN 40. UniFi's auto-generated policies are
+correct for the security direction — `IoT -> Internal` BLOCK, `IoT -> External`
+ALLOW, `IoT -> IoT` BLOCK (so the TV is walled off from IoT gear). One gap
+remains: `Internal -> IoT` is also BLOCK, which breaks casting to the Nest
+devices. Predefined zone policies are **not editable via the API**
+(`api.err.FirewallPolicyNotFound`), and creating a custom override failed
+schema validation — so that one allow rule must be added in the UI:
+Settings -> Security -> Firewall -> Policies, Internal -> IoT, Allow.
