@@ -192,3 +192,128 @@ devices. Predefined zone policies are **not editable via the API**
 (`api.err.FirewallPolicyNotFound`), and creating a custom override failed
 schema validation — so that one allow rule must be added in the UI:
 Settings -> Security -> Firewall -> Policies, Internal -> IoT, Allow.
+
+---
+
+# Addendum — 2026-08-26 (zones, reboot test, DNS, VPN benchmarking)
+
+## Inter-VLAN isolation (zone-based firewall)
+
+This firmware uses UniFi's **zone-based firewall**; the classic
+`/rest/firewallrule` endpoint is effectively dead here — every write returned
+`api.err.FirewallRuleIndexOutOfRange` regardless of index. Zones live at
+`/v2/api/site/default/firewall/zone`, policies at `/v2/api/site/default/firewall-policies`.
+
+All four internal networks started in one `Internal` zone, which is why there
+was no isolation at all. Created a zone **`IoT`** holding VLAN 20 + VLAN 40.
+UniFi then auto-generated sensible predefined policies:
+
+| Direction | Action | Note |
+|---|---|---|
+| IoT → Internal | BLOCK | the actual security goal |
+| IoT → External | ALLOW | internet works |
+| IoT → Gateway | ALLOW | DHCP/DNS |
+| VLAN40 ↔ VLAN20 | BLOCK | TV walled off from IoT |
+| Internal → IoT | BLOCK | **breaks casting — see below** |
+
+> **Predefined policies are NOT editable via the API.** PUT against their id
+> returns `api.err.FirewallPolicyNotFound`, and POSTing a custom override
+> failed schema validation. `Internal → IoT` therefore remains BLOCK, which
+> means casting from a phone to the Nest devices will not work. Fix in the UI:
+> Settings → Security → Firewall → Policies → new policy Internal → IoT Allow.
+> This does not weaken isolation — IoT still cannot initiate toward Internal.
+
+## Reboot persistence test (executed 2026-08-26 07:33)
+
+Owner-approved, ran with the house empty. Pre-flight confirmed 0 recordings
+in progress before rebooting. **UDR came back via LAN in ~120 s.**
+
+**Survived:** both WireGuard tunnels (handshaking), all SSIDs, VLANs 20/40,
+the IoT firewall zone, Tailscale, client list.
+
+**Did NOT survive:** all 8 LAN-bypass routes in tables 178/179 — confirming
+they were runtime-only. Now handled durably by
+**`/data/on_boot.d/20-lan-bypass.sh`** on the UDR (`/data` survives both
+reboots and firmware upgrades, same mechanism Tailscale uses). It waits for
+the wg tables to appear, then re-applies.
+
+Harness: `/root/udr-verify.sh {baseline|check}` on pve-01 writes
+`/root/udr-state-*.txt` for diffing; `/root/udr-reboot-test.sh` does the whole
+cycle unattended and refuses to reboot if a recording is live.
+
+## Tailscale on the UDR broke again — different cause than last time
+
+The 2026-08-09 fix (adding `'5'` to the OS-version check in `manage.sh`) was
+**still in place**. This time the firmware upgrade (5.1.31, built 2026-08-19)
+**wiped the binaries**, which live outside `/data`; config and
+`tailscaled.state` survived, so `manage.sh install` + `start` restored it and
+it rejoined as the same node (`100.114.159.40`) with no re-auth.
+`tailscale-install.timer` is supposed to auto-repair this and did not fire —
+that is the thing to check if it recurs.
+
+## ⚠️ A VPN-routed VLAN needs explicit DNS — and check each resolver's country
+
+Symptom: phones on `Lambeau` were prompted to **"Sign in to network"**, then
+eventually connected. Cause: the VLAN handed out the **gateway** as DNS
+(`dhcpd_dns_enabled=false`), but UniFi's traffic route marks port-53 traffic
+into the tunnel, so queries aimed at the local gateway were pushed into
+WireGuard and lost. The phone's captive-portal probe then failed, so Android
+assumed a login page.
+
+Measured, per VLAN:
+
+```
+VLAN 1  (Allianz, no route) gateway DNS -> 7 answers  OK
+VLAN 20 (IoT, no route)     gateway DNS -> 7 answers  OK
+VLAN 40 (Lambeau, routed)   gateway DNS -> 0 answers  BROKEN
+```
+
+**Why the tunnel didn't supply DNS:** the `DNS =` line in a WireGuard `.conf`
+is a *client-side* directive for wg-quick-style clients. UniFi consumes the
+conf for **routing only** and never propagates it to DHCP — so it must be set
+manually on the VLAN.
+
+**The trap worth remembering:** Surfshark's own conf pairs
+`162.252.172.57` (**US, New York**) with `149.154.159.92` (**Germany,
+Frankfurt**). Using both on a US-exit SSID would intermittently resolve via
+German DNS while presenting a US IP — the exact mismatch streaming services
+flag as a proxy. VLAN 40 now uses the US resolver primary with `8.8.8.8`
+(anycast, resolves US-side through the tunnel) secondary; the German resolver
+is deliberately excluded.
+
+**If the Frankfurt/Allianz route is ever re-enabled**, VLAN 1 will develop the
+same symptom and needs the inverse: `149.154.159.92` becomes correct and the
+US resolver becomes the leak. Prerequisites for enabling that route are now
+(1) the on-boot LAN-bypass script (done) and (2) explicit German DNS on VLAN 1.
+
+## VPN endpoint benchmarking — `/root/vpn-bench.sh`
+
+Repeatable harness. Runs from pve-01 but measures **on the UDR**, because the
+UDR is the only host that egresses natively — 9.1 tunnels every pve-01
+container by source (CT107→Ashburn, CT111/112→Zürich, pve-01→Ashburn), so
+testing from here would be VPN-inside-VPN. The UDR is also the more relevant
+vantage point, since that is where the Lambeau tunnel actually runs.
+
+```
+sudo /root/vpn-bench.sh 'us-'        # any regex: 'de-|ch-', 'us-(nyc|ash)'
+```
+
+Reports idle RTT, jitter, loss, **loaded latency** (RTT while the link is
+saturated) and the delta — the number that predicts felt performance.
+
+Full 24-endpoint US sweep, 2026-08-26 08:02: **zero packet loss everywhere**,
+jitter <1 ms except `us-bdn`/`us-phx` (~4 ms). Top five by loaded latency:
+ash 102.7, nyc 107.8, buf 109.4, clt 110.0, ltm 111.3.
+
+**No hidden gems.** Nearly every endpoint degrades a uniform 10–15 ms under
+load, which says the constraint is the shared transatlantic path, not endpoint
+contention. Geography dominates: east coast 91–107 ms, midwest 119–137, west
+coast 149–172. `us-slc` (+0.2) and `us-oma` (+2.8) are genuinely uncontested
+but 40 ms further away, so low contention does not rescue them.
+**Ashburn (current) ranked best — no change warranted.**
+
+Caveat: three separate runs disagreed on the ordering *within* the top five,
+so treat those as tied. The east/west split is far larger than the noise and
+is trustworthy. Throughput per endpoint is still unmeasured — that needs a
+native-exit test host, which requires a "no VPN" policy exemption on 9.1 added
+via the GL UI (not the CLI, per the standing rule).
