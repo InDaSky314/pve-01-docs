@@ -922,3 +922,106 @@ ten-second smoke test proved Agy was fine; the prompts were six-part
 investigations that ran past the timeout, and Agy only writes its report at the
 end, so being killed meant losing everything. Scope subagent tasks to one
 question with a small deliverable, or have them write findings incrementally.
+
+**Never reload `/etc/init.d/network` from inside an `interface_status_change` handler.**
+In GL.iNet's `/usr/bin/rtp2.sh`, queuing `/etc/init.d/network reload` during an
+interface up/down event triggers netifd to re-evaluate and reload interfaces,
+spawning a circular storm of hotplug events and deadlocking on `/tmp/lock/procd_network.lock`
+(`flock 1000`) inside command substitution subshells (`pipe_wait`). Interface status
+handlers should update nftables rules and routing tables dynamically without invoking
+service-level network reloads.
+
+**WireGuard hotplug scripts must write `connected` state before calling heavy hooks.**
+GL.iNet's `vpn-failover-watcher.sh` watches `/tmp/wireguard/<iface>_state` with a 30s
+timeout. If `/etc/hotplug.d/wireguard/ifup.sh` blocks synchronously inside `rtp2.sh` before
+writing `connected`, the watcher assumes connection failure and tears down the tunnel,
+causing an infinite failover/restart loop. Always mark state `connected` upon `proto_send_update`
+and invoke policy reconciliation hooks in the background.
+
+**Check custom persistence scripts when topology or SSID assignments change.**
+`/etc/hotplug.d/iface/99-network-buildout-persist` was carrying stale bridge mappings
+(`mld1 -> br-iot`) and obsolete priority 5900 policy routing rules from an earlier
+topology iteration. When migrating subnets or SSIDs, audit all `/etc/hotplug.d/` hooks.
+
+
+**On the BE9300, a cold reboot is the fix for post-change instability — not
+hand-patching runtime state.** After the cutover, three separate faults were
+present at once: `wgclient2`/`wgclient3` stuck at netifd `"up": false,
+"pending": true` with no address and blackhole-only routing tables;
+`mld0` unbridged and `mld1` bridged to `br-iot` instead of `br-guest`; and
+`rtp2.sh` (the VPN interface state-change handler) leaking stuck processes in
+`pipe_wait` — 34 of them, respawning faster than they could be killed. Killing
+the backlog, clearing `/tmp/run/rtp2.lock`, `ifup`, and cycling the tunnels
+through `vpn-client.set_tunnel` all failed; hand-assigning the addresses and
+routes worked but only until the next boot. **One cold reboot fixed every one of
+them at once**, and the config was correct all along. Same lesson as 6 GHz
+earlier: on this hardware, `reload`-class operations do not converge, and time
+spent hand-repairing runtime state is wasted. Reboot first, diagnose second.
+
+**Watch for stale priority-5900 ip rules hijacking the no-VPN path.** A rule
+`from 192.168.9.0/24 fwmark 0x8000/0xf000 lookup 1001` sat *above* the correct
+`from all fwmark 0x8000/0xf000 lookup main` at priority 6000. Mark `0x8000` is
+the *no-VPN* mark, so every client meant to egress natively was being forced
+through the Swiss tunnel instead — including the Proxmox host. The rule was a
+leftover mapping from when that subnet lived behind a different router, and
+siblings for two long-deleted VLANs (192.168.11/12.0/24) sat beside it. Symptom:
+a device with its MAC in no tunnel rule still exits via a VPN. Check
+`ip rule show | grep 5900` whenever egress does not match the policy rules. The
+cold reboot cleared all three.
+
+**A GL proto handler that assigns no address is not necessarily broken.**
+`/lib/netifd/proto/wgclient.sh` has both the address assignment (`ip address add
+dev ... "$address_v4"`) and `proto_init_update` commented out, so the interface
+legitimately stays `pending` until a separate component completes setup. Do not
+read "no address, pending" as a config error — find the component that finishes
+the job before changing anything.
+
+**Verify a router move by ARP, not by assumption.** After the cutover the MT6000
+and the UniFi UDR were both absent from the new gateway's ARP table and DHCP
+leases, and no route to their subnet existed — they had not actually been
+re-cabled to it yet, regardless of what the plan said. `ip neigh` plus
+`/tmp/dhcp.leases` on the new gateway is the cheap check for "is this device
+actually where I think it is".
+
+**A GL.iNet VPN tunnel can be fully "up" and still carry no client traffic.**
+After the 2026-08-27 cutover, wgclient1/2/3 had addresses, live handshakes,
+correct policy marks and correct routing tables — `ip route get` returned the
+right tunnel — yet every container behind them was offline. Three separate
+layers were broken underneath a healthy-looking tunnel:
+
+1. `accept_to_wgclientN` was an **empty chain**, so the forward policy (`drop`)
+   killed the traffic. fw4 builds a zone from the netifd *network*, and netifd
+   never completes the "up" transition for these interfaces, so the zone was
+   created with no device.
+2. The `oifname wgclientN jump srcnat_wgclientN` **masquerade jump was missing**
+   for the same reason. Packets left with a private source and the replies never
+   returned. This one is especially deceptive: conntrack shows reply packets
+   arriving, so it reads as a routing fault when it is NAT.
+3. `/tmp/resolv.conf.d/resolv.conf.wgclientN` was **zero bytes**, so the
+   per-tunnel dnsmasq instances (2153/2253/2353) had no upstream and answered
+   every query REFUSED. `ping 1.1.1.1` worked while every name lookup failed.
+
+Diagnose in that order — forward accept, then srcnat, then per-tunnel DNS — and
+verify each with `nft list chain inet fw4 accept_to_<t>`,
+`nft list chain inet fw4 srcnat | grep <t>`, and
+`wc -c /tmp/resolv.conf.d/resolv.conf.<t>`. **`wg show <t> transfer` is the
+cheapest discriminator: if the counters do not move while a client generates
+traffic, the packets are being dropped before the tunnel and the problem is
+firewall, not VPN.**
+
+**Bind VPN firewall zones to the DEVICE, not the network, on this firmware.**
+`uci set firewall.@zone[N].device=wgclientN` makes the zone independent of
+netifd's state. But GL's `rtp2.sh` regenerates VPN zones dynamically and wipes
+the binding, so it must be reasserted from a boot hook — a one-time `uci commit`
+does not survive.
+
+**`/tmp` state must be reconciled at boot, not fixed by hand.** The per-tunnel
+resolv files live in `/tmp`. Any fix applied interactively is gone on the next
+power cycle. On this box the durable place is
+`/etc/hotplug.d/iface/99-network-buildout-persist`.
+
+**Prove persistence with a reboot you perform yourself.** Three reboots were
+needed here: the first proved the tunnels came back, the second exposed that the
+firewall binding had been wiped and only one tunnel recovered, the third
+confirmed the self-healing chain end to end with no intervention. One clean
+reboot is not evidence; the second is where the interesting failures show up.
