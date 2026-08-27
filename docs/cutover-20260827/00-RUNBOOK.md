@@ -97,12 +97,24 @@ sets this up.
 
 ## Order of operations
 
-**1. Prestage (safe, do it now, nothing breaks)**
+**1. Prestage — ALREADY DONE (2026-08-27 19:52, verified)**
 ```sh
-ssh root@192.168.3.1 'sh /root/cutover/10-prestage.sh'
+ssh root@192.168.3.1 'sh /root/cutover/10-prestage.sh'   # already run
 ```
-Adds the 7 Proxmox DHCP reservations and points scraper + log-server + pve-01
-host at the Ashburn tunnel. WAN and LAN addressing untouched.
+Created the 7 Proxmox DHCP reservations on the 192.168.9.x scope and put
+scraper + log-server + pve-01 host on the Ashburn tunnel. Verified afterwards:
+LAN still 192.168.3.1, WAN still dhcp, no reboot, dnsmasq up, 20 wifi VAPs, all
+four tunnels re-checked by exit IP and geolocation (Zürich / Frankfurt /
+Ashburn / New York), and container egress on the MT6000 unchanged.
+
+It is idempotent, so re-running it is harmless if you want to confirm.
+
+Backup taken: `/root/cfg-backups/etc-config-precutover-20260827-195200.tar.gz`
+
+**Also already done:** the MT6000's disabled guest/iot interfaces were
+re-addressed to 192.168.15.1 / 192.168.16.1 so they can never collide with
+3.1's guest (192.168.30.1) or iot (192.168.10.1). Step 3 below will therefore
+only perform the LAN re-IP.
 
 **2. Shut the Proxmox server down**
 ```sh
