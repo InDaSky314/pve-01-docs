@@ -11,10 +11,17 @@ echo "backup: /root/cfg-backups/etc-config-reip-$TS.tar.gz"
 echo "== LAN 192.168.9.1 -> 192.168.5.1 =="
 uci set network.lan.ipaddr='192.168.5.1'
 uci set network.lan.netmask='255.255.255.0'
-# guest/iot are disabled but both collide with 3.1's ranges - re-address so they
-# can never conflict if someone enables them later.
+# guest and iot here are DISABLED and their bridges never instantiate, so they
+# do not conflict with anything today. They are only re-addressed (not deleted)
+# so that they still cannot collide with 3.1's guest 192.168.30.1 / iot
+# 192.168.10.1 if anyone ever switches them on. Changing an address touches no
+# firewall or route_policy references; deleting them would orphan ~12 objects
+# (5 forwardings, guest_drop_leaked_dns and friends, append_source_if='iot').
+# Full removal is 92-mt6000-remove-guest-iot.sh - do NOT run that on cutover day.
 uci -q set network.guest.ipaddr='192.168.15.1'
 uci -q set network.iot.ipaddr='192.168.16.1'
+uci -q set network.guest.disabled='1'
+uci -q set network.iot.disabled='1'
 uci set network.wan.proto='dhcp'
 
 echo "== re-scope the TV reservations onto 192.168.5.0/24 =="
