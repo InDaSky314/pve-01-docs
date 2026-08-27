@@ -739,3 +739,121 @@ it's worth pursuing over the current manual WiFi-as-WAN bridge.
   no fault of ours — check GL.iNet's rollout before considering hardware
   replacement (a second Flint 3 would be the like-for-like path if MediaTek
   support slips indefinitely).
+
+---
+
+## Session addendum (2026-08-27) — per-SSID VPN binding, and the `clients` module
+
+### `route_policy` `from_type` taxonomy — the thing that makes per-SSID steering work
+
+A tunnel's "From" selector maps onto exactly one `from_type` in
+`/etc/config/route_policy`. This is the whole mechanism behind "which SSID goes
+out which tunnel":
+
+| GUI wizard tab | `from_type` | `from` value | Matches on |
+|---|---|---|---|
+| All Clients | `default` | — | everything unmatched |
+| Specified Connection Types | `interface` | network name (`guest`, `iot`, `lan`) | `iifname "br-<net>"` |
+| Specified Devices | `ipset` | `src_mac<tunnel_id>` | `ether saddr @src_mac<id>` |
+| Exclude Specified Devices | `ipset` (negated) | as above | inverted match |
+
+**GUI navigation aid:** VPN → VPN Dashboard → click the **"From"** area of a
+tunnel card (not the gear icon) → the 3-step wizard opens on step 2 →
+tab across to **"Specified Connection Types"** → tick the network → **Apply All
+Changes**. The card then reads `From: 1 Connection Type`.
+The VPN Dashboard page is **slow to render** — allow ~10s after navigation and
+after Apply before screenshotting or clicking, or you will act on a stale frame.
+
+### How the rules actually compose (verified live on 3.1, 2026-08-27)
+
+All rules land in one nft chain and are evaluated **in order, first match wins**,
+each gated on `meta mark & 0x0000f000 == 0`:
+
+```
+897: ether saddr @src_mac2430           -> mark 0x1000   (MAC rule, Swiss)
+902: iifname "br-iot"                   -> mark 0x2000   (interface rule, WALDO)
+907: iifname "br-guest"                 -> mark 0xa000   (interface rule, GIOT)
+912: (catch-all)                        -> mark 0x8000   (novpn)
+```
+
+Then `ip rule` priority 6000 maps mark → table → tunnel interface.
+
+Two consequences worth knowing:
+
+1. **MAC rules and interface rules coexist fine.** They are separate
+   `route_policy` rules in the same chain. A MAC rule sitting *above* an
+   interface rule wins for that device on *any* network — which is exactly what
+   you want for "this box always exits via Swiss no matter where it plugs in".
+   Rule order = UCI section order, so put the narrow MAC rules first.
+2. **One `from_type` per tunnel, and one tunnel per rule.** Each rule carries its
+   own `tunnel_id` and its own `/etc/vpn_profiles.d/profile<tunnel_id>` file.
+   You therefore **cannot** have a single tunnel serve both an SSID *and* a MAC
+   list. Wanting both against the same VPN endpoint means creating a **second
+   tunnel instance** to the same server. Use `vpn-client.add_tunnel` (see above)
+   — that is the UI's own handler and does the `group_id`/`peer_id`/profile
+   bookkeeping correctly.
+
+**Concurrency is not the limit:** 9.1 runs `wgclient1`+`wgclient2`+`wgclient3`
+simultaneously, and 3.1 runs `wgclient1`+`wgclient2`+`ovpnclient1`. Multiple
+WireGuard *and* OpenVPN client instances coexist on 4.10.0.
+
+### `clients` module — friendly names (and a trap that cost real time)
+
+Discovered by probing `gl-session call` with candidate func names; `clients` was
+already in the module catalog above but its funcs were never enumerated.
+
+```bash
+# Read the list the GUI renders (name, mac, ip, online, ...)
+ubus call gl-session call '{"module":"clients","func":"get_list","params":{}}'
+
+# Rename a device — this is what the GUI's pencil icon calls
+ubus call gl-session call '{"module":"clients","func":"set_info","params":{"mac":"BC:24:11:59:1F:60","name":"media-core"}}'
+```
+
+Confirmed funcs: `get_list`, `set_info`. **Not** present: `set_name`, `rename`,
+`get_name`, `set_client`, `list`, `get_info` (all return `-32601 Method not found`).
+
+`set_info` writes to **three** places at once — this is the bookkeeping you must
+not skip:
+- `/etc/config/gl-client` → `@client[].alias` (the durable friendly name)
+- `/etc/config/dhcp` → a `config host` static reservation pinning the current IP
+- `/etc/oui-tertf/client.db` → the `name` column
+
+**TRAP — same class as the raw-UCI trap above.** `/etc/oui-tertf/client.db` is a
+*derived cache*. Writing names into it directly with `sqlite3` appears to work
+and even survives a few minutes, but `ubus call gl-clients sync` silently
+reverts the row to the DHCP-reported hostname. Renames **must** go through
+`clients.set_info`. Symptom when you get this wrong: the name is right in the db
+right after the write, and blank again after the next sync or reboot.
+
+Note also that the GUI displays the **alias**, while `client.db.name` holds the
+raw DHCP hostname — so a device can legitimately show a name in the GUI while
+`client.db.name` is empty. Verify renames with `clients.get_list`, not with
+sqlite.
+
+Offline devices are absent from `get_list` output entirely, so a rename applied
+to a powered-down host cannot be verified until it comes back up; the alias in
+`/etc/config/gl-client` is the proof in the meantime.
+
+### Proxmox CT/VM MAC map (pve-01, for the Swiss/media rules)
+
+| MAC | CT/VM | Name |
+|---|---|---|
+| `BC:24:11:59:1F:60` | CT 105 | media-core |
+| `BC:24:11:EF:79:09` | CT 107 | log-server |
+| `BC:24:11:28:55:77` | CT 108 | scraper |
+| `BC:24:11:34:1C:E8` | CT 110 | jellyfin-live |
+| `BC:24:11:9A:ED:DB` | CT 111 | jellyfin-vod |
+| `BC:24:11:01:33:58` | CT 112 | jellyfin-npvr |
+| `BC:24:11:6C:21:D3` | CT 113 | android-emulator |
+| `BC:24:11:18:0E:A7` | VM 104 | SRV-STD-2022 |
+| `52:9F:12:A3:47:63` | VM 102 | WIN11 |
+| `7C:2B:E1:13:DE:30` | host | pve-01 (`enp2s0`/`vmbr0`) |
+
+Regenerate with:
+```bash
+for c in $(pct list | awk 'NR>1{print $1}'); do
+  printf "%-5s %-20s %s\n" "$c" "$(pct config $c | sed -n 's/^hostname: //p')" \
+    "$(pct config $c | grep -oiE 'hwaddr=[0-9A-F:]+' | cut -d= -f2)"
+done
+```

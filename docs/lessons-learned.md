@@ -799,3 +799,51 @@ measured actually runs.
 **One benchmark run is not a ranking.** Three sweeps disagreed on the ordering
 within the top five US endpoints while agreeing strongly on the east/west
 split. Report what survives repetition; call the rest tied.
+
+**GL.iNet's `client.db` is a derived cache, not a store.** Writing friendly
+names into `/etc/oui-tertf/client.db` with `sqlite3` reads back correctly and
+survives for minutes, then `gl-clients sync` silently reverts the row to the
+DHCP-reported hostname. Renames must go through the UI's own handler,
+`clients.set_info` via `gl-session call`, which writes the alias, a DHCP static
+reservation, and the cache together. This is the *same* trap as hand-editing
+`route_policy` with `uci set`: on this firmware, any state the GUI manages has
+bookkeeping in more than one file, and the only safe write path is the handler
+the GUI itself calls. Before scripting a GL change, look for the module/func
+first — assume a direct file write is wrong until proven otherwise.
+
+**Read the runbook before diagnosing, not after.** `docs/glinet-api-cli-runbook.md`
+already documented `gl-session call` — the exact mechanism needed to rename
+clients correctly — while time was being spent probing `ubus list` and grepping
+for a rename implementation in binaries. The owner had to point at the runbook.
+The lookup costs one `grep -n "^#"` on the file.
+
+**On GL.iNet, the GUI shows the alias; the db shows the DHCP hostname.** A
+device can correctly display a friendly name in the GUI while
+`client.db.name` is empty, and vice versa. Verify renames with
+`clients.get_list` (what the GUI renders), never with sqlite. Offline devices
+are omitted from `get_list` entirely, so a rename to a powered-down host can
+only be verified via `/etc/config/gl-client`.
+
+**GL.iNet's `client.db` is a derived cache, not a store.** Writing friendly
+names into `/etc/oui-tertf/client.db` with `sqlite3` reads back correctly and
+survives for minutes, then `gl-clients sync` silently reverts the row to the
+DHCP-reported hostname. Renames must go through the UI's own handler,
+`clients.set_info` via `gl-session call`, which writes the alias, a DHCP static
+reservation, and the cache together. This is the *same* trap as hand-editing
+`route_policy` with `uci set`: on this firmware, any state the GUI manages has
+bookkeeping in more than one file, and the only safe write path is the handler
+the GUI itself calls. Before scripting a GL change, look for the module/func
+first — assume a direct file write is wrong until proven otherwise.
+
+**Read the runbook before diagnosing, not after.** `docs/glinet-api-cli-runbook.md`
+already documented `gl-session call` — the exact mechanism needed to rename
+clients correctly — while time was being spent probing `ubus list` and grepping
+for a rename implementation in binaries. The owner had to point at the runbook.
+The lookup costs one `grep -n "^#"` on the file.
+
+**On GL.iNet, the GUI shows the alias; the db shows the DHCP hostname.** A
+device can correctly display a friendly name in the GUI while
+`client.db.name` is empty, and vice versa. Verify renames with
+`clients.get_list` (what the GUI renders), never with sqlite. Offline devices
+are omitted from `get_list` entirely, so a rename to a powered-down host can
+only be verified via `/etc/config/gl-client`.
