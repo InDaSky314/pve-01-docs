@@ -868,3 +868,25 @@ touching wireless on 3.1, confirmed its uplink was wired (eth0/DHCP, repeater
 and bsta disabled) so a wireless reload could not strand the session. That box
 had previously gone unreachable when a mesh backhaul dropped. One cheap query
 turns an unattended risky change into a safe one.
+
+**On the BE9300, `wifi reload` does not instantiate a newly enabled radio's
+VAPs — only a reboot does.** An enabled radio with no `/var/run/hostapd-<vap>.conf`
+means "needs a reboot", not "is broken". Two hours went into hunting an MLO or
+regulatory cause for 6 GHz that a single reboot resolved. Before diagnosing a
+wireless enablement failure on this hardware, reboot once and re-check.
+
+**Diff MLO sections against their siblings after any SSID edit.** A bulk SSID
+rotation left `wlanmldguest6g` with the wrong SSID *and* the wrong network
+(`Open-Fields` on `iot`, versus `GL-BE9300-437-MLO-Guest` on `guest` for both its
+siblings). The MLO sections do not appear in the GUI's SSID list, so nothing
+surfaces the divergence. It was inert only while 6 GHz was down; the reboot that
+enabled 6 GHz brought that VAP up, and uncorrected it would have put an
+"Open-Fields" SSID on the German VPN. Three sibling sections that disagree in
+any field is a bug, not a configuration.
+
+**A changed SSH host key is a question, not a verdict.** After a reboot,
+192.168.3.1 presented an unexpected key. It was the same host: that exact key was
+already trusted in known_hosts under the router's Tailscale address, and the
+192.168.3.1 line was stale from a previous device. Cross-check against the host's
+other known address before editing known_hosts, and never accept blindly to make
+the warning go away.
