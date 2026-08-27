@@ -1,0 +1,7 @@
+BC:24:11:59:1F:60|192.168.9.50|media-core
+BC:24:11:28:55:77|192.168.9.115|scraper
+BC:24:11:EF:79:09|192.168.9.164|log-server
+BC:24:11:9A:ED:DB|192.168.9.171|jellyfin-vod
+BC:24:11:6C:21:D3|192.168.9.204|android-emulator
+BC:24:11:01:33:58|192.168.9.219|jellyfin-npvr
+BC:24:11:34:1C:E8|192.168.9.195|jellyfin-live
