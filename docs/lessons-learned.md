@@ -890,3 +890,35 @@ already trusted in known_hosts under the router's Tailscale address, and the
 192.168.3.1 line was stale from a previous device. Cross-check against the host's
 other known address before editing known_hosts, and never accept blindly to make
 the warning go away.
+
+**Diff siblings, attribute by attribute, when one member of a group misbehaves.**
+Three of the six MLO member VAPs had silently lost their `mld=` binding — the one
+attribute that makes a VAP a link of an MLD rather than a plain AP. Nothing
+surfaced it: the VAPs came up, bridged, and broadcast normally. The MLD simply
+never gained links, and a single-link MLD is torn down by the firmware, which is
+what the "applied then reverts" toggle was actually reporting. An attribute
+present on two siblings and absent on the third is a bug, not a configuration.
+This is the third distinct corruption from one SSID rotation (after
+`wlanmldguest6g`'s ssid/network and `mlo.global.support_bands`), so after any
+bulk wireless edit on this box, diff every sibling group before trusting it.
+
+**Do not guard a security boundary with a workaround that can fail silently.**
+The firmware bridges the MLD parent to the wrong network, putting guest MLO
+clients on the German VPN instead of the US one. `ip link set mld1 master
+br-guest` fixes it at runtime and a boot hook would have "worked", but any wifi
+reconfigure could re-parent it and nothing would alert. The feature was disabled
+instead and the capability restored a different way (a non-MLO 6 GHz VAP that
+bridges correctly). Prefer losing a feature over keeping a boundary that depends
+on a hook holding.
+
+**Ask what a UI error is really reporting.** "Applied, then the toggle turns off"
+was not a UI bug and not a permissions problem — it was the firmware correctly
+refusing to keep an MLD that had only one link. The toggle was telling the truth
+about a config defect three layers down.
+
+**When a subagent returns nothing, check the shape of the task before the tool.**
+Two Agy runs produced empty reports and both looked like tool failure. A
+ten-second smoke test proved Agy was fine; the prompts were six-part
+investigations that ran past the timeout, and Agy only writes its report at the
+end, so being killed meant losing everything. Scope subagent tasks to one
+question with a small deliverable, or have them write findings incrementally.
