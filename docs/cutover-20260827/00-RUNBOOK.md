@@ -35,9 +35,34 @@ ONT ──PPPoE──> BE9300 3.1 (192.168.9.1)  ← edge + LAN gateway
 | MT6000 guest / iot (disabled) | 192.168.9.1 / 192.168.10.1 | 192.168.15.1 / 192.168.16.1 |
 | BE9300 guest / iot | 192.168.30.1 / 192.168.10.1 | unchanged |
 
-Two collisions being resolved: the MT6000 had `lan` and `guest` both on
-192.168.9.1, and both routers claimed 192.168.10.1 for IoT. Inert today (those
-interfaces are disabled) but they would bite once the MT6000 sits behind 3.1.
+### On the 192.168.10.1 "collision" — verified, and it is not an active one
+
+Measured on both routers rather than read off config:
+
+- **BE9300 (3.1): IoT is live and load-bearing.** `br-iot` UP at 192.168.10.1/24,
+  members `wlan06` + `wlan16` — both the **WALDO** SSID — one active lease, and
+  it is the interface the `WALDO -> wgclient2` (Frankfurt) policy rule binds to.
+  **Nothing in this cutover touches it.**
+- **MT6000 (9.1): IoT and guest are dead.** Both `disabled=1`, neither bridge
+  instantiates, zero leases, only `br-lan` is live. The four VAPs referencing
+  them are all disabled with stock GL names.
+
+So the duplicate address never actually conflicts — 9.1's IoT does not exist at
+runtime. Same for `lan`/`guest` both reading 192.168.9.1 on the MT6000. These
+are latent config duplicates, not live faults, and they are **not blockers**.
+
+`91-mt6000-reip.sh` therefore only *re-addresses* the disabled interfaces
+(guest -> 192.168.15.1, iot -> 192.168.16.1) and pins them disabled. That is a
+one-field change per interface with no firewall or routing side effects, and it
+removes the footgun if anyone ever enables them.
+
+**Deliberately not deleting them during the cutover.** On the MT6000 those two
+networks are referenced by 5 forwardings (`guest->wan`, `iot->wan`,
+`guest->wgclient1/2/3`), 6+ firewall rules including named sections such as
+`guest_drop_leaked_dns`, and `route_policy.global.append_source_if='iot'`.
+Unwinding ~12 objects on a router that is also changing role the same day is how
+you end up with dangling references and a wifi outage. Full removal lives in
+`92-mt6000-remove-guest-iot.sh` — run it on a calm day, not today.
 
 PPPoE is **untagged on eth0** — no VLAN 7 needed on this line. Credentials are
 already staged at `/root/cutover/.pppoe-creds` (mode 600), copied from the
