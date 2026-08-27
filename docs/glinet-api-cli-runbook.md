@@ -994,3 +994,102 @@ SSH refused with the MITM warning. It was **not** an attack: the key answering
 its Tailscale IP `100.82.158.23`; the `192.168.3.1` line was stale from an
 earlier device on that address. Resolve this by comparing against the host's
 other known address before touching `known_hosts` — never by blindly accepting.
+
+## MLO on the BE9300 — root cause, fix, and a firmware bug (2026-08-27)
+
+Symptom: the MLO toggle on the Wireless page reports "applied" and then flips
+itself back off. Guest MLO could be enabled; the main (Open-Fields) group could
+not. The RPC behind the toggle is `wifi.set_config`, which returns **HTTP 500**.
+
+### Two config bugs, both collateral from the 2026-08-26 SSID rotation
+
+**1. `mlo.global.support_bands` collapsed from a list to a single value.**
+
+```
+# broken                       # correct (restored from mlo.pre-disable-20260826)
+option support_bands '2g'      list support_bands '2g'
+                               list support_bands '5g'
+                               list support_bands '6g'
+```
+With support restricted to 2.4 GHz, the driver logged
+`osifp_create_wlan_vap: mlo_mbssid disabled in lower band radios` and
+`wlan_mlme_start_ap_vdev: Allowing 11be non-MLO operation as per INI configuration`
+on every VAP start. Fixing it cleared both messages (count went to zero).
+
+**2. Three MLO member VAPs had lost their `mld` binding entirely.**
+
+```
+wlanmld2g       mld=mld0      (ok)
+wlanmld5g       mld=MISSING   -> must be mld0
+wlanmld6g       mld=MISSING   -> must be mld0
+wlanmldguest2g  mld=mld1      (ok)
+wlanmldguest5g  mld=mld1      (ok)
+wlanmldguest6g  mld=MISSING   -> must be mld1   (also carried a stale iot='1')
+```
+`mld` is the attribute that makes a VAP a *link* of an MLD rather than an
+ordinary bridged AP. Without it the VAP still comes up and still bridges — it
+just never joins the MLD. That is why `mld0` only ever had one link (`wlan02`),
+and **a single-link MLD is not MLO, so the firmware tears it back down** — which
+is exactly what the reverting toggle was showing.
+
+After restoring all three bindings and rebooting:
+```
+mld0  UP LOWER_UP  bridge=br-lan  links: wlan02(2.4) wlan12(5) wlan22(6 GHz)
+```
+Full tri-band MLO on the main network.
+
+**Diagnostic that found it** — diff each MLO member against its same-group
+sibling, attribute by attribute. Any attribute present on two of three siblings
+and missing on the third is a bug:
+```bash
+for s in wlanmld2g wlanmld5g wlanmld6g wlanmldguest2g wlanmldguest5g wlanmldguest6g; do
+  printf "%-16s mld=%-8s net=%-7s guest=%-4s iot=%-4s disabled=%s\n" "$s" \
+    "$(uci -q get wireless.$s.mld || echo MISSING)" \
+    "$(uci -q get wireless.$s.network)" "$(uci -q get wireless.$s.guest || echo -)" \
+    "$(uci -q get wireless.$s.iot || echo -)" "$(uci -q get wireless.$s.disabled)"
+done
+```
+
+### FIRMWARE BUG: the MLD parent ignores its network and lands on the wrong bridge
+
+With both MLDs enabled and correctly configured (`network='guest'`, `guest='1'`,
+no `iot` flag on every member), `mld1` still bridged into **`br-iot`**:
+
+```
+br-lan    eth1.1 mld0 wlan0 wlan1 wlan2
+br-guest  wlan01 wlan11 wlan21
+br-iot    mld1 wlan06 wlan16          <-- mld1 is the GIOT MLO group
+```
+
+On this router `br-iot` egresses via the **German** WireGuard tunnel while
+`br-guest` egresses via the **US** OpenVPN tunnel, so guest MLO clients would
+have silently used the wrong VPN. Adding `option network 'guest'` to the
+`wireless.mld1` section is accepted by UCI and **ignored** by the firmware.
+`ip link set mld1 master br-guest` works at runtime, so a boot hook is possible —
+but it was deliberately **not** used: a hook that fails after any wifi
+reconfigure re-opens a VPN boundary silently, which is worse than not having the
+feature.
+
+**Resolution taken:** guest MLO disabled, and GIOT restored on 6 GHz through the
+ordinary non-MLO VAP (`guest6g` -> `wlan21`), which bridges to `br-guest`
+correctly. GIOT therefore covers 2.4 + 5 + 6 GHz with the right egress, just
+without multi-link. Open-Fields keeps full tri-band MLO.
+
+**Disabling an MLD takes two changes, not one.** `mlo.mld1.disabled='1'` alone
+persists but the firmware still builds the MLD from its member VAPs. The member
+sections must be disabled as well:
+```bash
+uci set mlo.mld1.disabled='1'; uci commit mlo
+for s in wlanmldguest2g wlanmldguest5g wlanmldguest6g; do
+  uci set wireless.$s.disabled='1'; done; uci commit wireless
+reboot
+```
+Result: `mld1` remains as an empty bridge port with **no links and no hostapd
+config**, so it broadcasts nothing and nothing can associate to it.
+
+### Firmware status
+
+`GL.iNet BE9300 / IPQ5332-AP-MI01.6`, version **4.10.0, type `beta1`**, build
+2026-07-07. The router's own online check reports **"Firmware is up-to-date"**,
+so this is already the newest available on the beta channel — the MLD bridging
+bug is present in the latest build and is worth reporting upstream to GL.iNet.
