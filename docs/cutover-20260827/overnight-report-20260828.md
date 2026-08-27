@@ -151,3 +151,37 @@ Tuesday or plan to press the button.
 on inbound interface, which only applies to forwarded traffic, so nothing I run
 from the router proves anything. Connect a phone to each SSID and check the exit:
 GIOT → New York, WALDO → Frankfurt, Open-Fields → your own IP.
+
+---
+
+## Independent validation (Agy)
+
+I had Agy adversarially review the fixes, with instructions to challenge them. It
+performed **its own separate reboot** and reached the same result independently —
+so this has now survived four reboots across two agents.
+
+It confirmed:
+
+- All containers egress correctly with **DNS working**, unattended
+- All four `srcnat` jumps emitted with no intervention
+- **Killswitch fails closed** — blackhole routes in tables 1001/1002/1003, the
+  priority-9910 rule, and an `lan_drop_leaked_dns` firewall rule
+- **No plaintext DNS leak** — queries stay encapsulated in the tunnel
+- Both timers intact, with IDs; power override confirmed to Tue 06:00
+- MT6000 healthy, all TV devices on `192.168.5.x` with correct names
+
+It raised four issues. **I deliberately fixed none of them tonight**, and I want
+to be explicit about why rather than have you find unexplained changes:
+
+| Agy's finding | My call |
+|---|---|
+| **Geo-DNS on the Swiss tunnel** — resolvers are in New York and Frankfurt, not Switzerland, so IPTV CDN lookups may resolve to non-Swiss edges | **Valid, but not a regression.** This is the firmware's own default — `ovpnclient1` has the identical pair, and it is exactly what netifd would have written. IPTV works right now. Changing DNS on the IPTV path hours before two scheduled recordings trades a working system for a theoretical geo benefit. **Worth doing with you awake, after the games.** |
+| Replace `firewall restart` with `fw4 reload` in the boot hook (blocks hotplug ~11s) | Real, but the current mechanism is proven across four reboots and the delay has caused no observed harm. Churning boot-critical code overnight for a performance nicety is the riskier choice. |
+| Add `[ "$ACTION" = "ifup" ] || exit 0` gating | Same reasoning — saves CPU, changes when reconciliation runs. Not worth touching proven code unsupervised. |
+| Duplicate `#!/bin/sh` mid-file from appending | Cosmetic; a `#!` mid-script is just a comment. Left alone to avoid touching the file at all. |
+
+My reasoning throughout: the system is working and proven. The remaining items are
+efficiency and hygiene with no functional impact. All are safe morning tasks.
+
+**Recommended order when you are back:** verify per-SSID egress with a phone →
+decide on Swiss DNS → the three hygiene fixes → decide on the Tuesday shutdown.
