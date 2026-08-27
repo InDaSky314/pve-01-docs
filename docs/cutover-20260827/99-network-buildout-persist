@@ -1,0 +1,168 @@
+#!/bin/sh
+# /etc/hotplug.d/iface/99-network-buildout-persist
+#
+# Persists network configuration and VPN tunnel health across reboots:
+#
+# 1. MLD Bridge attachment:
+#    - mld0 (Open-Fields, SSID for main LAN) -> br-lan
+#    - mld1 (GIOT, SSID for Guest network)  -> br-guest
+#
+# 2. Cleanup stale/obsolete ip rules:
+#    - Removes old manual priority 5900 / 6100 rules that interfered with
+#      GL.iNet's native route_policy engine.
+#
+# 3. Spurious blackhole cleanup:
+#    - Removes spurious 'from all iif br-lan blackhole' rule if added by rtp2.
+#
+# 4. WireGuard tunnel IP and routing reconciliation fail-safe:
+#    - For each enabled WireGuard tunnel, if handshake is active but address/route
+#      is missing (e.g. from a netifd timing race), reasserts IP and default route.
+
+logger -t network-buildout-persist "hotplug fired (INTERFACE=$INTERFACE ACTION=$ACTION)"
+
+# --- 1. MLD Bridging ---
+if ip link show mld0 >/dev/null 2>&1; then
+    current_master=$(ip -o link show mld0 2>/dev/null | sed -n 's/.*master \([^ ]*\).*/\1/p')
+    if [ "$current_master" != "br-lan" ]; then
+        ip link set dev mld0 master br-lan 2>&1 | logger -t network-buildout-persist
+        logger -t network-buildout-persist "attached mld0 -> br-lan (was: ${current_master:-none})"
+    fi
+fi
+
+if ip link show mld1 >/dev/null 2>&1; then
+    current_master=$(ip -o link show mld1 2>/dev/null | sed -n 's/.*master \([^ ]*\).*/\1/p')
+    if [ "$current_master" != "br-guest" ]; then
+        ip link set dev mld1 master br-guest 2>&1 | logger -t network-buildout-persist
+        logger -t network-buildout-persist "attached mld1 -> br-guest (was: ${current_master:-none})"
+    fi
+fi
+
+# --- 2. Clean up obsolete ip rules (prio 5900 & 6100) ---
+ip rule del from 192.168.11.0/24 lookup 1011 priority 5900 2>/dev/null
+ip rule del from 192.168.12.0/24 lookup 1002 priority 5900 2>/dev/null
+ip rule del from 192.168.9.0/24 lookup 1001 priority 5900 2>/dev/null
+ip rule del from 192.168.11.0/24 lookup 1011 priority 6100 2>/dev/null
+ip rule del from 192.168.12.0/24 lookup 1002 priority 6100 2>/dev/null
+ip rule del from 192.168.9.0/24 lookup 1001 priority 6100 2>/dev/null
+
+# --- 3. Spurious br-lan blackhole cleanup ---
+if ip rule show | grep -q "from all iif br-lan blackhole"; then
+    ip rule del prio 9920 iif br-lan 2>&1 | logger -t network-buildout-persist
+    logger -t network-buildout-persist "removed spurious br-lan (main) blackhole rule"
+fi
+
+# --- 4. WireGuard IP and Table Reconciliation ---
+reconcile_wg_tunnel() {
+    local iface="$1"
+    local table="$2"
+    local addr="${3:-10.14.0.2/24}"
+
+    # Check if interface is configured and enabled
+    [ "$(uci -q get network.${iface}.disabled)" = "0" ] || return 0
+    ip link show dev "$iface" >/dev/null 2>&1 || return 0
+
+    # Check if handshake exists
+    local hs=$(wg show "$iface" latest-handshakes 2>/dev/null | awk '{print $2}')
+    if [ -n "$hs" ] && [ "$hs" -gt 0 ] 2>/dev/null; then
+        # Ensure IP is assigned
+        if ! ip -4 addr show dev "$iface" 2>/dev/null | grep -q "inet "; then
+            ip addr add "$addr" dev "$iface" 2>/dev/null
+            logger -t network-buildout-persist "reconciled $iface: added $addr"
+        fi
+
+        # Ensure default route exists in table
+        if ! ip route show table "$table" 2>/dev/null | grep -q "default dev $iface"; then
+            ip route replace default dev "$iface" table "$table" 2>/dev/null
+            logger -t network-buildout-persist "reconciled $iface: replaced default route in table $table"
+        fi
+
+        # Ensure state file reflects connected
+        [ -f /tmp/wireguard/"${iface}"_state ] && echo "connected" > /tmp/wireguard/"${iface}"_state
+    fi
+}
+
+reconcile_wg_tunnel wgclient1 1001 10.14.0.2/24
+reconcile_wg_tunnel wgclient2 1002 10.14.0.2/24
+reconcile_wg_tunnel wgclient3 1003 10.14.0.2/24
+
+#!/bin/sh
+# Appended 2026-08-27: per-tunnel DNS reconciliation.
+#
+# The WireGuard tunnels' resolv files (/tmp/resolv.conf.d/resolv.conf.<iface>)
+# are written by netifd when it marks the interface up. On this box netifd never
+# completes that transition for wgclient*, so the files stay ZERO BYTES, their
+# per-tunnel dnsmasq instances (2153/2253/2353) have no upstream, and every DNS
+# query from a tunnelled client comes back REFUSED. IP connectivity works, which
+# makes it look like a routing fault when it is purely DNS.
+#
+# /tmp is volatile, so this must run on every boot.
+reconcile_vpn_dns() {
+    changed=0
+    for t in wgclient1 wgclient2 wgclient3; do
+        [ -e "/sys/class/net/$t" ] || continue
+        f="/tmp/resolv.conf.d/resolv.conf.$t"
+        # only act when the file is missing or empty - never clobber a good one
+        [ -s "$f" ] && continue
+        cfg=$(uci -q get "network.$t.config")
+        dns=$(uci -q get "wireguard.$cfg.dns" 2>/dev/null)
+        [ -z "$dns" ] && dns=$(uci -q get "wireguard.group_4557.dns" 2>/dev/null)
+        [ -z "$dns" ] && continue
+        mkdir -p /tmp/resolv.conf.d
+        {
+            echo "# Interface $t (reconciled by 99-network-buildout-persist)"
+            echo "$dns" | tr ',' '\n' | while read -r s; do
+                [ -n "$s" ] && echo "nameserver $s"
+            done
+        } > "$f"
+        logger -t netbuildout "reconciled DNS for $t from $cfg"
+        changed=1
+    done
+    [ "$changed" = "1" ] && /etc/init.d/dnsmasq reload >/dev/null 2>&1
+    return 0
+}
+
+reconcile_vpn_dns
+
+# Appended 2026-08-27: firewall zone reconciliation for VPN tunnels.
+#
+# fw4 builds a zone's accept/srcnat chains from the netifd NETWORK. netifd never
+# completes the "up" transition for wgclient* on this box, so the zone is built
+# with no device: accept_to_wgclientN ends up empty and, critically, the
+# "oifname wgclientN jump srcnat_wgclientN" masquerade jump is never emitted.
+# Forwarded client traffic then leaves the tunnel with a private source address
+# and the replies never come back - it looks like a routing fault but is NAT.
+#
+# Binding the zone to the DEVICE makes it independent of netifd state. GL's
+# rtp2.sh regenerates these zones dynamically, so the binding gets wiped and
+# must be reasserted on every boot.
+reconcile_vpn_firewall() {
+    need_reload=0
+    for t in wgclient1 wgclient2 wgclient3 ovpnclient1; do
+        [ -e "/sys/class/net/$t" ] || continue
+        # a tunnel with no address is not ready; skip rather than thrash
+        ip -4 addr show "$t" 2>/dev/null | grep -q "inet " || continue
+        # already wired? nothing to do
+        nft list chain inet fw4 srcnat 2>/dev/null | grep -q "jump srcnat_$t" && continue
+
+        i=0
+        while [ $i -lt 30 ]; do
+            n=$(uci -q get "firewall.@zone[$i].name" 2>/dev/null)
+            [ -z "$n" ] && break
+            if [ "$n" = "$t" ]; then
+                uci set "firewall.@zone[$i].device=$t"
+                logger -t netbuildout "bound firewall zone $t to device $t (netifd never marked it up)"
+                need_reload=1
+                break
+            fi
+            i=$((i+1))
+        done
+    done
+    if [ "$need_reload" = "1" ]; then
+        uci commit firewall
+        /etc/init.d/firewall restart >/dev/null 2>&1
+        logger -t netbuildout "firewall restarted to emit VPN srcnat jumps"
+    fi
+    return 0
+}
+
+reconcile_vpn_firewall
