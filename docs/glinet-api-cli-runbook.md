@@ -857,3 +857,89 @@ for c in $(pct list | awk 'NR>1{print $1}'); do
     "$(pct config $c | grep -oiE 'hwaddr=[0-9A-F:]+' | cut -d= -f2)"
 done
 ```
+
+### `wifi` module — radios and SSIDs (3.1, 2026-08-27)
+
+The module is **`wifi`**, not `wireless` (that name returns `Method not found`).
+
+```bash
+ubus call gl-session call '{"module":"wifi","func":"get_status","params":{}}'
+ubus call gl-session call '{"module":"wifi","func":"get_config","params":{}}'
+```
+
+`get_config` returns `{dfs_support, bandmode, res:[radio,...]}`; each radio has
+`device` (`wifi0`/`wifi1`/`wifi2`), `band` (`2G`/`5G`/`6G`), `htmode`, `txpower`,
+`channels[]` (with `psc` and `dfs` flags) and `ifaces[]`. Note the radio object
+carries **no `enabled` field** — per-radio enable lives only in
+`/etc/config/wireless` as `wireless.wifi<N>.disabled`. `set_config` exists but
+its payload shape was not captured; the Wireless GUI page is the safer editor.
+
+**GUI caution:** the Wireless page on 3.1 hangs on a "Processing, please wait…"
+modal that blocks scrolling and clicks — it did not clear across a reload and
+two 10s waits. Fall back to `gl-session call` / SSH when that happens.
+
+### 6 GHz on the BE9300 does not come up from `wireless.wifi2.disabled=0` alone
+
+Attempted 2026-08-27. Setting `wireless.wifi2.disabled='0'` + `wifi reload`
+brings the *radio* up and is harmless — 2.4 GHz and 5 GHz were re-verified
+unchanged and correctly bridged afterwards — but **no 6 GHz AP appears**:
+
+- `logread`: `Wireless device 'wifi2' is now up`
+- `ubus call network.wireless status`: `wifi2 up=True pending=False`, listing
+  `wifi6g` / `wlanmld6g` / `wlanmldguest6g` all with `disabled=False`
+- but **no `wlan2*` netdev is created** and **no `/var/run/hostapd-wlan2*.conf`
+  is generated** — only the seven 2.4/5 GHz configs exist
+
+So netifd reports success while `qca-wifi-configurator` never instantiates the
+VAPs. Same family as the earlier hostapd-drift incident on this box: netifd's
+view is not evidence that a VAP exists. **Verify 6 GHz with `iwinfo` /
+`/var/run/hostapd-*.conf`, never with `network.wireless status`.**
+
+Unresolved. Prime suspect is MLO: `mld-phy0` also advertises 28 6 GHz channels
+and `mld0` is already a member of `br-lan`, while both MLO toggles in the GUI
+are **off** — so the 6 GHz chain may be claimed by the MLD phy and only
+reachable by enabling MLO. Next step is the GUI's
+"2.4 GHz + 5 GHz + 6 GHz" MLO toggle (needs the hung Wireless page working),
+or a reboot — note a reboot previously killed 3.1's Tailscale, so do it with
+someone on site.
+
+`wireless.wifi2.disabled='0'` was left in place: it is the intended end state,
+costs nothing while no VAP exists, and may resolve on the next clean boot.
+
+### Latent misconfiguration found while investigating
+
+`wlanmldguest6g` is configured with **`ssid='Open-Fields'` but `network='iot'`**.
+Every other Open-Fields VAP is on `lan`. IoT is bound to the German WireGuard
+tunnel, so if that VAP ever instantiates, a client joining "Open-Fields" on
+6 GHz would silently egress through Frankfurt instead of natively. It is inert
+today only because no 6 GHz VAP comes up. **Fix this before enabling MLO/6 GHz.**
+
+### Verified: adding a tunnel via the UI handler (2026-08-27)
+
+Full working sequence, `add_tunnel` → `set_tunnel` → verify, on 3.1:
+
+```bash
+# 1. create (lands disabled, named whatever you pass)
+ubus call gl-session call '{"module":"vpn-client","func":"add_tunnel","params":{
+  "via":{"type":"wireguard","configs":[{"group_id":4557,"id_list":[1504]}]},
+  "from":{"type":"mac","mac_list":["BC:24:11:28:55:77"]},
+  "to":{"type":"default"},"name":"US-Ashburn (WG)"}}'
+# -> {"tunnel_id": 3742}
+
+# 2. enable it
+ubus call gl-session call '{"module":"vpn-client","func":"set_tunnel","params":{"tunnel_id":3742,"enabled":true}}'
+
+# 3. verify the EXIT, not the config
+curl -s --interface wgclient3 https://api.ipify.org
+```
+
+The firmware allocated `wgclient3` automatically and the rule appeared as
+`route_policy.@rule[3]` with its own `profile3742`. Surfshark WireGuard peer ids
+are stable in `uci show wireguard` (`peer_1500` New York … `peer_1504` Ashburn …
+`peer_1524` Los Angeles), all under Surfshark `group_id=4557`.
+
+**Always verify a tunnel by its exit IP.** All Surfshark peers hand out the same
+client address `10.14.0.2/24`, which produces three same-priority
+`from 10.14.0.2 lookup 100X` ip rules — the config alone cannot tell you which
+exit you actually got. Confirmed live: wgclient1→Zürich, wgclient2→Frankfurt,
+wgclient3→Ashburn, ovpnclient1→New York.
