@@ -943,3 +943,54 @@ client address `10.14.0.2/24`, which produces three same-priority
 `from 10.14.0.2 lookup 100X` ip rules — the config alone cannot tell you which
 exit you actually got. Confirmed live: wgclient1→Zürich, wgclient2→Frankfurt,
 wgclient3→Ashburn, ovpnclient1→New York.
+
+### RESOLVED (2026-08-27): 6 GHz needs a full reboot, not `wifi reload`
+
+The 6 GHz failure documented above was **not** an MLO lock. `wireless.wifi2.disabled='0'`
+is correct and sufficient — but `wifi reload` will not instantiate the 6 GHz VAPs.
+Only a full `reboot` does. After the reboot, on the same config that had produced
+nothing:
+
+```
+  wlan2    Open-Fields              br-lan     ch=5   5.975 GHz
+  wlan22   Open-Fields              br-lan     ch=5   5.975 GHz   (MLO)
+  wlan23   GL-BE9300-437-MLO-Guest  br-guest   ch=5   5.975 GHz   (MLO guest)
+```
+with `hostapd-wlan2.conf`, `hostapd-wlan22.conf`, `hostapd-wlan23.conf` all
+generated. `wifi.get_status` then reports `wifi2 band=6g channel=5`.
+
+**Rule for this box: a radio that is enabled in UCI but has no
+`/var/run/hostapd-<vap>.conf` needs a reboot, not another reload.** Do not
+conclude the radio is broken and do not go hunting for an MLO/regulatory cause
+before rebooting once.
+
+Reboot notes: plain `reboot` over SSH works (a previous `nohup sh -c "sleep 2;
+reboot"` silently never fired). Down/up took ~80 seconds; SSH and Tailscale both
+came back on their own. Prove it with `/proc/uptime`, never with "ping answers".
+
+### The `wlanmldguest6g` fix was load-bearing — confirmed by the reboot
+
+Before the reboot, `wlanmldguest6g` had `ssid='Open-Fields'` and `network='iot'`
+while both its siblings had `ssid='GL-BE9300-437-MLO-Guest'` / `network='guest'`.
+It was corrected to match. The reboot then **brought that VAP up as `wlan23`** —
+so had it not been corrected, a VAP advertising **"Open-Fields" would now be
+bridged to `br-iot` and egressing through the German WireGuard tunnel**, while
+every other Open-Fields VAP exits natively. The leak would have been live.
+
+Note the firmware reset `wlanmldguest6g.disabled` from `1` back to `0` across the
+reboot — it manages MLO member enablement itself — but it **kept** the corrected
+`ssid` and `network`. So disabling an MLO member is not durable; fixing its
+network binding is.
+
+**Generalisation:** after any SSID rotation on this box, diff every `wlanmld*`
+section against its same-group siblings. The MLO sections are not visible in the
+GUI's normal SSID list and silently keep whatever a bulk edit wrote into them.
+
+### Stale `known_hosts` entries after a router swap
+
+Post-reboot, `192.168.3.1` presented a key that did not match `known_hosts` and
+SSH refused with the MITM warning. It was **not** an attack: the key answering
+(`SHA256:Xixuagkw2Z/…`) was already the trusted entry for the *same host* under
+its Tailscale IP `100.82.158.23`; the `192.168.3.1` line was stale from an
+earlier device on that address. Resolve this by comparing against the host's
+other known address before touching `known_hosts` — never by blindly accepting.
