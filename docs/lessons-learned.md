@@ -847,3 +847,24 @@ device can correctly display a friendly name in the GUI while
 `clients.get_list` (what the GUI renders), never with sqlite. Offline devices
 are omitted from `get_list` entirely, so a rename to a powered-down host can
 only be verified via `/etc/config/gl-client`.
+
+**netifd reporting a wireless device "up" is not evidence that an AP exists.**
+On the BE9300, `ubus call network.wireless status` showed `wifi2 up=True,
+pending=False` with three enabled 6 GHz interfaces while no `wlan2*` netdev and
+no hostapd config had been created at all. The layer that actually instantiates
+VAPs (`qca-wifi-configurator`) had done nothing. Verify radios with `iwinfo` and
+`/var/run/hostapd-*.conf` — the presence of a generated hostapd config per VAP
+is the real proof. This is the same shape as every other false pass this week:
+the control plane says yes, the data plane never happened.
+
+**Verify a VPN tunnel by its exit IP, never by its config.** Surfshark hands
+every peer the same client address (10.14.0.2/24), so several same-priority
+`from 10.14.0.2 lookup 100X` rules coexist and the config cannot tell you which
+endpoint you actually reached. `curl --interface <tunnel>` against an IP echo,
+then geolocate, is the only honest check.
+
+**Check what your own access path depends on before reconfiguring it.** Before
+touching wireless on 3.1, confirmed its uplink was wired (eth0/DHCP, repeater
+and bsta disabled) so a wireless reload could not strand the session. That box
+had previously gone unreachable when a mesh backhaul dropped. One cheap query
+turns an unattended risky change into a safe one.
