@@ -1,116 +1,152 @@
 # Network Topology & Router Inventory
 
-Written 2026-08-09 while evaluating a proposed re-layout (3.1 as new DSL
-head-end). Everything below was verified directly via SSH against each
-device the same day, not assumed from memory. Router-specific rebuild
-detail for 9.1 stays in `router-rebuild-runbook.md`; this doc is the
-cross-device map that didn't exist before.
+**Rewritten 2026-08-28**, the morning after the cutover. The previous version
+(2026-08-09) described a *proposed* re-layout — making the BE9300 the DSL
+head-end and moving the Proxmox host behind it. That proposal is now reality, so
+this file describes what exists rather than what was being considered.
+
+Everything below was verified directly against each device, not assumed.
+
+---
+
+## Current topology
+
+```mermaid
+graph TD
+    ONT["Telekom ONT<br/>(DSL)"]
+    BE["<b>GL-BE9300</b> — 192.168.9.1<br/>PPPoE edge + LAN gateway<br/>SSIDs: Open-Fields / GIOT / WALDO"]
+    PVE["pve-01 — 192.168.9.11<br/>+ CT 105/107/108/111/112"]
+    UDR["UniFi UDR 'R2D2'<br/>LAN 192.168.1.1/25<br/>WAN 192.168.9.110"]
+    MT["<b>GL-MT6000</b> — 192.168.5.1<br/>TV corner · SSID Big-GL<br/>WAN 192.168.1.12"]
+    APS["UniFi APs<br/>AC-Lite · U6 Lite<br/>Basement-Express"]
+    MID["Mid-Express<br/><i>wireless uplink</i>"]
+    TV["LG TV · FireStick<br/>Chromecast"]
+
+    ONT -->|PPPoE| BE
+    BE --> PVE
+    BE --> UDR
+    UDR --> MT
+    UDR --> APS
+    UDR -.->|RF backhaul| MID
+    MT --> TV
+```
+
+Text form, for terminals:
+
+```
+Telekom ONT ──PPPoE──▶ BE9300 (192.168.9.1)   ◀── the edge, do not power-cycle
+                          ├──▶ pve-01 (192.168.9.11) + containers
+                          └──▶ UDR / R2D2 (WAN 192.168.9.110, LAN 192.168.1.1/25)
+                                   ├──▶ MT6000 (WAN 192.168.1.12, LAN 192.168.5.1) ──▶ TV corner
+                                   ├──▶ AC-Lite · U6 Lite · Basement-Express (wired)
+                                   └┄┄▶ Mid-Express (WIRELESS backhaul — see warning)
+
+GL-MT2500 — RETIRED. Unplugged from the ONT during the cutover.
+```
+
+---
 
 ## Inventory
 
-| Device | IP | Model | Firmware/OS | SSH alias |
+| Device | IP | Model | Role | SSH |
 |---|---|---|---|---|
-| R2D2 | `192.168.1.1` | Ubiquiti UniFi Dream Router (UDR) | UniFi OS (kernel `4.4.198-ui-mtk`) | `unifi-1.1` (owner-provided password, key installed 2026-08-08) |
-| — | `192.168.2.1` | GL.iNet **GL-MT2500** | GL firmware 4.7.4 | `glinet-2.1` |
-| Big-Big-GL | `192.168.3.1` | GL.iNet **GL-BE9300** ("Flint 3", WiFi 7) | GL firmware 4.10.0, OpenWrt 23.05-SNAPSHOT | `glinet-3.1` |
-| (Flint 2) | `192.168.9.1` | GL.iNet **GL-MT6000** ("Flint 2") | see `router-rebuild-runbook.md` | `glinet-9.1` |
+| **BE9300** | `192.168.9.1` | GL-BE9300 "Flint 3" (WiFi 7) | **PPPoE edge + LAN gateway** | `glinet-9.1` |
+| **MT6000** | `192.168.5.1` | GL-MT6000 "Flint 2" | TV corner router | `glinet-5.1` (LAN, unreachable from pve-01) / `glinet-5.1-ts` (Tailscale) |
+| **R2D2** | `192.168.1.1` | UniFi Dream Router | UniFi controller + APs | `unifi-1.1` **(broken — see below)** |
+| MT2500 | — | GL-MT2500 "Brume 2" | **RETIRED** | `glinet-2.1` (dead alias) |
+| pve-01 | `192.168.9.11` | Proxmox host | media-core stack | — |
 
-All four SSH aliases use `IdentityFile /root/.ssh/id_ed25519_routers`,
-`IdentitiesOnly yes` — confirmed working against all four 2026-08-09
-(1.1 needed the `unifi-1.1` alias specifically; connecting to
-`root@192.168.1.1` directly fails since `IdentitiesOnly` scopes the key
-to the matching `Host` block).
+**The BE9300 changed address.** It was `192.168.3.1`; the `192.168.3.0/24`
+subnet no longer exists. The MT6000 previously held `192.168.9.1` and moved to
+`192.168.5.1`. If you see `glinet-3.1` or `192.168.2.x` anywhere, it is stale.
 
-pve-01 itself sits behind 9.1 today (`192.168.9.11`); see
-`router-rebuild-runbook.md` for 9.1's VPN policy engine, backup/restore
-procedure, and known gotchas — not repeated here.
+---
 
-## Current topology (as of 2026-08-09)
+## Access gotchas
 
-- **2.1 (GL-MT2500) is the real internet head-end.** Confirmed via its
-  `network.wan` config: PPPoE dialing a `t-online.de` (Deutsche Telekom
-  DSL) account directly. It feeds **3.1** and **1.1**.
-- **9.1 (Flint 2)** mesh-links to **3.1** and is also hardwired to **1.1**
-  via a powerline adapter. pve-01 and the rest of media-core sit behind 9.1.
-- Credentials (PPPoE login, WiFi passwords, VPN keys) live on-device and
-  in `/root/router-backups/` (600/700, outside git) — deliberately not
-  reproduced in this doc.
+**pve-01 can no longer reach the UDR at `192.168.1.1`.** Before the cutover
+pve-01 sat *behind* the UDR; it is now a sibling on the far side of the UDR's
+WAN. The UDR is healthy — reach it over Tailscale at `100.114.159.40`.
+`/root/uni.sh` probes the LAN address first and falls back automatically.
 
-```
-DSL ─▶ 2.1 (GL-MT2500, PPPoE head-end)
-         ├─▶ 3.1 (Flint 3) ── mesh ──▶ 9.1 (Flint 2) ─▶ pve-01 / media-core
-         └─▶ 1.1 (UDR/R2D2)              │
-                                      powerline
-                                          ▼
-                                        1.1
-```
+**The MT6000's LAN is likewise unreachable from pve-01.** Use `glinet-5.1-ts`.
+Note this does *not* stop the MT6000 shipping syslog to the collector — the
+router pushes outbound, so the missing return route is irrelevant.
 
-## Proposed re-layout (under discussion, not yet applied)
+**SSH host keys legitimately changed.** `192.168.9.1` now answers with the
+BE9300's key, not the MT6000's. Verify a changed key against the same host's
+Tailscale entry before clearing it — never accept blindly.
 
-Owner is considering moving the Proxmox host's own router dependency
-from 9.1 to 3.1 (more capable hardware — see capability notes below),
-and making **3.1 the DSL head-end** directly, feeding **1.1** and **9.1**.
-9.1 would then step back from "head-end path" duty and instead serve as
-a wired hub for new devices (Google Streamer, LG TV) that shouldn't
-depend on wireless.
+---
 
-Open question raised during this review: **2.1's role in the new
-layout isn't decided yet** — whether it's retired, or repurposed. Confirm
-before actually cutting over, since it currently holds the live PPPoE
-session.
+## Addressing
 
-```
-DSL ─▶ 3.1 (Flint 3, proposed new head-end)
-         ├─▶ 1.1 (UDR/R2D2)
-         └─▶ 9.1 (Flint 2) ─▶ wired hub for Google Streamer / LG TV
-                                (no longer on the path to pve-01 unless
-                                 pve-01 also moves to 3.1)
-2.1 (GL-MT2500) — role TBD
-```
+| Subnet | Owner | Purpose |
+|---|---|---|
+| `192.168.1.0/25` | UDR | Default UniFi network |
+| `192.168.4.0/24` | UDR | VPN (VLAN 4) |
+| `192.168.5.0/24` | MT6000 | **TV corner** (LG TV, FireStick, Chromecast) |
+| `192.168.9.0/24` | BE9300 | **Main LAN** — pve-01 and all containers |
+| `192.168.10.0/24` | BE9300 | IoT — the WALDO SSID, bound to the German tunnel |
+| `192.168.15/16.0/24` | MT6000 | guest/iot, **disabled** — re-addressed so they can never collide |
+| `192.168.20.0/24` | UDR | IoT (VLAN 20) |
+| `192.168.30.0/24` | BE9300 | Guest — the GIOT SSID, bound to the US tunnel |
+| `192.168.40.0/24` | UDR | Lambeau (VLAN 40) |
 
-## Tailscale status (updated 2026-08-09)
+`192.168.2.0/24` and `192.168.3.0/24` are **gone**. `192.168.6.0/24` is
+advertised to the tailnet by the MT2500 but has no interface behind it — a stale
+advertisement worth clearing in the Tailscale admin console.
 
-3.1's Tailscale had expired/logged-out (found during the 2026-08-08 Tailscale
-audit, `tailscale-audit-findings.md`). Re-authenticated 2026-08-09 —
-confirmed online (`GL-BE9300` / `big-big-gl.tail8f3e6.ts.net`,
-`100.82.158.23`, already advertising `192.168.3.0/24`). Confirmed
-**"Expiry disabled"** in the Tailscale admin console (owner-verified
-screenshot), given its candidacy as the new head-end.
+---
 
-Noted in passing: 9.1 (`big-gl`) does **not** have expiry disabled (dated
-expiry, 2027-01-21 per the 2026-08-08 audit) — worth doing the same
-regardless of how the head-end decision lands, since it stays core
-infrastructure either way. Not yet done.
+## Egress design
 
-Also fixed same day: R2D2 (1.1)'s Tailscale, dead since 2025-04-24 —
-`/data/tailscale/manage.sh` didn't recognize UniFi OS v5. One-line fix
-(added `'5'` to the version check at line 32), verified online with a
-direct-path ping from pve-01.
+| Source | Exits via | Verified location |
+|---|---|---|
+| CT 105 media-core, CT 111 jellyfin-vod, CT 112 jellyfin-npvr | `wgclient1` | **Zürich** — required for IPTV |
+| CT 107 log-server, CT 108 scraper | `wgclient3` | **Ashburn** |
+| pve-01 host | none | **native Telekom** (owner's choice) |
+| WALDO SSID (`br-iot`) | `wgclient2` | Frankfurt |
+| GIOT SSID (`br-guest`) | `ovpnclient1` | New York |
+| Open-Fields (`br-lan`) | none | native |
 
-## 3.1 (GL-BE9300) capability notes, gathered for this evaluation
+Always verify by **exit IP**, never by config: every Surfshark peer is handed the
+same client address `10.14.0.2/24`, so the config cannot tell you which exit you
+actually got.
 
-Confirmed live via SSH, relevant to the proposed head-end swap:
+---
 
-- **Per-SSID/per-network VPN tunnel binding is supported natively.**
-  `gl-sdk4-vpn-policy` + `gl-sdk4-ui-vpndashboard` installed, WireGuard +
-  OpenVPN client/server + multi-WAN (`kmwan`) all present. The device
-  already separates SSIDs onto distinct bridged networks (`lan`, `guest`,
-  `iot` — each with its own `br-*` interface and per-band SSIDs), and
-  `route_policy` rules route by source (device/group/process). Binding a
-  dedicated network (i.e., a dedicated SSID) to a dedicated VPN tunnel is
-  the same mechanism already used for the existing `iot` segment — not a
-  new capability, just an additional instance of the existing pattern.
-- **Native WiFi radio scheduling**, via the `gl_timer` UCI config —
-  per-band (2G/5G/6G/MLD) and per-guest-vs-main-SSID entries, each
-  supporting both `turn_onoff` (full radio kill) and `power_switch`
-  (scheduled tx-power drop to "Low", restore to "Max") on an hour/minute/
-  day-of-week schedule. Present in config, currently all `enable='0'`
-  (UI toggle away, no scripting needed).
-- No `client_group` entries configured yet (checked, empty) — would need
-  to be set up as part of implementing the 3-tunnel SSID plan.
+## Wireless
 
-## Related docs
-- `router-rebuild-runbook.md` — 9.1 (Flint 2) backup/restore, VPN policy
-  gotchas, reboot-survival checklist.
-- `home-network-power-automation.md` — R2D2 (1.1) Tailscale/UniFi OS
-  version issue.
+BE9300 runs 2.4 / 5 / 6 GHz plus MLO: `mld0` → `br-lan` (Open-Fields),
+`mld1` → `br-guest` (GIOT). WALDO is 2.4 + 5 only.
+
+**`wifi reload` does not apply radio enable/disable on this box** — measured. Use
+`wifi down <radio>` / `wifi up <radio>`, which works in both directions with no
+reboot. See `radio-shutoff-plan.md`.
+
+**Mid-Express uplinks over RF to the UDR.** Disabling the UDR's radios strands it
+and its clients. It re-associates automatically when they return, so a
+time-boxed schedule is safe; a permanent disable is not, until it is cabled.
+
+---
+
+## The PPPoE line
+
+Untagged on `eth0` — **no VLAN 7**, which German Telekom lines often need.
+Credentials are staged at `/root/cutover/.pppoe-creds` on the BE9300 (mode 600).
+
+Telekom forces a **re-auth roughly nightly**, changing the public IP (observed
+`93.209.195.65` → `84.149.191.129` → `84.149.178.215`). All four tunnels
+re-establish through it unattended — verified twice. Alerting deliberately uses
+a 5-minute window so the routine reconnect does not page.
+
+---
+
+## Related
+
+- `cutover-20260827/00-RUNBOOK.md` — how the cutover was performed, with rollback
+- `cutover-20260827/overnight-report-20260828.md` — what broke and how it was fixed
+- `cutover-20260827/radio-shutoff-plan.md` — radio power-off and timer plan
+- `glinet-api-cli-runbook.md` — **read first** for any GL router work
+- `lessons-learned.md` — traps already paid for
