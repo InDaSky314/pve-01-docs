@@ -22,6 +22,7 @@ import json
 import os
 import re
 import subprocess
+from zoneinfo import ZoneInfo
 import sys
 from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
@@ -97,6 +98,24 @@ def record_notification(state: dict, match_key: str, match_info: dict) -> None:
     save_state(state)
 
 
+
+# --- time formatting -------------------------------------------------------
+# The owner reads these in German local time. Kickoffs arrive from ESPN in UTC
+# (sometimes naive), so normalise then convert. Bayern is a German fixture, so
+# German time alone is right here; US-team emails additionally carry US Central.
+BERLIN = ZoneInfo("Europe/Berlin")
+
+
+def _fmt_de(dt) -> str:
+    """Render a datetime in German local time. Naive input is assumed UTC."""
+    if not isinstance(dt, datetime):
+        return str(dt) if dt else "N/A"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    local = dt.astimezone(BERLIN)
+    return local.strftime("%a %d %b %Y, %H:%M %Z")
+
+
 def render_email_content(match_info: dict, is_test: bool = False, test_context: dict = None) -> tuple[str, str, str]:
     """
     Renders (subject, text_body, html_body) for the alert email.
@@ -114,10 +133,7 @@ def render_email_content(match_info: dict, is_test: bool = False, test_context: 
     fixture_name = espn_fixture.get("match_name") if espn_fixture else (test_context.get("match_name") if test_context else raw_name)
     kickoff = espn_fixture.get("kickoff") if espn_fixture else (test_context.get("kickoff") if test_context else None)
     
-    if isinstance(kickoff, datetime):
-        kickoff_str = kickoff.strftime("%Y-%m-%d %H:%M UTC")
-    else:
-        kickoff_str = str(kickoff) if kickoff else "N/A"
+    kickoff_str = _fmt_de(kickoff)
 
     if is_test:
         subject = "TEST: Bayern PPV Alert System Validation"
@@ -137,34 +153,34 @@ def render_email_content(match_info: dict, is_test: bool = False, test_context: 
         badge_bg = "#1e824c"  # Green for production match
         test_banner = ""
 
-    # --- BLUF ------------------------------------------------------------
+    # --- Summary ------------------------------------------------------------
     # Bottom line first: what happened and whether the owner must do anything.
     # Everything technical stays below, unchanged.
     if is_test:
-        bluf_line = ("This is a <strong>test</strong> of the PPV detector. No match was actually "
+        summary_line = ("This is a <strong>test</strong> of the PPV detector. No match was actually "
                      "found and nothing is scheduled. No action needed.")
-        bluf_action = "No action needed."
+        summary_action = "No action needed."
     else:
-        bluf_line = (f"An <strong>English-language</strong> PPV feed for "
+        summary_line = (f"An <strong>English-language</strong> PPV feed for "
                      f"<strong>{html_lib.escape(fixture_name)}</strong> was detected on "
                      f"<strong>{html_lib.escape(channel_slot)}</strong>, kickoff "
                      f"{html_lib.escape(kickoff_str)}.")
-        bluf_action = ("No action needed. The DVR probes this slot automatically 40 minutes "
+        summary_action = ("No action needed. The DVR probes this slot automatically 40 minutes "
                        "before kickoff and switches to it if it proves live; the German feed "
                        "stays booked as a fallback either way.")
 
-    bluf_html = f"""
+    summary_lead_html = f"""
   <div style="margin:16px 24px 0 24px;background:#f0f7ff;border-left:4px solid #2f6fed;border-radius:4px;padding:14px 16px;">
-    <div style="color:#1d4ed8;font-size:11px;font-weight:700;letter-spacing:.08em;margin-bottom:6px;">BOTTOM LINE</div>
-    <div style="color:#0f172a;font-size:14.5px;line-height:1.55;">{bluf_line}</div>
-    <div style="color:#334155;font-size:13px;line-height:1.55;margin-top:8px;">{bluf_action}</div>
+    <div style="color:#1d4ed8;font-size:11px;font-weight:700;letter-spacing:.08em;margin-bottom:6px;">SUMMARY</div>
+    <div style="color:#0f172a;font-size:14.5px;line-height:1.55;">{summary_line}</div>
+    <div style="color:#334155;font-size:13px;line-height:1.55;margin-top:8px;">{summary_action}</div>
   </div>"""
 
-    bluf_text = (
-        "BOTTOM LINE\n"
+    summary_lead_text = (
+        "SUMMARY\n"
         "-----------\n"
-        + re.sub(r"<[^>]+>", "", bluf_line) + "\n"
-        + re.sub(r"<[^>]+>", "", bluf_action) + "\n"
+        + re.sub(r"<[^>]+>", "", summary_line) + "\n"
+        + re.sub(r"<[^>]+>", "", summary_action) + "\n"
     )
 
     reasons_li = "".join(f"<li>{html_lib.escape(r)}</li>" for r in reasons)
@@ -183,7 +199,7 @@ def render_email_content(match_info: dict, is_test: bool = False, test_context: 
   </div>
   
   {test_banner}
-{bluf_html}
+{summary_lead_html}
 
   <!-- Status & Match Summary Card -->
   <div style="padding:20px 24px 12px 24px;">
@@ -261,7 +277,7 @@ def render_email_content(match_info: dict, is_test: bool = False, test_context: 
 {subject}
 ================================================================
 
-{bluf_text}
+{summary_lead_text}
 ----------------------------------------------------------------
 DETAIL
 

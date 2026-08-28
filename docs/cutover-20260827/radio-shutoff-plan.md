@@ -3,7 +3,7 @@
 
 ---
 
-## BLUF
+## Executive summary
 
 **You do not need powerline timers for either GL router.** Both the BE9300 and the
 MT6000 can go fully radio-silent in software while continuing to route over wire —
