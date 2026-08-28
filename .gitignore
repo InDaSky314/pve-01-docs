@@ -1,1 +1,6 @@
 __pycache__/
+
+# local pre-change backups - keep them off git
+*.pre-cutover-*
+*.pre-repair-*
+*.pre-bluf-*
