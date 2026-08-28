@@ -137,6 +137,36 @@ def render_email_content(match_info: dict, is_test: bool = False, test_context: 
         badge_bg = "#1e824c"  # Green for production match
         test_banner = ""
 
+    # --- BLUF ------------------------------------------------------------
+    # Bottom line first: what happened and whether the owner must do anything.
+    # Everything technical stays below, unchanged.
+    if is_test:
+        bluf_line = ("This is a <strong>test</strong> of the PPV detector. No match was actually "
+                     "found and nothing is scheduled. No action needed.")
+        bluf_action = "No action needed."
+    else:
+        bluf_line = (f"An <strong>English-language</strong> PPV feed for "
+                     f"<strong>{html_lib.escape(fixture_name)}</strong> was detected on "
+                     f"<strong>{html_lib.escape(channel_slot)}</strong>, kickoff "
+                     f"{html_lib.escape(kickoff_str)}.")
+        bluf_action = ("No action needed. The DVR probes this slot automatically 40 minutes "
+                       "before kickoff and switches to it if it proves live; the German feed "
+                       "stays booked as a fallback either way.")
+
+    bluf_html = f"""
+  <div style="margin:16px 24px 0 24px;background:#f0f7ff;border-left:4px solid #2f6fed;border-radius:4px;padding:14px 16px;">
+    <div style="color:#1d4ed8;font-size:11px;font-weight:700;letter-spacing:.08em;margin-bottom:6px;">BOTTOM LINE</div>
+    <div style="color:#0f172a;font-size:14.5px;line-height:1.55;">{bluf_line}</div>
+    <div style="color:#334155;font-size:13px;line-height:1.55;margin-top:8px;">{bluf_action}</div>
+  </div>"""
+
+    bluf_text = (
+        "BOTTOM LINE\n"
+        "-----------\n"
+        + re.sub(r"<[^>]+>", "", bluf_line) + "\n"
+        + re.sub(r"<[^>]+>", "", bluf_action) + "\n"
+    )
+
     reasons_li = "".join(f"<li>{html_lib.escape(r)}</li>" for r in reasons)
 
     html_body = f"""\
@@ -153,6 +183,7 @@ def render_email_content(match_info: dict, is_test: bool = False, test_context: 
   </div>
   
   {test_banner}
+{bluf_html}
 
   <!-- Status & Match Summary Card -->
   <div style="padding:20px 24px 12px 24px;">
@@ -229,6 +260,10 @@ def render_email_content(match_info: dict, is_test: bool = False, test_context: 
     text_body = f"""================================================================
 {subject}
 ================================================================
+
+{bluf_text}
+----------------------------------------------------------------
+DETAIL
 
 Match:           {fixture_name}
 Channel Slot:    {channel_slot}
