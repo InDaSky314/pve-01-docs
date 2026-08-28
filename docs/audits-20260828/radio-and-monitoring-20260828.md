@@ -3,7 +3,7 @@
 
 ---
 
-## BLUF
+## Executive summary
 
 **Radios.** Every device except the UniFi APs can stop serving WiFi in software while
 its wired path keeps running — so **only the UniFi side needs a powerline timer.**
