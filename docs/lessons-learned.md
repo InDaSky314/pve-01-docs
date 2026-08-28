@@ -1025,3 +1025,37 @@ needed here: the first proved the tunnels came back, the second exposed that the
 firewall binding had been wiped and only one tunnel recovered, the third
 confirmed the self-healing chain end to end with no intervention. One clean
 reboot is not evidence; the second is where the interesting failures show up.
+
+**Geolocating a resolver's IP tells you nothing about where its recursion
+egresses — test what the authoritative server actually sees.** On the BE9300,
+Agy flagged a HIGH-severity geo-DNS mismatch: the Swiss tunnel's resolv file
+lists 162.252.172.57 (geolocates to New York) and 149.154.159.92 (Frankfurt), so
+IPTV lookups would supposedly resolve to non-Swiss CDN edges. Measured, that is
+false. Querying `o-o.myaddr.l.google.com TXT` from inside each container returns
+the address the authoritative nameserver observed:
+
+    media-core (Swiss tunnel)  -> 89.37.173.28    = the Swiss exit  (3/3 samples)
+    scraper    (Ashburn tunnel)-> 151.240.254.18  = the Ashburn exit
+
+Both match their tunnel's own exit exactly. Those Surfshark addresses behave as
+anycast reachable inside the provider network: because `ip route get
+162.252.172.57 mark 0x1000` resolves via `dev wgclient1`, the query enters at the
+Swiss PoP and recursion leaves from the Swiss egress. The resolver IP's WHOIS
+location is irrelevant. Verify with an echo service, never with a geo lookup of
+the resolver address.
+
+**This does not contradict the earlier UniFi lesson — the difference is whether
+DNS is guaranteed to traverse the matching tunnel.** On the UDR the resolver was
+set per-VLAN and queries could take a path unrelated to the tunnel, so pairing
+resolver country to exit country genuinely mattered. On the GL box, per-tunnel
+dnsmasq instances (2153/2253/2353) plus fwmark policy routing force each query
+down its own tunnel, which makes the pairing automatic. Before applying the
+"match resolver country to exit country" rule, first establish which of the two
+architectures you are in.
+
+**A second opinion that reasons from static data still needs empirical
+challenge.** Agy's other findings that night were correct and its independent
+reboot was genuinely useful, but this one was derived from geolocating an IP
+rather than measuring behaviour, and would have led to changing DNS on a working
+IPTV path hours before two scheduled recordings. Rank a finding by the evidence
+behind it, not the confidence of its presentation.
