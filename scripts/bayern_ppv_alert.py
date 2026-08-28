@@ -157,9 +157,10 @@ def render_email_content(match_info: dict, is_test: bool = False, test_context: 
     # Bottom line first: what happened and whether the owner must do anything.
     # Everything technical stays below, unchanged.
     if is_test:
-        summary_line = ("This is a <strong>test</strong> of the PPV detector. No match was actually "
-                     "found and nothing is scheduled. No action needed.")
-        summary_action = "No action needed."
+        summary_line = ("This is a <strong>test</strong> of the PPV detector. No English PPV "
+                        "slot was actually detected and nothing has been scheduled from it.")
+        summary_action = ("No action needed. The German feed on Sky Sport Bundesliga 1 is "
+                          "booked regardless, so the fixture is covered either way.")
     else:
         summary_line = (f"An <strong>English-language</strong> PPV feed for "
                      f"<strong>{html_lib.escape(fixture_name)}</strong> was detected on "
@@ -178,7 +179,7 @@ def render_email_content(match_info: dict, is_test: bool = False, test_context: 
 
     summary_lead_text = (
         "SUMMARY\n"
-        "-----------\n"
+        "-------\n"
         + re.sub(r"<[^>]+>", "", summary_line) + "\n"
         + re.sub(r"<[^>]+>", "", summary_action) + "\n"
     )
