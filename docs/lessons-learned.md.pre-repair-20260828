@@ -1059,12 +1059,3 @@ reboot was genuinely useful, but this one was derived from geolocating an IP
 rather than measuring behaviour, and would have led to changing DNS on a working
 IPTV path hours before two scheduled recordings. Rank a finding by the evidence
 behind it, not the confidence of its presentation.
-
-**Chained routers behind intermediate gateways masquerade syslog UDP source IPs.**
-When a downstream router (MT6000 at 192.168.5.1) is chained behind an intermediate
-gateway (UniFi UDR at 192.168.1.1 on WAN 192.168.9.110), UDP syslog packets forwarded
-across subnets arrive at the receiver with the intermediate gateway's WAN IP
-(192.168.9.110), not the originating router's LAN IP. Syslog receivers filtering
-strictly on the originating router's IP will drop all packets unless they accept the
-intermediate NAT source IP or match the hostname in the syslog payload (`GL-MT6000`).
-
