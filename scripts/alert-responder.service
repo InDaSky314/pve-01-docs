@@ -4,6 +4,7 @@ Documentation=file:///root/pve-01-docs/docs/livetv-custom-build-and-updates-2026
 After=network-online.target
 
 [Service]
+Environment=HOME=/root
 Type=simple
 ExecStart=/usr/bin/python3 /root/bin/alert-responder.py
 Restart=always

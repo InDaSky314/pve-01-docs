@@ -637,8 +637,6 @@ LINKS = [
      "url": "http://192.168.9.50:8096", "host": "192.168.9.50", "port": 8096},
     {"group": "Media servers", "label": "Jellyfin - live (Threadfin)",
      "url": "http://192.168.9.195:8096", "host": "192.168.9.195", "port": 8096},
-    {"group": "Media servers", "label": "Jellyfin - VOD",
-     "url": "http://192.168.9.171:8096", "host": "192.168.9.171", "port": 8096},
     {"group": "Media servers", "label": "Jellyfin - NextPVR",
      "url": "http://192.168.9.219:8096", "host": "192.168.9.219", "port": 8096},
     {"group": "Tuners / DVR", "label": "Threadfin - production",
