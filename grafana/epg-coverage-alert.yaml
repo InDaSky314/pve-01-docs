@@ -1,0 +1,59 @@
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: media-core-epg
+    folder: Media-Core
+    interval: 1m
+    rules:
+      - uid: media-core-epg-coverage-ratio
+        title: "Media-Core: EPG guide coverage ratio regressed"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: epg_coverage_ratio
+              instant: true
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              reducer: last
+              expression: A
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 0.28
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    type: last
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 25h
+        annotations:
+          summary: "EPG real-guide coverage ratio below 28% (currently {{ $values.B.Value }})"
+          description: "Real guide data covers <28% of lineup channels. Baseline 34.6% (424/1225) as of 2026-08-31. The pre-existing absolute rule (real < 380) cannot catch dilution from lineup growth - that is what this ratio rule is for. Check xtream-sync output in Loki job=\"epg-sync\"."
+        labels:
+          severity: warning
