@@ -1068,3 +1068,93 @@ across subnets arrive at the receiver with the intermediate gateway's WAN IP
 strictly on the originating router's IP will drop all packets unless they accept the
 intermediate NAT source IP or match the hostname in the syslog payload (`GL-MT6000`).
 
+**`ET.iterparse` buffer chunk boundaries strip trailing `elem.tail` newlines from `ET.tostring`.**
+When streaming XML via `ET.iterparse`, if an element closing tag lands exactly on a
+chunk boundary (16 KB / 32 KB), `elem.tail` is `None` at the `end` event because the trailing
+newline has not yet been buffered. `ET.tostring(elem)` thus serialises boundary elements without
+a trailing newline while sibling elements inside the chunk include `\n`. Comparing such output against strings built with an
+unconditional trailing newline therefore fails for whichever elements happen to land on a
+boundary — a handful out of hundreds, and a different handful each run as the file shifts.
+Because the comparison was wrapped in `all()`, those few were enough to make the whole test
+False every time. Always `.strip()` before comparing serialised XML fragments for equality.
+
+
+**Docker `logs --since` on Loki log driver hangs without `--tail`.**
+When a container is configured with `--log-driver=loki`, running `docker logs --since <duration>` without an explicit `--tail` limit attempts to buffer unbounded historical log chunks from the remote Loki daemon, resulting in process stalls. Always specify `--tail <n>` alongside `--since` when querying containers logging to Loki.
+
+**systemd services do not populate `$HOME` by default, breaking agent CLI dispatches.**
+Service units running as root execute in a minimal environment where `$HOME` is unset unless explicitly declared. Any spawned sub-process or agent binary (such as `agy`) that derives its application data directory, settings, or log paths from `$HOME` fails immediately with `$HOME is not defined`. Always set `Environment=HOME=/root` in the `[Service]` block of units that shell out to CLI tooling.
+
+## Reading the sync/EPG diagnostics correctly (2026-08-31)
+
+Three separate misreadings of `media-core-sync` output were made during a health audit on
+this date — by Claude Code first and then confirmed a second time by agy, because agy
+"verified" them by re-reading the same log lines rather than testing the underlying claim.
+All three are recorded here so the next reader does not repeat them.
+
+**`external epg <source>: matched 0/243 channels` does NOT mean that source is broken.**
+External sources are merged in the order listed in `config.json` `external_epg`, and each
+one reports how many *still-uncovered* channels it newly covered. A source listed after
+`epg_ripper_US_SPORTS1.xml.gz` will report 0 for ESPN simply because ESPN was already
+covered upstream of it. The README has said so since 2026-07-21: *"Deliberately no
+per-external-source zero-match rule — several sources are structurally always near-zero for
+this lineup."* Before concluding a scraper is dead, check whether the channels it targets
+actually have programmes in `epg.xml`.
+
+**`total coverage 424/1225 unique guide ids` is the `real=` metric, not "channels with a guide".**
+In `xtream-sync.py`, `total = len(covered | fed)` — provider-supplied plus externally-matched.
+Everything else is given a synthesised or PPV programme, so **every** channel ends up with
+guide data. On 2026-08-31 the true split was real=424, ppv=608, synth=193, summing to 1225,
+and a parse of `epg.xml` showed 1225/1225 channels carrying at least one programme. A falling
+*ratio* here means the lineup grew (mostly PPV event slots, which are synthetic by design),
+not that channels went blind. Ground-truth it by parsing `epg.xml`; do not infer it from the
+log line.
+
+**Threadfin is the tuner, not the guide provider.** `jellyfin/config/config/livetv.xml` has
+Threadfin under `<TunerHosts>` (type `hdhomerun`) and, separately, `<ListingProviders>` of
+type `xmltv` pointing at `/epg/epg.xml`. Jellyfin never reads Threadfin's XMLTV endpoint.
+Triggering Threadfin's `update.xmltv` therefore does **not** update Jellyfin's guide — only
+Jellyfin's own "Refresh Guide" task ingests `epg.xml`, and there is no narrower API in
+10.11.9 to refresh a single channel or date range. This is why a one-line PPV title change
+costs a full 16-39 minute rebuild across all 1225 channels.
+
+## Retiring a container: check the feeders and the scrape targets, not just the monitors
+
+When CT 111 was retired on 2026-08-31, `stack-monitor.py` and `dvr-dashboard` were updated
+(following the CT 110 precedent) — but two other things still pointed at it and were missed
+on the first pass:
+
+* `prometheus.yml` still listed `192.168.9.171:9100` in the `node` job. The scrape target
+  went down and fired **"Infra: Prometheus target down"** within minutes. Note that CT 110's
+  `192.168.9.195` is absent from that file — the precedent was already there and was simply
+  not followed. Removed, `promtool check config` clean, Grafana/Prometheus restarted.
+* `vod-sync-ct111.timer` (host) kept running daily at 13:45, rsyncing VOD media into
+  `/srv/shared-vod-media` — a path referenced by `111.conf` and nothing else. It did not
+  fail (it writes to a host path, not into the container), so it would never have alarmed;
+  it just burned ~16 s of CPU and pointless I/O every day forever. Disabled.
+
+**Checklist when retiring a guest:** `stack-monitor.py` metrics + probes · `dvr-dashboard`
+tiles · `prometheus.yml` scrape targets · any systemd timer that *feeds* it · Grafana rules
+that reference its series · vzdump `vmid` list · the bind-mount paths only it consumed.
+
+## Do not diagnose from a staged `.diff` without checking whether it was already applied
+
+During the same audit, a "live data-loss bug" was reported — that `xtream-sync.py`'s per-show
+cleanup used a bare `f.unlink()` and was destroying artwork and subtitles on every sync. It
+was read straight out of `/root/agy-reports/xtream-sync.py.proposed.diff` (2026-08-17).
+Both the repo copy and the CT 105 copy already contained the fix
+(`f.suffix in (".strm", ".nfo")`), with identical md5sums. The bug did not exist.
+
+Separately, agy then recommended *applying* that same already-applied patch. Two agents,
+opposite errors, same root cause: a proposed diff was treated as a description of current
+state. **`md5sum` the live file against the repo, and read the actual line, before believing
+a diff.** (For the record, the directories in question contain only `.strm` and `.nfo`
+anyway — Jellyfin has `SaveLocalMetadata: false` and no subtitle fetchers — so the patch is
+a defensive no-op either way.)
+
+## LVM thin `Data%` is high-water allocation, not live usage
+
+`lvs` showed `vm-111-disk-0` at 98.15% and `vm-112-disk-0` at 99.19%, which reads as
+"about to run out of disk". Actual filesystem usage inside those containers was 73% and 43%.
+Thin `Data%` counts blocks ever written, not blocks currently in use, and never falls when
+files are deleted. Always confirm with `df -h` inside the guest before acting on it.

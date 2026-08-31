@@ -101,6 +101,21 @@ needs 2 attempts — that is normal, not a fault.
 **Jellyfin's Refresh Guide takes ~20 minutes on production** and adding new
 channels can need more than one cycle. Do not assume one pass is enough.
 
+Since 2026-08-31 the hourly `media-core-ppv` run no longer triggers that refresh
+unconditionally — it only does so when a PPV event actually changed. `epg.xml` is still
+rewritten and Threadfin's `update.xmltv` still fires every hour. If you change the lineup
+and want it visible immediately, trigger Refresh Guide yourself; do not wait for the PPV
+timer to do it for you.
+
+**Reading the coverage line.** `total coverage R/T unique guide ids` is the *real-guide*
+count (`len(covered | fed)`), not "channels that have a guide". Every channel gets
+programmes — the rest are PPV event slots and synthesised looping guides. On 2026-08-31 the
+split was real=424, ppv=608, synth=193 of 1225, and `epg.xml` carried programmes for
+1225/1225. A falling ratio usually means the lineup grew, not that channels went blind.
+`stack-monitor.py` now exports `epg_coverage_ratio` for exactly this reason: the older
+Grafana rule watches an absolute `real < 380`, which lineup growth can dilute past without
+ever tripping.
+
 ---
 
 ## Verifying a change — at the right layer

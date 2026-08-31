@@ -53,6 +53,19 @@ The media stack lives in `/srv/media-core/` inside CT 105; drive it with
   updates only the primary server-side**, so after a merge run
   `git -C /root/pve-01-docs checkout main && git pull && git push origin main`
   to propagate the merge to the mirror (PRs themselves don't mirror).
+- **Supervised-sprint delegation to agy (added 2026-08-31).** `agy-task.sh`
+  originally reserved CT 105's live media-core stack for Claude Code. The
+  owner opened that up for supervised sprints: Claude Code writes the brief
+  (explicit scope, pre-state capture, acceptance tests, back-out plan), agy
+  executes **one** item in `build` mode, Claude Code independently verifies
+  before releasing the next. Secrets and git/PR history stay with Claude
+  Code. The verification step is the safeguard, not a formality — in the
+  2026-08-31 sprint agy marked all 12 audit findings CONFIRMED including two
+  that were false, because it re-read the evidence it was handed instead of
+  testing the claim. Ask it for proof in **both** directions (a guard that
+  never fires and a guard that always fires both look like "no alerts"), and
+  treat "CONFIRMED" as a claim to check, not a result. Its genuine strengths
+  are building, and recovering project history you did not know existed.
 - **Overnight maintenance window (added 2026-07-20): 01:00-05:00 local
   (Europe/Berlin), see `sync/maintenance_window.py`.** An automated agent
   (Claude Code, agy) may use the IPTV provider's single tuner connection
