@@ -1275,4 +1275,11 @@ configuration in <0.04s without unpacking disk filesystems:
 - **QEMU `.vma.zst`**: `zstd -d -c <archive> | vma config /dev/stdin` reads the embedded VM
   configuration from the VMA header stream and halts in **0.034s**.
 
+## Host vs LXC egress for provider APIs & silent-failure traps (2026-09-02)
+
+When external service APIs (such as IPTV Xtream Codes / player_api) require specific egress routing (e.g. CT 105's Swiss Mullvad VPN tunnel and `User-Agent: MediaCoreSync/1.0`), host systemd scripts running on `pve-01` must shell the API calls through `pct exec 105 -- ...` rather than curling directly from the host.
+
+Crucially, scrapers and detectors must never swallow network exceptions or missing schedule data with `return []` / `exit 0`. Network failures, empty fixture fetches during active seasons, and provider timeouts must fail loudly by exiting non-zero and pushing an alert line to Loki `job="media-core-alerts"`, ensuring systemd and Grafana alert rules catch failures immediately.
+
+
 

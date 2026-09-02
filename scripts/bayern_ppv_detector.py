@@ -3,8 +3,9 @@
 Bayern Munich English PPV Match Detector & Scheduler Prototype.
 
 Queries:
-1. ESPN Public Soccer API for Bayern Munich (Team ID 132) schedule across Bundesliga, DFB-Pokal, and Champions League.
-2. Xtream Codes API for target English PPV categories:
+1. OpenLigaDB (for German Bundesliga and DFB-Pokal) and ESPN Public Soccer API
+   (for UEFA Champions League) for upcoming Bayern Munich fixtures.
+2. Xtream Codes API (via CT 105 Swiss egress) for target English PPV categories:
    - Category 573: US| DAZN PPV
    - Category 575: UK| DAZN PPV VIP
    - Category 1441: UK| SKY SPORT+ PPV
@@ -14,16 +15,19 @@ Queries:
 Matching Logic:
 - Multi-tier regex matching for Bayern Munich team names.
 - Negative regex filtering to eliminate false positives (Women, Amateure, Basketball, Highlights, Replays).
-- Cross-referencing opponent name and kickoff timestamp from ESPN schedule.
+- Cross-referencing opponent name and kickoff timestamp from OpenLigaDB / ESPN schedule.
 - Category market prioritization (US English > UK English > DE German).
 """
 
 import json
+import os
 import re
+import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Xtream API details (CT 105 credentials)
 XTREAM_BASE = "http://cf.teltv.xyz"
@@ -51,77 +55,128 @@ FALSE_POSITIVES = re.compile(
     re.IGNORECASE
 )
 
-# ESPN Soccer Leagues to check for Bayern Munich
-ESPN_LEAGUES = [
-    ("ger.1", "German Bundesliga"),
-    ("ger.pokal", "DFB-Pokal"),
-    ("uefa.champions", "UEFA Champions League"),
-]
-
-USER_AGENT = "curl/7.88.1"
+OPENLIGADB_BASE = "https://api.openligadb.de/getmatchdata"
+USER_AGENT_HTTP = "MediaCoreSync/1.0"
+USER_AGENT_ESPN = "curl/7.88.1"
 
 
-def fetch_espn_bayern_schedule():
-    """Fetch next upcoming Bayern Munich match details from ESPN API."""
+class ProviderFetchError(Exception):
+    """Raised when fetching streams from IPTV provider fails."""
+
+
+class FixtureFetchError(Exception):
+    """Raised when fetching fixture schedules fails."""
+
+
+def fetch_bayern_fixtures() -> tuple[list[dict], list[str]]:
+    """
+    Fetch upcoming Bayern Munich fixtures from OpenLigaDB (Bundesliga & DFB-Pokal)
+    and ESPN (UEFA Champions League).
+    Returns (sorted_fixtures, errors_list).
+    """
     fixtures = []
+    errors = []
     now = datetime.now(timezone.utc)
-    
-    for league_code, league_name in ESPN_LEAGUES:
-        # Dynamically query past, current, and upcoming seasons
-        current_year = now.year
-        for season in [current_year - 1, current_year, current_year + 1]:
-            url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_code}/teams/132/schedule?season={season}"
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            try:
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    data = json.load(r)
-                for ev in data.get("events", []):
-                    dt_str = ev.get("date")
-                    if not dt_str:
-                        continue
-                    try:
-                        kickoff = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-                    except ValueError:
-                        continue
-                    
-                    # Only consider future matches or matches started within last 3 hours
-                    if kickoff < now - timedelta(hours=3):
-                        continue
-                    
-                    name = ev.get("name", "")
-                    short_name = ev.get("shortName", "")
-                    comps_list = ev.get("competitions", [])
-                    comps = comps_list[0] if comps_list else {}
-                    competitors = comps.get("competitors", [])
-                    
-                    opponent = "Unknown"
-                    is_home = True
-                    for team_info in competitors:
-                        tname = team_info.get("team", {}).get("displayName", "")
-                        tid = str(team_info.get("id") or team_info.get("team", {}).get("id", ""))
-                        if tid != "132" and "Bayern" not in tname:
-                            opponent = tname
-                        else:
-                            is_home = team_info.get("homeAway") == "home"
-                            
-                    fixtures.append({
-                        "id": ev.get("id"),
-                        "league": league_name,
-                        "match_name": name,
-                        "short_name": short_name,
-                        "kickoff": kickoff,
-                        "opponent": opponent,
-                        "is_home": is_home,
-                    })
-            except Exception as e:
-                pass
-                
-    # Also check scoreboard endpoint (often has near-term live matches)
-    url_sb = "https://site.api.espn.com/apis/site/v2/sports/soccer/ger.1/scoreboard"
+    season_year = now.year if now.month >= 7 else now.year - 1
+
+    # 1. OpenLigaDB for Bundesliga (bl1) and DFB-Pokal (dfb)
+    oldb_leagues = [
+        ("bl1", f"{OPENLIGADB_BASE}/bl1/{season_year}", "German Bundesliga"),
+        ("dfb", f"{OPENLIGADB_BASE}/dfb/{season_year}", "DFB-Pokal"),
+    ]
+
+    for league_key, url, league_name in oldb_leagues:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT_HTTP})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.load(resp)
+                if isinstance(data, list):
+                    for m in data:
+                        t1 = m.get("team1") or {}
+                        t2 = m.get("team2") or {}
+                        t1_name = t1.get("teamName", "")
+                        t2_name = t2.get("teamName", "")
+                        if not ("Bayern" in t1_name or "Bayern" in t2_name):
+                            continue
+
+                        dt_utc = m.get("matchDateTimeUTC")
+                        if not dt_utc:
+                            continue
+                        try:
+                            kickoff = datetime.fromisoformat(dt_utc.replace("Z", "+00:00"))
+                        except (ValueError, TypeError):
+                            continue
+
+                        # Include matches that are upcoming or started within the last 3 hours
+                        if kickoff < now - timedelta(hours=3):
+                            continue
+
+                        is_home = "Bayern" in t1_name
+                        opponent = t2_name if is_home else t1_name
+                        fixtures.append({
+                            "id": f"oldb_{m.get('matchID')}",
+                            "league": league_name,
+                            "match_name": f"{t1_name} vs. {t2_name}",
+                            "short_name": f"{t1.get('shortName') or t1_name} vs. {t2.get('shortName') or t2_name}",
+                            "kickoff": kickoff,
+                            "opponent": opponent,
+                            "is_home": is_home,
+                        })
+                else:
+                    errors.append(f"OpenLigaDB {league_key} returned non-list data")
+        except Exception as exc:
+            errors.append(f"OpenLigaDB {league_key} error: {exc}")
+
+    # 2. ESPN for UEFA Champions League (teams schedule + scoreboard)
+    for s in [season_year - 1, season_year, season_year + 1]:
+        url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/uefa.champions/teams/132/schedule?season={s}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT_ESPN})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.load(resp)
+            for ev in data.get("events", []):
+                dt_str = ev.get("date")
+                if not dt_str:
+                    continue
+                try:
+                    kickoff = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    continue
+                if kickoff < now - timedelta(hours=3):
+                    continue
+                name = ev.get("name", "")
+                short_name = ev.get("shortName", "")
+                comps_list = ev.get("competitions", [])
+                comps = comps_list[0] if comps_list else {}
+                competitors = comps.get("competitors", [])
+                opponent = "Unknown"
+                is_home = True
+                for team_info in competitors:
+                    tname = team_info.get("team", {}).get("displayName", "")
+                    tid = str(team_info.get("id") or team_info.get("team", {}).get("id", ""))
+                    if tid != "132" and "Bayern" not in tname:
+                        opponent = tname
+                    else:
+                        is_home = team_info.get("homeAway") == "home"
+                fixtures.append({
+                    "id": f"espn_{ev.get('id')}",
+                    "league": "UEFA Champions League",
+                    "match_name": name,
+                    "short_name": short_name,
+                    "kickoff": kickoff,
+                    "opponent": opponent,
+                    "is_home": is_home,
+                })
+        except Exception:
+            # ESPN UCL schedule query is best-effort
+            pass
+
+    # Scoreboard for near-term UCL fixtures
+    url_sb = "https://site.api.espn.com/apis/site/v2/sports/soccer/uefa.champions/scoreboard"
     try:
-        req = urllib.request.Request(url_sb, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            sb_data = json.load(r)
+        req = urllib.request.Request(url_sb, headers={"User-Agent": USER_AGENT_ESPN})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            sb_data = json.load(resp)
         for ev in sb_data.get("events", []):
             name = ev.get("name", "")
             if "Bayern" in name:
@@ -138,8 +193,8 @@ def fetch_espn_bayern_schedule():
                         if tid != "132" and "Bayern" not in tname:
                             opponent = tname
                     fixtures.append({
-                        "id": ev.get("id"),
-                        "league": "German Bundesliga",
+                        "id": f"espn_sb_{ev.get('id')}",
+                        "league": "UEFA Champions League",
                         "match_name": name,
                         "short_name": ev.get("shortName", ""),
                         "kickoff": kickoff,
@@ -149,27 +204,65 @@ def fetch_espn_bayern_schedule():
     except Exception:
         pass
 
-    # Deduplicate by event ID and sort by kickoff
-    unique_fixtures = {}
+    # Deduplicate by fixture ID and sort by kickoff
+    unique = {}
     for f in fixtures:
-        unique_fixtures[f["id"]] = f
-    sorted_fixtures = sorted(unique_fixtures.values(), key=lambda x: x["kickoff"])
-    return sorted_fixtures
+        unique[f["id"]] = f
+    sorted_fixtures = sorted(unique.values(), key=lambda x: x["kickoff"])
+    return sorted_fixtures, errors
 
 
-def fetch_provider_ppv_streams(cat_id):
-    """Fetch live streams for a specific provider category."""
+def fetch_espn_bayern_schedule() -> list[dict]:
+    """Compatibility alias: calls fetch_bayern_fixtures and returns list of fixtures."""
+    fixtures, _ = fetch_bayern_fixtures()
+    return fixtures
+
+
+def fetch_provider_ppv_streams(cat_id: int) -> list[dict]:
+    """
+    Fetch live streams for a specific provider category.
+    Runs via CT 105's Swiss egress with User-Agent: MediaCoreSync/1.0.
+    """
     url = f"{XTREAM_BASE}/player_api.php?username={XTREAM_USER}&password={XTREAM_PASS}&action=get_live_streams&category_id={cat_id}"
-    req = urllib.request.Request(url, headers={"User-Agent": "MediaCoreSync/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.load(r)
+
+    # If running directly inside CT 105:
+    is_in_container = os.path.exists("/srv/media-core/.env") and not os.path.exists("/usr/sbin/pct")
+
+    if is_in_container:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT_HTTP})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.load(r)
+                if isinstance(data, list):
+                    return data
+                raise ProviderFetchError(f"Category {cat_id} returned unexpected data type: {type(data).__name__}")
+        except Exception as exc:
+            raise ProviderFetchError(f"Failed fetching category {cat_id} inside CT 105: {exc}") from exc
+    else:
+        # On host: shell provider query into CT 105
+        cmd = [
+            "/usr/sbin/pct", "exec", "105", "--",
+            "curl", "-s", "--max-time", "15",
+            "-A", USER_AGENT_HTTP,
+            url
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+            if res.returncode != 0:
+                raise ProviderFetchError(f"pct exec 105 failed (exit {res.returncode}): {res.stderr.strip()}")
+            out = res.stdout.strip()
+            if not out:
+                raise ProviderFetchError(f"Empty response received for category {cat_id}")
+            data = json.loads(out)
             if isinstance(data, list):
                 return data
-            return []
-    except Exception as exc:
-        print(f"Error fetching category {cat_id}: {exc}")
-        return []
+            raise ProviderFetchError(f"Category {cat_id} returned non-list JSON: {type(data).__name__}")
+        except subprocess.TimeoutExpired as exc:
+            raise ProviderFetchError(f"Timeout querying category {cat_id} via CT 105: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise ProviderFetchError(f"Invalid JSON from category {cat_id}: {exc} (response: {out[:100]})") from exc
+        except Exception as exc:
+            raise ProviderFetchError(f"Error querying category {cat_id} via CT 105: {exc}") from exc
 
 
 def extract_channel_slot(raw_name: str) -> str:
@@ -183,17 +276,39 @@ def extract_channel_slot(raw_name: str) -> str:
     return raw_name.strip()
 
 
-def match_stream_generic(stream, cat_info, team_patterns, false_positives_pattern=None, espn_fixture=None):
+def find_best_matching_fixture(stream_name: str, fixtures: list[dict]) -> dict | None:
+    """Find the most relevant fixture from the schedule for a given stream name."""
+    if not fixtures:
+        return None
+    # 1. Match opponent keyword in stream name
+    for f in fixtures:
+        opp = f.get("opponent", "")
+        opp_keywords = [w for w in re.findall(r"\w+", opp) if len(w) > 3 and w.lower() not in ["fc", "vfb", "tsv", "1.fc", "sv", "sc", "vfl"]]
+        for kw in opp_keywords:
+            if re.search(rf"\b{re.escape(kw)}\b", stream_name, re.IGNORECASE):
+                return f
+    # 2. Match fixture kickoff date
+    for f in fixtures:
+        f_date_str = f["kickoff"].strftime("%Y-%m-%d")
+        if f_date_str in stream_name:
+            return f
+    # Default to first upcoming fixture
+    return fixtures[0]
+
+
+def match_stream_generic(stream, cat_info, team_patterns, false_positives_pattern=None, fixture=None, espn_fixture=None):
     """
     Generic evaluator for provider stream match criteria.
+    Accepts fixture (or espn_fixture for backward compatibility).
     Returns match dictionary if matched, else None.
     """
+    target_fixture = fixture or espn_fixture
     raw_name = stream.get("name", "")
     stream_id = stream.get("stream_id")
-    
+
     if false_positives_pattern and false_positives_pattern.search(raw_name):
         return None
-        
+
     matched_team = False
     for p in team_patterns:
         if p.search(raw_name):
@@ -201,25 +316,25 @@ def match_stream_generic(stream, cat_info, team_patterns, false_positives_patter
             break
     if not matched_team:
         return None
-        
+
     score = cat_info["priority"]
     match_reasons = [f"Category: {cat_info['name']} (+{cat_info['priority']} pts)"]
-    
-    if espn_fixture:
-        opp = espn_fixture.get("opponent", "")
-        opp_keywords = [w for w in re.findall(r"\w+", opp) if len(w) > 3 and w.lower() not in ["fc", "vfb", "tsv", "1.fc", "sv", "sc"]]
+
+    if target_fixture:
+        opp = target_fixture.get("opponent", "")
+        opp_keywords = [w for w in re.findall(r"\w+", opp) if len(w) > 3 and w.lower() not in ["fc", "vfb", "tsv", "1.fc", "sv", "sc", "vfl"]]
         for kw in opp_keywords:
             if re.search(rf"\b{re.escape(kw)}\b", raw_name, re.IGNORECASE):
                 score += 50
                 match_reasons.append(f"Opponent match '{kw}' (+50 pts)")
                 break
-                
+
         dt_match = re.search(r"(\d{4}-\d\d-\d\d)\s*\|\s*(\d\d:\d\d)", raw_name)
         if dt_match:
             try:
                 str_dt_str = f"{dt_match.group(1)} {dt_match.group(2)}+00:00"
                 str_kickoff = datetime.fromisoformat(str_dt_str)
-                time_diff = abs((str_kickoff - espn_fixture["kickoff"]).total_seconds()) / 3600.0
+                time_diff = abs((str_kickoff - target_fixture["kickoff"]).total_seconds()) / 3600.0
                 if time_diff <= 3.0:
                     score += 40
                     match_reasons.append(f"Kickoff time alignment ({time_diff:.1f}h diff) (+40 pts)")
@@ -228,7 +343,7 @@ def match_stream_generic(stream, cat_info, team_patterns, false_positives_patter
                     match_reasons.append(f"Date/Time mismatch ({time_diff:.1f}h diff) (-50 pts)")
             except ValueError:
                 pass
-                
+
     raw_lower = raw_name.lower().strip()
     if raw_lower.startswith("live"):
         score += 20
@@ -250,53 +365,68 @@ def match_stream_generic(stream, cat_info, team_patterns, false_positives_patter
         "lang": cat_info["lang"],
         "score": score,
         "reasons": match_reasons,
+        "fixture": target_fixture,
     }
 
 
-def match_stream_for_bayern(stream, cat_info, espn_fixture=None):
+def match_stream_for_bayern(stream, cat_info, fixture=None, espn_fixture=None):
     """Evaluates a provider stream for Bayern Munich match criteria."""
-    return match_stream_generic(stream, cat_info, BAYERN_PATTERNS, FALSE_POSITIVES, espn_fixture)
-
+    return match_stream_generic(stream, cat_info, BAYERN_PATTERNS, FALSE_POSITIVES, fixture=fixture, espn_fixture=espn_fixture)
 
 
 def main():
     print("================================================================")
-    print(" BAYERN MUNICH PPV MATCH DETECTOR PROTOTYPE")
-    print("================================================ failure/test\n")
-    
-    # Step 1: ESPN Schedule Query
-    print("[1] Querying ESPN Schedule API for Bayern Munich...")
-    fixtures = fetch_espn_bayern_schedule()
-    next_fixture = fixtures[0] if fixtures else None
-    
-    if next_fixture:
-        print(f"  --> Next Fixture Found:")
-        print(f"      League:    {next_fixture['league']}")
-        print(f"      Match:     {next_fixture['match_name']}")
-        print(f"      Opponent:  {next_fixture['opponent']}")
-        print(f"      Kickoff:   {next_fixture['kickoff'].strftime('%Y-%m-%d %H:%M UTC')}")
-    else:
-        print("  --> No upcoming fixture returned by ESPN API for immediate window.")
+    print(" BAYERN MUNICH PPV MATCH DETECTOR")
+    print("================================================================\n")
+
+    # Step 1: Fixture Schedule Query
+    print("[1] Querying OpenLigaDB & ESPN for Bayern Munich fixtures...")
+    fixtures, fix_errors = fetch_bayern_fixtures()
+    if fix_errors:
+        for err in fix_errors:
+            print(f"  Warning: {err}", file=sys.stderr)
+
+    if not fixtures:
+        print("  ERROR: No upcoming Bayern Munich fixtures could be determined!", file=sys.stderr)
+        sys.exit(1)
+
+    next_fixture = fixtures[0]
+    print(f"  --> Next Upcoming Fixture:")
+    print(f"      League:    {next_fixture['league']}")
+    print(f"      Match:     {next_fixture['match_name']}")
+    print(f"      Opponent:  {next_fixture['opponent']}")
+    print(f"      Kickoff:   {next_fixture['kickoff'].strftime('%Y-%m-%d %H:%M UTC')}")
+    if len(fixtures) > 1:
+        print(f"      Following: {fixtures[1]['match_name']} ({fixtures[1]['kickoff'].strftime('%Y-%m-%d %H:%M UTC')})")
     print()
 
-    # Step 2: Provider Stream Scan across Target Categories
-    print("[2] Scanning Live Streams across Target Provider PPV Categories...")
+    # Step 2: Provider Stream Scan
+    print("[2] Scanning Live Streams across Target Provider PPV Categories (via CT 105 egress)...")
     all_matches = []
     total_streams_scanned = 0
-    
+    scan_errors = []
+
     for cat_id, cat_info in TARGET_CATEGORIES.items():
-        streams = fetch_provider_ppv_streams(cat_id)
-        total_streams_scanned += len(streams)
-        print(f"  Category {cat_id} ({cat_info['name']}): scanned {len(streams)} streams.")
-        
-        for s in streams:
-            match_res = match_stream_for_bayern(s, cat_info, next_fixture)
-            if match_res:
-                all_matches.append(match_res)
-                
+        try:
+            streams = fetch_provider_ppv_streams(cat_id)
+            total_streams_scanned += len(streams)
+            print(f"  Category {cat_id} ({cat_info['name']}): scanned {len(streams)} streams.")
+            for s in streams:
+                matched_f = find_best_matching_fixture(s.get("name", ""), fixtures) or next_fixture
+                match_res = match_stream_for_bayern(s, cat_info, fixture=matched_f)
+                if match_res:
+                    all_matches.append(match_res)
+        except ProviderFetchError as exc:
+            scan_errors.append(f"Category {cat_id} ({cat_info['name']}): {exc}")
+            print(f"  Category {cat_id} ({cat_info['name']}): ERROR - {exc}", file=sys.stderr)
+
+    if scan_errors:
+        print(f"\nProvider scan encountered {len(scan_errors)} errors!", file=sys.stderr)
+        sys.exit(1)
+
     print(f"\nScan complete! Examined {total_streams_scanned} total streams across {len(TARGET_CATEGORIES)} categories.")
     print(f"Live Bayern matches found: {len(all_matches)}")
-    
+
     for m in sorted(all_matches, key=lambda x: x["score"], reverse=True):
         print(f"\n  [MATCH DETECTED - Score: {m['score']}]")
         print(f"   Stream ID: {m['stream_id']}")
@@ -308,12 +438,12 @@ def main():
     print("\n----------------------------------------------------------------")
     print(" RUNNING TEST SUITE ON SYNTHESIZED TEST CASES")
     print("----------------------------------------------------------------")
-    
-    mock_espn = {
+
+    mock_fixture = {
         "opponent": "VfB Stuttgart",
-        "kickoff": datetime.fromisoformat("2026-08-28 18:30:00+00:00")
+        "kickoff": datetime.fromisoformat("2026-08-28 18:30:00+00:00"),
     }
-    
+
     test_cases = [
         ("Live | Bayern Munich vs. VfB Stuttgart | Bundesliga | 2026-08-28 | 18:30 (GMT) | 8K EXCLUSIVE | US: DAZN PPV 4", 573, True),
         ("Upcoming | VfB Stuttgart vs. FC Bayern Munich | Bundesliga | 2026-08-28 | 18:30 (GMT) | GB: DAZN PPV 1", 575, True),
@@ -323,19 +453,21 @@ def main():
         ("Live | Borussia Dortmund vs. RB Leipzig | Bundesliga | US: DAZN PPV 5", 573, False),
         ("Live | Bayern Munich Highlights & Goals | Magazine", 573, False),
     ]
-    
+
     passed = 0
     for name, cat_id, expected_match in test_cases:
         cat_info = TARGET_CATEGORIES[cat_id]
-        res = match_stream_for_bayern({"stream_id": 999999, "name": name}, cat_info, mock_espn)
+        res = match_stream_for_bayern({"stream_id": 999999, "name": name}, cat_info, fixture=mock_fixture)
         is_matched = res is not None and res["score"] > 80
         status = "PASS" if is_matched == expected_match else "FAIL"
         if status == "PASS":
             passed += 1
         print(f" [{status}] Stream: '{name[:65]}...'")
         print(f"         Expected Matched: {expected_match} | Actual Matched: {is_matched} (Score: {res['score'] if res else None})")
-        
+
     print(f"\nTest Suite Result: {passed}/{len(test_cases)} tests passed.")
+    if passed != len(test_cases):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

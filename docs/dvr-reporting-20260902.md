@@ -111,3 +111,76 @@ Restore normal behaviour by removing/expiring that file when the mains timer is 
   on pve-01 being off.
 * Tonight's DFB-Pokal match (VfL Osnabrück v Bayern, 2026-09-02) is **not carried live** on
   this lineup — only a Sportschau highlights slot. `not in guide yet` was accurate.
+
+## 7. Egress topology — three sources, three different exits
+
+The Bayern English-PPV detector had been running every 15 minutes, exiting 0, and doing
+nothing, because it got **both** of its network paths wrong. Nothing in the code made the
+constraints explicit, so this is the table to check first when a data source "just stops".
+
+| Source | Required egress | Why |
+|---|---|---|
+| OpenLigaDB (fixtures) | any | free, no auth, no geo restriction |
+| Provider Xtream API | **CT 105 only** — Swiss, `User-Agent: MediaCoreSync/1.0` | the account expects that egress; anything else is unreachable/403 |
+| ESPN (UCL only) | **host only** — residential German IP | ESPN 403s datacenter ranges |
+
+Measured 2026-09-02:
+
+| Path | IP | ESPN result |
+|---|---|---|
+| host | `217.232.15.33` (German **residential**, Telekom) | 200 OK |
+| CT 108 scraper | `45.144.115.131` (Ashburn VA, Clouvider AS62240 — **datacenter**) | **403 Forbidden** |
+| CT 105 | `156.146.62.42` (Swiss datacenter) | blocked/empty |
+
+**Note the host is NOT on a US tunnel** — it egresses the bare German WAN. That assumption
+cost real time; check `curl https://api.ipify.org` before reasoning about any egress.
+
+### Routing ESPN through the scraper's US tunnel does not help
+
+The idea is reasonable — CT 108 exists precisely because its target sites reject the Swiss IP
+— but it fails twice over. ESPN 403s the Ashburn datacenter range, and more importantly
+**ESPN is not geo-restricting us at all**: `ger.1/scoreboard` returns real current Bundesliga
+fixtures from the German residential IP. The empty result is confined to
+`/teams/<id>/schedule`, an endpoint ESPN does not populate for soccer teams. No exit IP can
+fill an endpoint that has no data.
+
+Tunnel 937 (`ovpnclient1`, United States - New York, UDP) also **cannot** be reused for this:
+its `from` is `{"type": "interface", "interface_list": ["guest"]}` — bound to the GIOT SSID,
+not MAC-based. Adding a MAC would mean changing its binding type and breaking GIOT. A dedicated
+`ovpnclient2` with its own MAC-bound tunnel would be required, and given the 2026-08-27/28
+cutover took the whole media stack offline through stacked VPN-firewall faults, that is a
+change to make deliberately and verify against the scrapers — not as a side effect of chasing
+an ESPN endpoint that is empty for everyone.
+
+## 8. Self-correcting repair loops (report-only until armed)
+
+The first two jobs permitted to change production state on their own. The guardrail is
+deliberately **not** the agent's judgement — it is a metric measured before and after, with
+automatic revert when it does not improve.
+
+| Loop | Grader | Rollback | Timer |
+|---|---|---|---|
+| `epg-repair-loop` | `epg_real_channels` on :9105 | timestamped `config.json.bak-epgrepair-<stamp>` | daily 02:15 |
+| `icon-repair-loop` | `icon-verify` custom-icon count | `icon-archive export` + extracted-dir backup | daily 03:15 |
+
+Rules both enforce: rollback captured **before** acting; acting requires `--apply` **and** an
+open maintenance window (01:00-05:00, via CT 105's `sync/maintenance_window.py`, which
+auto-tightens around scheduled recordings); no tuner access; no changes to recordings or
+timers. **Both ship report-only** — the `--apply` flag is not in the unit files. Arm them
+deliberately.
+
+The revert path was proven end-to-end against production rather than asserted: Loop A captured
+a backup, dropped `epg_ripper_US_LOCALS1` from the live config, ran a real sync, watched
+`epg_real_channels` fall **424 -> 380**, detected the non-improvement, restored the backup,
+re-synced, and confirmed 424. A loop that can act but cannot revert is worse than no loop.
+
+New artwork *generation* is deliberately excluded from Loop B — the runbook records that
+batches of 12 produced cropped text and invented words, so generation stays batched at 6 and
+stays a human call. Loop B proposes those instead (75 candidates at the time of writing,
+mostly `BBC Stream N` placeholders).
+
+**Do not "fix" a source reporting `matched 0/N`.** Sources merge in priority order and a later
+one legitimately reports 0 when an earlier one already covered those channels; the README calls
+several of them "structurally always near-zero". Only genuinely unreachable sources count.
+That misreading produced two false findings in the 2026-08-31 audit.
+
