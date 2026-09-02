@@ -1,0 +1,9 @@
+[Unit]
+Description=Run Weekly Backup Restorability Verification on Sundays at 10:30 (after vzdump)
+
+[Timer]
+OnCalendar=Sun 10:30:00 Europe/Berlin
+Persistent=true
+
+[Install]
+WantedBy=timers.target

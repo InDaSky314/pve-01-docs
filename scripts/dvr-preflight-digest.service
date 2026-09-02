@@ -1,0 +1,12 @@
+[Unit]
+Description=DVR Morning Pre-Flight Recording Digest
+After=network.target dvr-dashboard.service
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/usr/local/bin/dvr-preflight-digest
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

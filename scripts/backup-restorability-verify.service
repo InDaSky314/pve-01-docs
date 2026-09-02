@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly Backup Restorability Verification
+After=network.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/usr/local/bin/backup-restorability-verify
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
