@@ -1,0 +1,11 @@
+[Unit]
+Description=Run EPG External-Source Repair Loop Daily during Overnight Maintenance Window (02:15 Berlin)
+Documentation=file:///root/pve-01-docs/docs/lineup-runbook.md
+
+[Timer]
+# 02:15 Europe/Berlin (inside 01:00-05:00 maintenance window, after midnight jobs)
+OnCalendar=*-*-* 02:15:00 Europe/Berlin
+Persistent=true
+
+[Install]
+WantedBy=timers.target
