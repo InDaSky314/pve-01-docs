@@ -1,0 +1,15 @@
+[Unit]
+Description=Bayern Munich English PPV Match Detector & Alerting
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/pve-01-docs
+ExecStart=/usr/bin/python3 /root/pve-01-docs/scripts/bayern_ppv_alert.py
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
