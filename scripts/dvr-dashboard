@@ -25,6 +25,7 @@ import socket
 import subprocess
 import sys
 import threading
+import unicodedata
 import urllib.request
 from datetime import datetime, timedelta, timezone, time as dtime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -445,10 +446,16 @@ def resolve_dynamic_ppv_channel(team: str, game: dict[str, Any],
 
 
 def resolve_channel_id(game: dict[str, Any], jf_channels: dict[str, str]) -> tuple[str | None, str]:
-    """Resolve ESPN broadcast network to Jellyfin channel ID and channel name."""
+    """Resolve broadcast network or EPG channel to Jellyfin channel ID and channel name."""
     team = game.get("team", "")
-    if team in DYNAMIC_PPV_TEAMS:
-        return resolve_dynamic_ppv_channel(team, game, jf_channels)
+
+    # If the game already has an EPG-enriched channel resolved (e.g. "1011 Sky Sport Bundesliga HD")
+    g_ch = game.get("channel", "")
+    if g_ch and g_ch != "not in guide yet":
+        for cname, cid in jf_channels.items():
+            if cname.lower() in g_ch.lower() or g_ch.lower() in cname.lower():
+                return cid, cname
+
     broadcasts = game.get("broadcasts") or []
 
     for bc in broadcasts:
@@ -459,6 +466,10 @@ def resolve_channel_id(game: dict[str, Any], jf_channels: dict[str, str]) -> tup
             return jf_channels["Milwaukee Brewers HD"], "Milwaukee Brewers HD"
         if "Bucks" in bc and "Milwaukee Bucks HD" in jf_channels:
             return jf_channels["Milwaukee Bucks HD"], "Milwaukee Bucks HD"
+
+        for cname, cid in jf_channels.items():
+            if cname.lower() in bc.lower() or bc.lower() in cname.lower():
+                return cid, cname
 
         preferred_market = LOCAL_MARKET_PREFERENCE.get(team)
         if preferred_market:
@@ -482,6 +493,9 @@ def resolve_channel_id(game: dict[str, Any], jf_channels: dict[str, str]) -> tup
         cid = jf_channels.get(rsn_name) or jf_channels.get(rsn_name.lower())
         if cid:
             return cid, rsn_name
+
+    if team in DYNAMIC_PPV_TEAMS:
+        return resolve_dynamic_ppv_channel(team, game, jf_channels)
 
     return None, f"Unmapped ({', '.join(broadcasts) if broadcasts else 'No Broadcast Info'})"
 
@@ -619,16 +633,7 @@ TEAMS = [
     ("Badgers Basketball", "basketball/mens-college-basketball", "275"),
     ("Bucks",              "basketball/nba",                     "mil"),
     ("Brewers",            "baseball/mlb",                       "mil"),
-    # Bayern Munich, added 2026-08-17 (Phase 3): all three competitions ESPN
-    # tracks for team 132, same set bayern_ppv_detector.py already covers
-    # (confirmed 2026-08-17: Champions League was already in scope, no gap).
-    # Three separate TEAMS rows under the same label is fine -- all_games()'s
-    # own dedup key is (label, event id), and ESPN gives each competition's
-    # matches distinct event IDs, so this just accumulates all three
-    # competitions' fixtures under one "Bayern Munich" schedule entry with no
-    # special-case code needed anywhere else.
-    ("Bayern Munich",      "soccer/ger.1",                       "132"),
-    ("Bayern Munich",      "soccer/ger.pokal",                   "132"),
+    # Bayern Munich: Champions League via ESPN; Bundesliga + DFB-Pokal via OpenLigaDB
     ("Bayern Munich",      "soccer/uefa.champions",              "132"),
 ]
 
@@ -752,83 +757,246 @@ def override_until() -> datetime | None:
 
 SEASON_TYPES = {1: "Preseason", 2: "", 3: "Postseason"}
 
+OPENLIGADB_BASE = "https://api.openligadb.de/getmatchdata"
+_oldb_cache: dict = {"at": None, "games": []}
+_problems: list[str] = []
 
-def all_games(now: datetime) -> list[dict]:
-    """Every game ESPN lists for the followed teams, all season types. Cached 6 h."""
+
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    t = unicodedata.normalize("NFKC", text).lower()
+    return t.replace("\u2013", "-").replace("\u2014", "-")
+
+
+def team_in_text(team_name: str, text: str) -> bool:
+    norm_text = normalize_text(text)
+    words = re.findall(r"\b[a-z0-9äöüß]+\b", normalize_text(team_name))
+    stop = {"fc", "vfl", "vfb", "sv", "sc", "fsv", "tsg", "rb", "1", "04", "05", "07", "09", "spvgg"}
+    sig = [w for w in words if w not in stop and len(w) > 1]
+    return any(w in norm_text for w in (sig if sig else words))
+
+
+def fetch_openligadb_bayern(now: datetime, problems: list[str], chmap: dict[str, str]) -> list[dict]:
+    """Fetch Bayern Munich fixtures from OpenLigaDB for Bundesliga (bl1) and DFB-Pokal (dfb)
+    for the current season, enriched with broadcast info from Jellyfin's EPG.
+    """
+    global _oldb_cache
+    now_utc = datetime.now(timezone.utc)
+    season_year = now.year if now.month >= 7 else now.year - 1
+
+    leagues = [("bl1", f"{OPENLIGADB_BASE}/bl1/{season_year}"),
+               ("dfb", f"{OPENLIGADB_BASE}/dfb/{season_year}")]
+
+    raw_matches = []
+    fetch_failed = False
+
+    for league_key, url in leagues:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "DVRDashboard/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.load(resp)
+                if isinstance(data, list):
+                    raw_matches.extend(data)
+        except Exception as exc:
+            fetch_failed = True
+            problems.append(f"OpenLigaDB {league_key} unreachable ({type(exc).__name__})")
+
+    if fetch_failed and not raw_matches:
+        if _oldb_cache.get("games"):
+            return list(_oldb_cache["games"])
+        return []
+
+    ch_items = (jf_request("/emby/LiveTv/Channels?Limit=2000") or {}).get("Items", [])
+    channels_by_id = {c.get("Id"): c for c in ch_items if isinstance(c, dict) and c.get("Id")}
+
+    out = []
+    seen_ids = set()
+
+    for m in raw_matches:
+        t1 = m.get("team1") or {}
+        t2 = m.get("team2") or {}
+        t1_name = t1.get("teamName", "")
+        t2_name = t2.get("teamName", "")
+        if not ("Bayern" in t1_name or "Bayern" in t2_name):
+            continue
+
+        match_id = str(m.get("matchID") or "")
+        if match_id in seen_ids:
+            continue
+        seen_ids.add(match_id)
+
+        dt_utc = m.get("matchDateTimeUTC")
+        if not dt_utc:
+            continue
+        try:
+            start_utc = datetime.fromisoformat(dt_utc.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+        start = start_utc.astimezone(LOCAL)
+        end = start + DURATION["soccer"]
+
+        group_name = (m.get("group") or {}).get("groupName", "")
+        done = bool(m.get("matchIsFinished"))
+
+        score = ""
+        if done:
+            res = next((r for r in m.get("matchResults", [])
+                        if r.get("resultTypeKind") in ("After90Minutes", "AfterExtraTime", "AfterPenaltyShootout")
+                        or r.get("resultName") == "Endergebnis"),
+                       m.get("matchResults")[-1] if m.get("matchResults") else None)
+            if res:
+                p1 = res.get("pointsTeam1", 0)
+                p2 = res.get("pointsTeam2", 0)
+                s1 = t1.get("shortName") or t1_name
+                s2 = t2.get("shortName") or t2_name
+                score = f"{s1} {p1}  {s2} {p2}"
+
+        # EPG enrichment: query Jellyfin LiveTV Programs around kickoff
+        # Guide window is ~54 days; only query if match is within reasonable range (-1 day to +60 days)
+        resolved_channel = None
+        broadcast_list = []
+        if (now_utc - timedelta(days=1)) <= start_utc <= (now_utc + timedelta(days=60)):
+            min_s = (start_utc - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            max_s = (start_utc + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            p_resp = jf_request("/LiveTv/Programs",
+                                data={"MinStartDate": min_s, "MaxStartDate": max_s, "Limit": 500},
+                                method="POST")
+            matched_progs = []
+            for p in (p_resp.get("Items", []) if isinstance(p_resp, dict) else []):
+                try:
+                    ps = datetime.fromisoformat(p["StartDate"].replace("Z", "+00:00"))
+                    pe = datetime.fromisoformat(p["EndDate"].replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                if not (ps <= start_utc < pe):
+                    continue
+                ep = p.get("EpisodeTitle") or ""
+                if team_in_text(t1_name, ep) and team_in_text(t2_name, ep):
+                    cid = p.get("ChannelId")
+                    c = channels_by_id.get(cid, {})
+                    cno = str(c.get("ChannelNumber") or c.get("Number") or "").strip()
+                    cname = (c.get("Name") or "").strip()
+                    disp = chmap.get(cid) or chmap.get(cno) or (f"{cno} {cname}".strip() if cno else cname)
+                    matched_progs.append({
+                        "channel_id": cid,
+                        "channel_number": cno,
+                        "channel_name": cname,
+                        "display": disp,
+                    })
+
+            if matched_progs:
+                # Prefer primary HD feed: 1011 (Sky Sport Bundesliga HD)
+                matched_progs.sort(key=lambda x: (
+                    0 if x["channel_number"] == "1011" or x["channel_name"] == "Sky Sport Bundesliga HD"
+                    else (1 if "Sky Sport Bundesliga HD" in x["channel_name"] else 2),
+                    int(x["channel_number"]) if x["channel_number"].isdigit() else 99999
+                ))
+                primary = matched_progs[0]
+                resolved_channel = primary["display"]
+                broadcast_list = [primary["display"]] + [mp["display"] for mp in matched_progs[1:]]
+
+        channel_field = resolved_channel if resolved_channel else "not in guide yet"
+
+        out.append({
+            "id": match_id,
+            "team": "Bayern Munich",
+            "kind": "soccer",
+            "season": group_name,
+            "name": f"{t1_name} vs. {t2_name}",
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "done": done,
+            "score": score,
+            "broadcasts": broadcast_list,
+            "channel": channel_field,
+            "needsPower": outside_window(start, end),
+        })
+
+    if out:
+        _oldb_cache["games"] = list(out)
+        _oldb_cache["at"] = now
+    elif _oldb_cache.get("games"):
+        out = list(_oldb_cache["games"])
+
+    return out
+
+
+def all_games(now: datetime, problems: list[str] | None = None) -> list[dict]:
+    """Every game listed for the followed teams, all season types. Cached 6 h."""
+    global _problems
     with _lock:
         if _sched["at"] and (now - _sched["at"]) < timedelta(hours=6):
+            if problems is not None:
+                problems.extend(_problems)
             return _sched["games"]
 
     out: list[dict] = []
     seen: set = set()
+    current_problems: list[str] = []
+    chmap = channel_names()
+    jf_channels = get_jellyfin_channels()
+
     for label, sport, team in TEAMS:
-      for stype, sname in SEASON_TYPES.items():
-        try:
-            req = urllib.request.Request(
-                f"https://site.api.espn.com/apis/site/v2/sports/{sport}"
-                f"/teams/{team}/schedule?seasontype={stype}",
-            )
-            with urllib.request.urlopen(req, timeout=15) as r:
-                data = json.load(r)
-        except Exception:                                   # noqa: BLE001
-            continue
-        kind = sport.split("/")[0]
-        for ev in data.get("events", []):
+        for stype, sname in SEASON_TYPES.items():
             try:
-                start = datetime.fromisoformat(
-                    ev["date"].replace("Z", "+00:00")).astimezone(LOCAL)
-            except (KeyError, ValueError):
+                req = urllib.request.Request(
+                    f"https://site.api.espn.com/apis/site/v2/sports/{sport}"
+                    f"/teams/{team}/schedule?seasontype={stype}",
+                )
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    data = json.load(r)
+            except Exception:                               # noqa: BLE001
                 continue
-            comp = (ev.get("competitions") or [{}])[0]
-            done = bool(((comp.get("status") or {}).get("type") or {}).get("completed"))
-            score = ""
-            if done:
-                bits = []
-                for c in comp.get("competitors") or []:
-                    ab = (c.get("team") or {}).get("abbreviation") or ""
-                    sc = (c.get("score") or {})
-                    val = sc.get("displayValue") if isinstance(sc, dict) else sc
-                    if ab and val is not None:
-                        bits.append(f"{ab} {val}")
-                score = "  ".join(reversed(bits))
-            key = (label, ev.get("id") or start.isoformat())
-            if key in seen:
-                continue
-            seen.add(key)
-            end = start + DURATION[kind]
+            kind = sport.split("/")[0]
+            for ev in data.get("events", []):
+                try:
+                    start = datetime.fromisoformat(
+                        ev["date"].replace("Z", "+00:00")).astimezone(LOCAL)
+                except (KeyError, ValueError):
+                    continue
+                comp = (ev.get("competitions") or [{}])[0]
+                done = bool(((comp.get("status") or {}).get("type") or {}).get("completed"))
+                score = ""
+                if done:
+                    bits = []
+                    for c in comp.get("competitors") or []:
+                        ab = (c.get("team") or {}).get("abbreviation") or ""
+                        sc = (c.get("score") or {})
+                        val = sc.get("displayValue") if isinstance(sc, dict) else sc
+                        if ab and val is not None:
+                            bits.append(f"{ab} {val}")
+                    score = "  ".join(reversed(bits))
+                key = (label, ev.get("id") or start.isoformat())
+                if key in seen:
+                    continue
+                seen.add(key)
+                end = start + DURATION[kind]
 
-            broadcast_names: list[str] = []
-            for bc in comp.get("broadcasts") or []:
-                m_short = (bc.get("media") or {}).get("shortName")
-                if m_short:
-                    broadcast_names.append(m_short)
-                for n in bc.get("names") or []:
-                    if n and n not in broadcast_names:
-                        broadcast_names.append(n)
+                broadcast_names: list[str] = []
+                for bc in comp.get("broadcasts") or []:
+                    m_short = (bc.get("media") or {}).get("shortName")
+                    if m_short:
+                        broadcast_names.append(m_short)
+                    for n in bc.get("names") or []:
+                        if n and n not in broadcast_names:
+                            broadcast_names.append(n)
 
-            out.append({
-                "id": str(ev.get("id") or ""),
-                "team": label, "kind": kind, "season": sname,
-                "name": ev.get("shortName") or ev.get("name") or "game",
-                "start": start.isoformat(), "end": end.isoformat(),
-                "done": done, "score": score,
-                "broadcasts": broadcast_names,
-                "needsPower": outside_window(start, end),
-            })
+                g_item = {
+                    "id": str(ev.get("id") or ""),
+                    "team": label, "kind": kind, "season": sname,
+                    "name": ev.get("shortName") or ev.get("name") or "game",
+                    "start": start.isoformat(), "end": end.isoformat(),
+                    "done": done, "score": score,
+                    "broadcasts": broadcast_names,
+                    "needsPower": outside_window(start, end),
+                }
+                cid, cname = resolve_channel_id(g_item, jf_channels)
+                if cid:
+                    g_item["channel"] = chmap.get(cid) or chmap.get(cname) or cname
+                out.append(g_item)
 
-    # Scoreboard fallback for dynamic-PPV teams (Bayern Munich Phase 3, added
-    # 2026-08-17). Agy's review (20260817T074620Z-bayern-phase3-review.md)
-    # found -- and I independently confirmed with direct curl calls -- that
-    # ESPN's own /schedule endpoint doesn't reliably carry soccer fixtures
-    # the way it does for the US-sports TEAMS entries above:
-    # soccer/ger.pokal?seasontype=1 returns HTTP 400, and
-    # soccer/ger.1?seasontype=2 returns 0 events, even though the real
-    # upcoming Bayern-Stuttgart match (2026-08-28) is sitting right there on
-    # /scoreboard. Without this, the match would never appear in the
-    # dashboard for the "Record" button to attach to at all. Deliberately a
-    # separate small block rather than folding into the loop above -- keeps
-    # the working US-sports path completely untouched, at the cost of a
-    # short bit of duplicated event-parsing.
+    # Scoreboard fallback for dynamic-PPV teams / Champions League
     dynamic_leagues = {sport for label, sport, _ in TEAMS if label in DYNAMIC_PPV_TEAMS}
     for sport in dynamic_leagues:
         try:
@@ -840,15 +1008,6 @@ def all_games(now: datetime) -> list[dict]:
             continue
         kind = sport.split("/")[0]
         for ev in data.get("events", []):
-            # Match against the FULL name ("VfB Stuttgart at Bayern Munich"),
-            # not shortName ("VFB @ MUN") -- found by testing this against
-            # the real live scoreboard response: ESPN's abbreviated
-            # shortName doesn't contain "Bayern" at all for this fixture, so
-            # matching shortName first (as the display-name convention below
-            # does) silently missed every match. Full `name` is only used
-            # for the regex check; the stored/displayed "name" field below
-            # still prefers shortName, same convention as the rest of this
-            # file.
             full_name = ev.get("name") or ev.get("shortName") or ""
             disp_name = ev.get("shortName") or ev.get("name") or "game"
             matched_label = next(
@@ -862,13 +1021,6 @@ def all_games(now: datetime) -> list[dict]:
                     ev["date"].replace("Z", "+00:00")).astimezone(LOCAL)
             except (KeyError, ValueError):
                 continue
-            # ESPN's UEFA-competition /scoreboard endpoints returned a whole
-            # group-stage slate (Sept 2025 - Mar 2026), not just "today"'s
-            # games the way NFL/NBA scoreboard calls typically do -- found
-            # by testing this against the real live response (10 events,
-            # mostly long-since-completed by the current date). Filter to
-            # future or very-recently-started matches only, same bound the
-            # standalone bayern_ppv_detector.py already uses.
             if start < now - timedelta(hours=3):
                 continue
             key = (matched_label, ev.get("id") or start.isoformat())
@@ -878,39 +1030,54 @@ def all_games(now: datetime) -> list[dict]:
             comp = (ev.get("competitions") or [{}])[0]
             done = bool(((comp.get("status") or {}).get("type") or {}).get("completed"))
             end = start + DURATION[kind]
-            out.append({
+            g_item = {
                 "id": str(ev.get("id") or ""),
                 "team": matched_label, "kind": kind, "season": "",
                 "name": disp_name,
                 "start": start.isoformat(), "end": end.isoformat(),
                 "done": done, "score": "",
-                # No fixed broadcast -- resolve_dynamic_ppv_channel() looks
-                # this up live at record-click time instead.
                 "broadcasts": [],
                 "needsPower": outside_window(start, end),
-            })
+            }
+            out.append(g_item)
+
+    # OpenLigaDB fixtures for Bayern Munich (Bundesliga + DFB-Pokal)
+    oldb_games = fetch_openligadb_bayern(now, current_problems, chmap)
+    for g in oldb_games:
+        key = ("Bayern Munich", g["id"] or g["start"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(g)
 
     out.sort(key=lambda g: g["start"])
     with _lock:
         _sched.update(at=now, games=out)
+        _problems = list(current_problems)
+
+    if problems is not None:
+        problems.extend(current_problems)
     return out
 
 
 def channel_names() -> dict[str, str]:
-    # Was 2 separate `pct exec` forks (cat + curl) per call -- expensive,
-    # given this runs on every dashboard poll. jf_request() already does
-    # the same thing with a cached token over a direct HTTP call, the
-    # same pattern already used everywhere else in this file (found in
-    # review, 2026-08-17).
     out: dict[str, str] = {}
     data = jf_request("/emby/LiveTv/Channels?Limit=2000")
     if not data or not isinstance(data, dict):
         return out
     for c in data.get("Items", []):
-        number = c.get("Number") or c.get("ChannelNumber")
-        name = c.get("Name")
-        if number and name:
-            out[str(number)] = name
+        number = str(c.get("ChannelNumber") or c.get("Number") or "").strip()
+        name = (c.get("Name") or "").strip()
+        cid = str(c.get("Id") or "").strip()
+        display = f"{number} {name}".strip() if number else name
+        if number:
+            out[number] = display
+            out[f"hdhr_{number}"] = display
+        if cid:
+            out[cid] = display
+        if name:
+            out[name] = display
+            out[name.lower()] = display
     return out
 
 
@@ -930,9 +1097,12 @@ def recordings(now: datetime) -> tuple[list[dict], list[str]]:
             end += timedelta(seconds=t.get("PostPaddingSeconds") or 0)
             if end < now:
                 continue
-            num = "".join(ch for ch in str(t.get("ChannelId", "")) if ch.isdigit())
+            raw_cid = str(t.get("ChannelId") or "")
+            num = "".join(ch for ch in raw_cid if ch.isdigit())
+            c_name = t.get("ChannelName") or ""
+            c_disp = chmap.get(raw_cid) or chmap.get(num) or chmap.get(c_name) or (f"ch {num}" if num else "")
             items.append({"source": "Jellyfin", "name": t.get("Name", "recording"),
-                          "channel": chmap.get(num) or (f"ch {num}" if num else ""),
+                          "channel": c_disp,
                           "subtitle": t.get("EpisodeTitle") or "",
                           "start": start.isoformat(), "end": end.isoformat(),
                           "live": start <= now <= end,
@@ -945,19 +1115,49 @@ def recordings(now: datetime) -> tuple[list[dict], list[str]]:
 
 
 def tag_recordings(games: list[dict], recs: list[dict]) -> None:
+    # A timer only carries the "<Team>:" name prefix when sports-dvr-auto created
+    # it. Anything scheduled by hand, or from the Jellyfin UI, used to fall through
+    # to the UI's "other recording overlaps" label even when it WAS this game --
+    # how the 2026-09-05 Bayern match and the 2026-09-02 Brewers game both read as
+    # foreign overlaps. Channel is the reliable second signal, and it generalises:
+    # recordings() and the schedule rows format channel identically ("<num> <name>"),
+    # so an overlapping timer on the same channel is this game's own recording.
     for g in games:
         gs, ge = datetime.fromisoformat(g["start"]), datetime.fromisoformat(g["end"])
-        hits = [r["name"] for r in recs
+        hits = [r for r in recs
                 if datetime.fromisoformat(r["start"]) < ge
                 and datetime.fromisoformat(r["end"]) > gs]
-        g["recording"] = hits[0] if hits else None
+        g["recording"] = hits[0]["name"] if hits else None
+        g["recordingIsThisGame"] = False
+        team = g.get("team") or ""
+        gch = g.get("channel") or ""
+        # Third signal, for the ESPN-sourced US teams: those games carry no
+        # resolved channel (only the OpenLigaDB/EPG path sets one), so the
+        # channel comparison above can never fire for them. The team's leading
+        # token is distinctive enough -- "Brewers" appears in both the timer name
+        # ("Milwaukee Brewers at Chicago Cubs") and its channel ("121 Milwaukee
+        # Brewers HD"). Leading token, not trailing: "Badgers Football" would
+        # otherwise match on "Football".
+        tok = team.split()[0].lower() if team else ""
+        for r in hits:
+            rname = str(r.get("name", ""))
+            rch = str(r.get("channel", ""))
+            if (team and rname.startswith(team + ":")) or (
+                    gch and gch != "not in guide yet" and rch == gch) or (
+                    len(tok) >= 4 and (tok in rname.lower() or tok in rch.lower())):
+                g["recording"] = rname
+                g["recordingIsThisGame"] = True
+                break
 
 
 def status() -> dict:
     now = datetime.now(LOCAL)
     recs, problems = recordings(now)
+    oldb_probs: list[str] = []
+    games = all_games(now, oldb_probs)
+    problems.extend(oldb_probs)
     horizon = now + timedelta(days=UPCOMING_DAYS)
-    upcoming = [g for g in all_games(now)
+    upcoming = [g for g in games
                 if now <= datetime.fromisoformat(g["start"]) <= horizon]
     tag_recordings(upcoming, recs)
     ov = override_until()
@@ -975,7 +1175,9 @@ def status() -> dict:
 def schedule() -> dict:
     now = datetime.now(LOCAL)
     recs, problems = recordings(now)
-    games = [dict(g) for g in all_games(now)]
+    oldb_probs: list[str] = []
+    games = [dict(g) for g in all_games(now, oldb_probs)]
+    problems.extend(oldb_probs)
     tag_recordings(games, recs)
     # dict.fromkeys() dedupes while preserving first-seen order -- needed
     # since a team can have multiple TEAMS rows (Bayern Munich has 3, one
@@ -1262,7 +1464,8 @@ async function recordGame(btn, encodedGame) {
 function pills(g, past){let h='';
   if(g.season)h+=`<span class="pill season">${esc(g.season)}</span>`;
   if(SPORTS_CONFIG[g.team] === false)h+=`<span class="pill season" title="Auto-record toggled off for ${esc(g.team)}">auto off</span>`;
-  const sameGame=g.team&&g.recording&&g.recording.startsWith(g.team+':');
+  const sameGame = g.recordingIsThisGame ||
+    (g.team && g.recording && g.recording.startsWith(g.team + ':'));
   if(g.recording){
     const label=sameGame?'recording':'other recording overlaps';
     h+=`<span class="pill rec" title="${esc(g.recording)}">${label}</span>`;

@@ -1158,3 +1158,121 @@ a defensive no-op either way.)
 "about to run out of disk". Actual filesystem usage inside those containers was 73% and 43%.
 Thin `Data%` counts blocks ever written, not blocks currently in use, and never falls when
 files are deleted. Always confirm with `df -h` inside the guest before acting on it.
+
+## The host only boots on an AC power *transition* (2026-09-02)
+
+The host was dead from 2026-09-01 22:13 to 2026-09-02 19:18 -- ~21 hours -- and every
+recording in that window was lost. `journalctl --list-boots` shows the gap plainly.
+
+Owner's diagnosis, and it fits every symptom: **if the mains timer does not actually cut and
+restore power, the machine never comes back on.** The BIOS boots on power-restore, so a
+missing OFF means there is no subsequent ON. A mains timer that silently stops cycling
+therefore does not leave the box running -- it leaves the box *off*, because
+`dvr-clean-shutdown` had already powered it down cleanly at 22:10 in anticipation of a cut
+that never came.
+
+That is the dangerous shape: the software half of the pairing is reliable and the hardware
+half is not, and the failure mode is silent. Nothing alarms, because from the monitoring
+stack's point of view the host is simply absent.
+
+**Two consequences worth remembering:**
+
+* A "keep the box up" request is NOT satisfied by leaving mains on alone. If
+  `dvr-clean-shutdown` runs, the box shuts down and then nothing restores it. Suppress the
+  software shutdown as well -- see below.
+* `stack-monitor.py` and Grafana cannot see this. Everything they scrape lives on the host
+  that is off. Detection has to come from outside the host, or from noticing an expected
+  boot did not happen.
+
+### Suppressing the nightly shutdown for more than one night
+
+`dvr-shutdown-hold on` masks `dvr-clean-shutdown.service` and is the right tool for a single
+night, but it **fails when the unit is a real file** in `/etc/systemd/system` (which it is):
+`Failed to mask unit: File '...' already exists` -- systemd cannot symlink over it.
+
+The mechanism that does work for a multi-day hold is the dashboard override file, which
+`dvr-clean-shutdown` checks before anything else:
+
+```python
+ov = datetime.fromisoformat(OVERRIDE.read_text().strip())
+if ov > now:
+    print(f"override active until {ov:%a %H:%M} -- staying up")
+    return 0
+```
+
+Note the API caps what it will write -- `POST /api/override {"hours": 160}` clamped to ~24h,
+because `keep_awake_cutoff()` deliberately targets the next real cutoff. For a multi-day hold,
+write `/var/lib/dvr-dashboard/override-until` directly with an ISO timestamp, then **verify
+with the script's own dry run** rather than assuming:
+
+```bash
+/usr/local/bin/dvr-clean-shutdown --dry-run
+# override active until Wed 12:00 -- staying up
+```
+
+An expired override is ignored (fixed 2026-08-11), so a stale file is harmless.
+
+## ESPN cannot supply Bundesliga fixtures; OpenLigaDB can (2026-09-02)
+
+The DVR dashboard showed Bayern Munich with exactly one game -- a completed preseason match --
+and the owner nearly missed the 2026-09-05 Schalke fixture. Probed live:
+
+| Endpoint | Result |
+|---|---|
+| `soccer/ger.1/teams/132/schedule?seasontype=1` | 1 event, already played |
+| `soccer/ger.1/teams/132/schedule?seasontype=2` (regular season) | **0 events** |
+| `soccer/ger.1/scoreboard` | 1 event, no Bayern |
+
+This is not a config error -- the three `TEAMS` rows for team 132 are correct, and the
+scoreboard fallback added 2026-08-17 works as designed. ESPN simply does not populate
+Bundesliga team schedules, and its scoreboard only covers the current matchday slice, so a
+fixture three days out is invisible.
+
+**`https://api.openligadb.de/getmatchdata/bl1/<year>` is free, needs no auth, and returns the
+full season** -- 306 matches, 34 of them Bayern. Use `matchDateTimeUTC`, not `matchDateTime`
+(local, no offset). UEFA Champions League stays on ESPN, whose scoreboard genuinely does
+return a full slate.
+
+**Two traps when matching a fixture to the EPG:**
+
+* The German feed puts the generic show name in the title (`Fußball: Bundesliga`) and the
+  actual fixture in the **sub-title** (`FC Schalke 04 – FC Bayern München, tipico Topspiel der
+  Woche, 2. Spieltag`). Match the sub-title. The separator is an EN DASH (U+2013).
+* **The programme window is not the kickoff.** Sky opens coverage an hour early: kickoff
+  16:30Z, coverage block 15:30Z-19:15Z. Match by requiring the programme window to *contain*
+  the kickoff -- that also excludes `Klassiker der Woche: ... (2014/2015)` archive reruns and
+  `Matchplan: ...` preview shows, which string filtering alone will not.
+
+## "other recording overlaps" was a label bug, not a conflict
+
+`tag_recordings()` matches games to timers purely by time overlap, and the UI decided the
+label with `g.recording.startsWith(g.team + ':')`. That prefix only exists on timers
+`sports-dvr-auto` created, so **any timer made by hand or from the Jellyfin UI displayed as a
+foreign overlap on its own game** -- including a Brewers game that was being recorded
+correctly.
+
+Fixed generally, not per-team: compare the resolved channel first (schedule rows and the
+recordings list now format channel identically as `"<num> <name>"`), then fall back to the
+team's *leading* token for the ESPN-sourced US teams, which carry no resolved channel.
+Leading token, not trailing -- "Badgers Football" would otherwise match on "Football".
+
+Worth noting agy's first attempt at this hardcoded `'Bayern'`/`'Bundesliga'`/`'Fußball'`
+string matches, which fixed the one visible case, left the Brewers case broken, and would
+have claimed any Bundesliga recording as the current fixture. A per-symptom patch that passes
+the demo is the characteristic failure to watch for when reviewing its work.
+
+## Fast zero-I/O verification of multi-gigabyte vzdump archives (2026-09-02)
+
+Unpacking or listing a 41 GB `.vma.zst` or 4.6 GB `.tar.zst` archive causes heavy read I/O
+and cache churn on shared NVMe/SATA storage pools (`tar -tf` took 27.5s on a 4.6 GB archive).
+
+Two fast single-block extraction methods verify decompression stream validity and guest
+configuration in <0.04s without unpacking disk filesystems:
+
+- **LXC `.tar.zst`**: `tar --zstd --occurrence=1 -xOf <archive> ./etc/vzdump/pct.conf` extracts
+  the initial container configuration block and halts immediately in **0.005s** (without
+  `--occurrence=1`, tar scans to EOF taking 25s).
+- **QEMU `.vma.zst`**: `zstd -d -c <archive> | vma config /dev/stdin` reads the embedded VM
+  configuration from the VMA header stream and halts in **0.034s**.
+
+
