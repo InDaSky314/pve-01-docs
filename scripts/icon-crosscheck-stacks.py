@@ -3,8 +3,8 @@ import json, hashlib, urllib.request, re
 def api(base, key, path):
     return urllib.request.urlopen(urllib.request.Request(
         base+path, headers={"Authorization":"MediaBrowser Token="+key}), timeout=60).read()
-P=("http://192.168.9.50:8096","3f579d403112dfbe5c2dd69832c5cbfe")
-C=("http://192.168.9.219:8096","1f74eabb57a5a6165e67c08aed0108b6")
+P=("http://192.168.9.50:8096",open("/etc/media-core/jellyfin-prod.key").read().strip())
+C=("http://192.168.9.219:8096",open("/etc/media-core/jellyfin-npvr.key").read().strip())
 def grab(s):
     items=json.loads(api(s[0],s[1],"/LiveTv/Channels?limit=2000"))["Items"]
     out={}

@@ -55,7 +55,7 @@ NPVR_PIN = "0000"
 # caches the emptiness. Observed 2026-08-03: 19 channels lost their guide
 # entirely that way, while NextPVR held 64-160 events for each of them.
 JF = "http://192.168.9.219:8096"
-JF_KEY = "1f74eabb57a5a6165e67c08aed0108b6"
+JF_KEY = open("/etc/media-core/jellyfin-npvr.key").read().strip()
 JF_GUIDE_TASK = "bea9b218c97bbf98c5dc1303bdb9a0ca"
 
 

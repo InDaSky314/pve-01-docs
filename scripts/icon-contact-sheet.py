@@ -3,7 +3,7 @@ import json, urllib.request, io, sys, sqlite3, subprocess
 from PIL import Image, ImageDraw
 
 JF = "http://192.168.9.219:8096"
-KEY = "1f74eabb57a5a6165e67c08aed0108b6"
+KEY = open("/etc/media-core/jellyfin-npvr.key").read().strip()
 auth = {"Authorization": "MediaBrowser Token=" + KEY}
 LO, HI, OUT = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 

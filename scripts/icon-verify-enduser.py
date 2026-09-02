@@ -7,7 +7,7 @@ serves for that channel. Nothing here reads a database row.
 import json, hashlib, sqlite3, urllib.request, collections, sys
 
 JF = "http://192.168.9.219:8096"
-KEY = "1f74eabb57a5a6165e67c08aed0108b6"
+KEY = open("/etc/media-core/jellyfin-npvr.key").read().strip()
 NPVR = "http://localhost:8866"
 
 

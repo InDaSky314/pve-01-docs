@@ -1,6 +1,6 @@
 import json, urllib.request, io, sys
 from PIL import Image, ImageDraw
-JF="http://192.168.9.50:8096"; KEY="3f579d403112dfbe5c2dd69832c5cbfe"
+JF="http://192.168.9.50:8096"; KEY=open("/etc/media-core/jellyfin-prod.key").read().strip()
 auth={"Authorization":"MediaBrowser Token="+KEY}
 def get(u):
     return urllib.request.urlopen(urllib.request.Request(u,headers=auth),timeout=45).read()
