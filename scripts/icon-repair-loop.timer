@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Channel Artwork Repair Loop Daily during Overnight Maintenance Window (03:15 Berlin)
+Documentation=file:///root/pve-01-docs/docs/channel-icons-runbook.md
+
+[Timer]
+# 03:15 Europe/Berlin (inside 01:00-05:00 maintenance window)
+OnCalendar=*-*-* 03:15:00 Europe/Berlin
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -4,3 +4,4 @@ __pycache__/
 *.pre-cutover-*
 *.pre-repair-*
 *.pre-bluf-*
+*.pre-oldb-*
