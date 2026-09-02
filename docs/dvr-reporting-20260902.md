@@ -184,3 +184,78 @@ one legitimately reports 0 when an earlier one already covered those channels; t
 several of them "structurally always near-zero". Only genuinely unreachable sources count.
 That misreading produced two false findings in the 2026-08-31 audit.
 
+
+## 9. CT 108 scraper moved from WireGuard to OpenVPN (2026-09-02)
+
+Owner request, for scraper reliability — his recollection was that the scrapers behaved
+better on OpenVPN before the 2026-08-27/28 router cutover. The measured exit IP supports
+that: the new tunnel lands in `151.240.254.x`, the same range `lessons-learned.md` records
+as "the Ashburn exit" (`151.240.254.18`) from before the cutover.
+
+**Deliberately held location constant** and changed only the protocol, so the experiment has
+one variable: `us-ash` (Ashburn) on both sides.
+
+| | before | after |
+|---|---|---|
+| tunnel | 3742 `US-Ashburn (WG)`, wgclient3 | **4941 `US-Ashburn (OVPN) scraper`**, ovpnclient2 |
+| exit IP | `45.144.115.131` (Clouvider AS62240) | `151.240.254.11` (Cyberzone AS209854) |
+| CT 107 | shares 3742 | **unchanged, still on 3742** |
+
+### Method
+
+`gl-session call` over SSH, never raw `uci` — the runbook is explicit that raw edits to
+`route_policy`/`openvpn` silently revert. **This was the first WRITE proven through that
+path**; the runbook's own "Not yet verified" section listed `add_tunnel`/`set_tunnel` as
+untested over SSH. They work, and behave as documented.
+
+The undocumented piece — resolving a server to its `group_id`/`id_list` — is
+`ovpn-client.get_config_list` with `{"group_id": 1792}`. It returns 282 Surfshark profiles
+with `client_id` and `name`. East-coast UDP options: Boston 228, New York 230 (in use by
+GIOT), Buffalo 232, **Ashburn 234**, Charlotte 240, Atlanta 246.
+
+```bash
+# 1. create (lands DISABLED and inert -- safe first write)
+ubus call gl-session call '{"module":"vpn-client","func":"add_tunnel","params":{
+  "via":{"type":"openvpn","configs":[{"group_id":1792,"id_list":[234]}]},
+  "from":{"type":"mac","mac_list":["BC:24:11:28:55:77"]},
+  "to":{"type":"default"},"name":"Tunnel 1"}}'      # -> {"tunnel_id": 4941}
+# 2. drop CT 108 from the WG tunnel, KEEPING CT 107
+ubus call gl-session call '{"module":"vpn-client","func":"set_tunnel","params":{
+  "tunnel_id":3742,"from":{"type":"mac","mac_list":["BC:24:11:EF:79:09"]}}}'
+# 3. name + enable
+ubus call gl-session call '{"module":"vpn-client","func":"set_tunnel","params":{"tunnel_id":4941,"name":"US-Ashburn (OVPN) scraper"}}'
+ubus call gl-session call '{"module":"vpn-client","func":"set_tunnel","params":{"tunnel_id":4941,"enabled":true}}'
+```
+
+New tunnels land **disabled**, which makes step 1 a safe way to prove the write path before
+committing to anything.
+
+### Verified after
+
+* `Initialization Sequence Completed`; `resolv.conf.ovpnclient2` and `dhcp.ovpnclient2`
+  written, and `network-buildout-persist` hotplug fired — the three things that were each
+  broken during the August cutover.
+* DNS resolves inside CT 108 (the zero-byte `resolv.conf` failure mode did not recur).
+* **All 12 scrapers re-run on the new tunnel: 12 parse OK, 0 bad**, programme counts and file
+  sizes within normal variation of the pre-change baseline
+  (`/root/agy-reports/ct108-ovpn-baseline-20260902/`).
+* CT 105 (`156.146.62.42`), CT 107 (`45.144.115.131`) and CT 112 unchanged; media stack
+  healthy; the Saturday Bayern timer intact.
+
+### ESPN is still 403 from CT 108 — as expected
+
+The protocol change did not fix ESPN, which confirms the diagnosis in §7: it is
+**datacenter-range blocking**, not protocol. Both exits are hosting ASNs. This does not
+matter — ESPN is not used for Bundesliga any more, and UCL runs from the host's residential
+line where it works.
+
+### Back-out
+
+```bash
+ubus call gl-session call '{"module":"vpn-client","func":"set_tunnel","params":{
+  "tunnel_id":3742,"from":{"type":"mac","mac_list":["BC:24:11:28:55:77","BC:24:11:EF:79:09"]}}}'
+ubus call gl-session call '{"module":"vpn-client","func":"remove_tunnel","params":{"tunnel_id":4941}}'
+```
+Pre-change exports (tunnels, `route_policy`, VPN configs) are in
+`/root/agy-reports/ct108-ovpn-baseline-20260902/`. **Those exports contain provider
+credentials — they stay on the host and must never be committed.**
