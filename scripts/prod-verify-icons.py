@@ -7,7 +7,7 @@ icon host holds for that channel name?
 import collections, hashlib, json, re, urllib.parse, urllib.request
 
 JF = "http://192.168.9.50:8096"
-KEY = "3f579d403112dfbe5c2dd69832c5cbfe"
+KEY = open("/etc/media-core/jellyfin-prod.key").read().strip()
 HOST = "http://192.168.9.11:8100"
 auth = {"Authorization": "MediaBrowser Token=" + KEY}
 STRIP = re.compile(r"[:/|]")
