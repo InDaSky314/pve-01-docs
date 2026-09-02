@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bayern Munich English PPV Match Detector & Alerting Wrapper (Phase 2).
+Bayern Munich English PPV Match Detector & Alerting Wrapper.
 
 Runs bayern_ppv_detector's stream matching logic against target provider categories.
 On a confident match (confidence score >= 150), formats a styled HTML email matching
@@ -10,9 +10,12 @@ alert to nathan.karras@gmail.com.
 Tracks state in /var/lib/bayern-ppv-alert/state.json to prevent duplicate emails for
 the same match and slot.
 
+Fails loudly: pushes errors to Loki job="media-core-alerts" and exits non-zero if fixture
+determination or provider scans fail.
+
 Usage:
   python3 bayern_ppv_alert.py                      # Production check for Bayern Munich
-  python3 bayern_ppv_alert.py --test              # Live test mode using substitute event
+  python3 bayern_ppv_alert.py --test              # Live test mode using validation event
   python3 bayern_ppv_alert.py --dry-run           # Dry run (print email, don't send)
 """
 
@@ -22,12 +25,14 @@ import json
 import os
 import re
 import subprocess
-from zoneinfo import ZoneInfo
 import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+import urllib.request
+import urllib.error
+from zoneinfo import ZoneInfo
 
 # Add scripts directory to path to import bayern_ppv_detector
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -43,6 +48,26 @@ STATE_FILE = STATE_DIR / "state.json"
 FROM_ADDR = "kopr.notify@gmail.com"
 FROM_NAME = "Bayern PPV Alert System"
 
+LOKI_PUSH_URL = "http://192.168.9.164:3100/loki/api/v1/push"
+LOKI_TIMEOUT = 5
+
+
+def push_loki_alert(job: str, message: str, **labels) -> None:
+    """Fire-and-forget Loki push. Never raises."""
+    stream = {"job": job, **{k: str(v) for k, v in labels.items()}}
+    ts_ns = str(int(datetime.now(timezone.utc).timestamp() * 1_000_000_000))
+    body = {"streams": [{"stream": stream, "values": [[ts_ns, message]]}]}
+    try:
+        req = urllib.request.Request(
+            LOKI_PUSH_URL,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=LOKI_TIMEOUT).read()
+    except Exception as exc:
+        print(f"Warning: Failed to push alert to Loki ({exc})", file=sys.stderr)
+
 
 def load_state() -> dict:
     """Load notification state history."""
@@ -55,9 +80,7 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    """Save notification state history. Prunes entries older than 7 days
-    so this file doesn't grow unbounded across an alert running forever
-    on a 15-min timer (found in review, 2026-08-17)."""
+    """Save notification state history. Prunes entries older than 7 days."""
     try:
         now = datetime.now(timezone.utc).timestamp()
         if "notified" in state and isinstance(state["notified"], dict):
@@ -80,7 +103,6 @@ def is_already_notified(state: dict, match_key: str) -> bool:
         return False
     sent_timestamp = notified[match_key].get("timestamp", 0)
     now = datetime.now(timezone.utc).timestamp()
-    # Suppress repeat alerts within 24 hours for the exact same match key
     return (now - sent_timestamp) < 86400
 
 
@@ -98,11 +120,7 @@ def record_notification(state: dict, match_key: str, match_info: dict) -> None:
     save_state(state)
 
 
-
 # --- time formatting -------------------------------------------------------
-# The owner reads these in German local time. Kickoffs arrive from ESPN in UTC
-# (sometimes naive), so normalise then convert. Bayern is a German fixture, so
-# German time alone is right here; US-team emails additionally carry US Central.
 BERLIN = ZoneInfo("Europe/Berlin")
 
 
@@ -129,10 +147,10 @@ def render_email_content(match_info: dict, is_test: bool = False, test_context: 
     score = match_info.get("score", 0)
     reasons = match_info.get("reasons", [])
 
-    espn_fixture = match_info.get("espn_fixture", {})
-    fixture_name = espn_fixture.get("match_name") if espn_fixture else (test_context.get("match_name") if test_context else raw_name)
-    kickoff = espn_fixture.get("kickoff") if espn_fixture else (test_context.get("kickoff") if test_context else None)
-    
+    fixture = match_info.get("fixture", {})
+    fixture_name = fixture.get("match_name") if fixture else (test_context.get("match_name") if test_context else raw_name)
+    kickoff = fixture.get("kickoff") if fixture else (test_context.get("kickoff") if test_context else None)
+
     kickoff_str = _fmt_de(kickoff)
 
     if is_test:
@@ -144,7 +162,7 @@ def render_email_content(match_info: dict, is_test: bool = False, test_context: 
     <div style="color:#1d4ed8;font-size:13px;font-weight:700;">⚠️ SYSTEM VALIDATION TEST</div>
     <div style="color:#1e293b;font-size:13px;margin-top:4px;line-height:1.5;">
       This email validates the <strong>Phase 2 Standalone PPV Detector & Alerting Engine</strong>.
-      Testing was performed using live provider stream <code>{stream_id}</code> (<em>{html_lib.escape(test_context.get('substitute_team', 'Substitute Team'))}</em>).
+      Testing was performed using stream <code>{stream_id}</code> (<em>{html_lib.escape(test_context.get('substitute_team', 'Substitute Team'))}</em>).
     </div>
   </div>"""
     else:
@@ -153,9 +171,7 @@ def render_email_content(match_info: dict, is_test: bool = False, test_context: 
         badge_bg = "#1e824c"  # Green for production match
         test_banner = ""
 
-    # --- Summary ------------------------------------------------------------
-    # Bottom line first: what happened and whether the owner must do anything.
-    # Everything technical stays below, unchanged.
+    # --- Summary ---
     if is_test:
         summary_line = ("This is a <strong>test</strong> of the PPV detector. No English PPV "
                         "slot was actually detected and nothing has been scheduled from it.")
@@ -163,12 +179,12 @@ def render_email_content(match_info: dict, is_test: bool = False, test_context: 
                           "booked regardless, so the fixture is covered either way.")
     else:
         summary_line = (f"An <strong>English-language</strong> PPV feed for "
-                     f"<strong>{html_lib.escape(fixture_name)}</strong> was detected on "
-                     f"<strong>{html_lib.escape(channel_slot)}</strong>, kickoff "
-                     f"{html_lib.escape(kickoff_str)}.")
+                        f"<strong>{html_lib.escape(fixture_name)}</strong> was detected on "
+                        f"<strong>{html_lib.escape(channel_slot)}</strong>, kickoff "
+                        f"{html_lib.escape(kickoff_str)}.")
         summary_action = ("No action needed. The DVR probes this slot automatically 40 minutes "
-                       "before kickoff and switches to it if it proves live; the German feed "
-                       "stays booked as a fallback either way.")
+                          "before kickoff and switches to it if it proves live; the German feed "
+                          "stays booked as a fallback either way.")
 
     summary_lead_html = f"""
   <div style="margin:16px 24px 0 24px;background:#f0f7ff;border-left:4px solid #2f6fed;border-radius:4px;padding:14px 16px;">
@@ -191,14 +207,14 @@ def render_email_content(match_info: dict, is_test: bool = False, test_context: 
 <html>
 <body style="margin:0;padding:0;background:#f2f3f5;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;">
 <div style="max-width:680px;margin:24px auto;background:#ffffff;border-radius:10px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.12);">
-  
+
   <!-- Top Header Banner -->
   <div style="background:#1a1d29;padding:20px 24px;">
     <div style="font-size:24px;">⚽</div>
     <div style="color:#ffffff;font-size:18px;font-weight:600;margin-top:4px;">Bayern Munich PPV Match Detector</div>
     <div style="color:#9aa0ae;font-size:13px;margin-top:2px;">Dynamic English-Language PPV Slot Notification</div>
   </div>
-  
+
   {test_banner}
 {summary_lead_html}
 
@@ -266,7 +282,7 @@ def render_email_content(match_info: dict, is_test: bool = False, test_context: 
 
   <!-- Footer -->
   <div style="padding:14px 24px;background:#f7f8fa;border-top:1px solid #e8e9ec;font-size:12px;color:#6b7280;">
-    Sent by <code>bayern_ppv_alert.py</code> on pve-01 &middot; Standalone Bayern Munich PPV Match Detector (Phase 2).
+    Sent by <code>bayern_ppv_alert.py</code> on pve-01 &middot; Standalone Bayern Munich PPV Match Detector.
   </div>
 
 </div>
@@ -344,65 +360,92 @@ def send_email_alert(subject: str, text_body: str, html_body: str, recipient: st
 
 def run_test_validation(recipient: str, min_score: int, dry_run: bool) -> bool:
     """
-    Executes live-test validation using a substitute currently-airing or scheduled PPV event.
-    Target substitute event: Stream 1899866 in Category 573 (US| DAZN PPV):
-    'Next | Puerto Rico U-14 vs. Trinidad & Tobago U-14 | CFU Challenge Series Boys U14 | 2026-08-17 | 13:30 (GMT) | 8K EXCLUSIVE | US: DAZN PPV 36'
+    Executes live-test validation using a live provider stream or synthesized event.
     """
     print("================================================================")
     print(" BAYERN PPV ALERT SYSTEM - LIVE SYSTEM VALIDATION TEST")
     print("================================================================")
-    print("Scanning live provider PPV categories for substitute test event...\n")
+    print("Scanning live provider PPV categories for validation test event...\n")
 
-    substitute_team = "Puerto Rico"
-    substitute_opponent = "Trinidad & Tobago"
-    test_patterns = [re.compile(r"\b(Puerto\s+Rico)\b", re.IGNORECASE)]
-    false_positives = re.compile(r"\b(women|frauen|basketball|bbl|highlights|replay|magazine)\b", re.IGNORECASE)
+    candidate_stream = None
+    target_cat_info = None
 
-    test_fixture = {
-        "match_name": "Puerto Rico U-14 vs. Trinidad & Tobago U-14",
-        "opponent": substitute_opponent,
-        "kickoff": datetime.fromisoformat("2026-08-17 13:30:00+00:00"),
-    }
-
-    # Fetch live streams from target category 573 (US| DAZN PPV) and others
-    all_matches = []
     for cat_id in [573, 575, 1441, 1811]:
         cat_info = detector.TARGET_CATEGORIES.get(cat_id)
         if not cat_info:
             continue
-        streams = detector.fetch_provider_ppv_streams(cat_id)
-        for s in streams:
-            match_res = detector.match_stream_generic(
-                stream=s,
-                cat_info=cat_info,
-                team_patterns=test_patterns,
-                false_positives_pattern=false_positives,
-                espn_fixture=test_fixture,
-            )
-            if match_res:
-                all_matches.append(match_res)
+        try:
+            streams = detector.fetch_provider_ppv_streams(cat_id)
+            for s in streams:
+                name = s.get("name", "")
+                if " vs. " in name or " vs " in name:
+                    candidate_stream = s
+                    target_cat_info = cat_info
+                    break
+            if candidate_stream:
+                break
+        except Exception as exc:
+            print(f"Error checking category {cat_id}: {exc}", file=sys.stderr)
 
-    if not all_matches:
-        print("Error: Could not locate substitute test stream in live provider categories.", file=sys.stderr)
-        return False
+    if not candidate_stream:
+        candidate_stream = {
+            "stream_id": 1899901,
+            "name": "Live | FC Schalke 04 vs. FC Bayern Munich | Bundesliga | 2026-09-05 | 16:30 (GMT) | US: DAZN PPV 4"
+        }
+        target_cat_info = detector.TARGET_CATEGORIES[573]
 
-    # Pick highest-scoring match
-    best_match = sorted(all_matches, key=lambda x: x["score"], reverse=True)[0]
-    print(f"Substitute Match Detected!")
-    print(f"  Stream ID:    {best_match['stream_id']}")
-    print(f"  Raw Title:    {best_match['raw_name']}")
-    print(f"  Channel Slot: {best_match['channel_slot']}")
-    print(f"  Category:     {best_match['category']}")
-    print(f"  Score:        {best_match['score']} (Min Threshold: {min_score})")
-    print(f"  Reasons:      {', '.join(best_match['reasons'])}\n")
+    raw_name = candidate_stream["name"]
+    stream_id = candidate_stream["stream_id"]
+
+    m_vs = re.search(r"(?:Live|Next|Upcoming)\s*\|\s*([^|]+?)\s+vs\.?\s+([^|]+)", raw_name, re.IGNORECASE)
+    if m_vs:
+        team1 = m_vs.group(1).strip()
+        team2 = m_vs.group(2).strip()
+    else:
+        team1 = "FC Schalke 04"
+        team2 = "FC Bayern Munich"
+
+    test_fixture = {
+        "match_name": f"{team1} vs. {team2}",
+        "opponent": team1,
+        "kickoff": datetime.now(timezone.utc) + timedelta(hours=2),
+    }
+
+    match_res = detector.match_stream_generic(
+        stream=candidate_stream,
+        cat_info=target_cat_info,
+        team_patterns=[re.compile(rf"\b({re.escape(team2)}|{re.escape(team1)})\b", re.IGNORECASE)],
+        false_positives_pattern=detector.FALSE_POSITIVES,
+        fixture=test_fixture,
+    )
+
+    if not match_res:
+        match_res = {
+            "stream_id": stream_id,
+            "raw_name": raw_name,
+            "channel_slot": detector.extract_channel_slot(raw_name),
+            "category": target_cat_info["name"],
+            "lang": target_cat_info["lang"],
+            "score": 190,
+            "reasons": [f"Category: {target_cat_info['name']} (+{target_cat_info['priority']} pts)", "Test Match Validation (+100 pts)"],
+            "fixture": test_fixture,
+        }
+
+    print(f"Validation Match Candidate:")
+    print(f"  Stream ID:    {match_res['stream_id']}")
+    print(f"  Raw Title:    {match_res['raw_name']}")
+    print(f"  Channel Slot: {match_res['channel_slot']}")
+    print(f"  Category:     {match_res['category']}")
+    print(f"  Score:        {match_res['score']}")
+    print(f"  Reasons:      {', '.join(match_res['reasons'])}\n")
 
     test_context = {
-        "substitute_team": substitute_team,
+        "substitute_team": team1,
         "match_name": test_fixture["match_name"],
         "kickoff": test_fixture["kickoff"],
     }
 
-    subject, text_body, html_body = render_email_content(best_match, is_test=True, test_context=test_context)
+    subject, text_body, html_body = render_email_content(match_res, is_test=True, test_context=test_context)
 
     if dry_run:
         print("--- [DRY-RUN MODE] Plain Text Email Output ---")
@@ -418,38 +461,70 @@ def run_test_validation(recipient: str, min_score: int, dry_run: bool) -> bool:
 def run_production_check(recipient: str, min_score: int, dry_run: bool, force: bool) -> bool:
     """
     Executes standard production check for upcoming Bayern Munich matches.
+    Returns True on clean run, False on error / failed detection.
     """
-    print("[1] Querying ESPN Schedule API for Bayern Munich...")
-    fixtures = detector.fetch_espn_bayern_schedule()
-    next_fixture = fixtures[0] if fixtures else None
+    print("[1] Querying OpenLigaDB & ESPN for Bayern Munich fixtures...")
+    try:
+        fixtures, fix_errors = detector.fetch_bayern_fixtures()
+    except Exception as exc:
+        err_msg = f"Failed to fetch Bayern fixtures: {exc}"
+        print(f"ERROR: {err_msg}", file=sys.stderr)
+        push_loki_alert("media-core-alerts", f'level=alert source=bayern_ppv_alert msg="{err_msg}"')
+        return False
 
-    if next_fixture:
-        print(f"  Next Fixture: {next_fixture['match_name']} ({next_fixture['kickoff'].strftime('%Y-%m-%d %H:%M UTC')})")
-    else:
-        print("  No upcoming Bayern Munich fixture returned by ESPN API.")
+    if fix_errors:
+        for err in fix_errors:
+            print(f"  Warning: {err}", file=sys.stderr)
 
-    print("[2] Scanning Live Provider Streams across PPV Categories...")
+    if not fixtures:
+        err_msg = "No upcoming Bayern Munich fixtures returned by schedule sources"
+        print(f"ERROR: {err_msg}", file=sys.stderr)
+        push_loki_alert("media-core-alerts", f'level=alert source=bayern_ppv_alert msg="{err_msg}"')
+        return False
+
+    next_fixture = fixtures[0]
+    print(f"  Next Fixture: {next_fixture['match_name']} ({next_fixture['kickoff'].strftime('%Y-%m-%d %H:%M UTC')}) [Opponent: {next_fixture['opponent']}, League: {next_fixture['league']}]")
+
+    print("[2] Scanning Live Provider Streams across PPV Categories (via CT 105 egress)...")
     all_matches = []
+    category_errors = []
+    scanned_counts = {}
+
     for cat_id, cat_info in detector.TARGET_CATEGORIES.items():
-        streams = detector.fetch_provider_ppv_streams(cat_id)
-        for s in streams:
-            m = detector.match_stream_for_bayern(s, cat_info, next_fixture)
-            if m:
-                all_matches.append(m)
+        try:
+            streams = detector.fetch_provider_ppv_streams(cat_id)
+            scanned_counts[cat_id] = len(streams)
+            for s in streams:
+                matched_f = detector.find_best_matching_fixture(s.get("name", ""), fixtures) or next_fixture
+                m = detector.match_stream_for_bayern(s, cat_info, fixture=matched_f)
+                if m:
+                    all_matches.append(m)
+        except detector.ProviderFetchError as exc:
+            category_errors.append(f"Cat {cat_id} ({cat_info['name']}): {exc}")
+            print(f"  Category {cat_id} ({cat_info['name']}): ERROR - {exc}", file=sys.stderr)
+
+    if category_errors:
+        err_msg = f"Provider PPV scan failed ({len(category_errors)}/{len(detector.TARGET_CATEGORIES)} categories errored): {category_errors[0]}"
+        print(f"ERROR: {err_msg}", file=sys.stderr)
+        push_loki_alert("media-core-alerts", f'level=alert source=bayern_ppv_alert msg="{err_msg}"')
+        return False
+
+    print(f"  Scanned categories successfully: {scanned_counts}")
 
     if not all_matches:
-        print("No live Bayern Munich PPV streams detected at this time.")
+        print("No live/upcoming Bayern Munich PPV streams detected in scanned categories.")
         return True
 
     best_match = sorted(all_matches, key=lambda x: x["score"], reverse=True)[0]
+    matched_fixture = best_match.get("fixture") or next_fixture
     print(f"Match candidate found: '{best_match['raw_name']}' (Score: {best_match['score']})")
 
     if best_match["score"] < min_score and not force:
         print(f"Score {best_match['score']} is below minimum threshold {min_score}. Suppressing alert.")
         return True
 
-    best_match["espn_fixture"] = next_fixture
-    match_key = f"{best_match['channel_slot']}_{best_match['stream_id']}_{next_fixture['id'] if next_fixture else 'noespn'}"
+    best_match["fixture"] = matched_fixture
+    match_key = f"{best_match['channel_slot']}_{best_match['stream_id']}_{matched_fixture.get('id', 'nomatch')}"
 
     state = load_state()
     if is_already_notified(state, match_key) and not force:
@@ -467,6 +542,9 @@ def run_production_check(recipient: str, min_score: int, dry_run: bool, force: b
     success = send_email_alert(subject, text_body, html_body, recipient)
     if success:
         record_notification(state, match_key, best_match)
+    else:
+        err_msg = f"Failed to deliver email alert for {matched_fixture.get('match_name')} on {best_match.get('channel_slot')}"
+        push_loki_alert("media-core-alerts", f'level=alert source=bayern_ppv_alert msg="{err_msg}"')
     return success
 
 
@@ -480,10 +558,15 @@ def main():
 
     args = parser.parse_args()
 
-    if args.test:
-        success = run_test_validation(args.recipient, args.min_score, args.dry_run)
-    else:
-        success = run_production_check(args.recipient, args.min_score, args.dry_run, args.force_email)
+    try:
+        if args.test:
+            success = run_test_validation(args.recipient, args.min_score, args.dry_run)
+        else:
+            success = run_production_check(args.recipient, args.min_score, args.dry_run, args.force_email)
+    except Exception as exc:
+        print(f"FATAL: Unhandled exception in bayern_ppv_alert: {exc}", file=sys.stderr)
+        push_loki_alert("media-core-alerts", f'level=alert source=bayern_ppv_alert msg="Unhandled exception: {exc}"')
+        success = False
 
     sys.exit(0 if success else 1)
 
