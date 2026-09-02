@@ -1,0 +1,15 @@
+[Unit]
+Description=Self-Correcting EPG External-Source Repair Loop (Report-Only)
+Documentation=file:///root/pve-01-docs/docs/lineup-runbook.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+# Shipped in report-only mode per Rule 4. The owner arms acting mode by adding --apply.
+ExecStart=/usr/local/bin/epg-repair-loop
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
