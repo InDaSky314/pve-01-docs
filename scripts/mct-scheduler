@@ -183,6 +183,12 @@ def cancel_booking(booking_id: str) -> bool:
     bookings = load_bookings()
     target = None
     for b in bookings:
+        # Ids are not unique in this store: re-booking a game after a cancel leaves
+        # several records under one id. Matching the first hit cancels an already
+        # -cancelled record and silently leaves the live booking armed. The same bug
+        # was fixed in dvr-dashboard's _cancel_booking on 2026-09-03.
+        if b.get("status") in ("cancelled", "canceled", "done", "failed", "error"):
+            continue
         if str(b.get("id")) == str(booking_id):
             target = b
             break
