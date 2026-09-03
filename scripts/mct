@@ -187,7 +187,8 @@ def parse_duration(dstr: str) -> int:
     raise ValueError(f"Invalid duration format: {dstr}")
 
 
-def check_exclusion(start_dt: datetime, end_dt: datetime) -> tuple[bool, str]:
+def check_exclusion(start_dt: datetime, end_dt: datetime,
+                    self_booking_id: str | None = None) -> tuple[bool, str]:
     recs = jf_api("/LiveTv/Recordings?IsInProgress=true")
     if recs and isinstance(recs, dict) and recs.get("Items"):
         names = [r.get("Name", "unnamed") for r in recs["Items"]]
@@ -213,6 +214,12 @@ def check_exclusion(start_dt: datetime, end_dt: datetime) -> tuple[bool, str]:
             if isinstance(bookings, list):
                 for b in bookings:
                     if b.get("status") in ("cancelled", "canceled", "done", "error"):
+                        continue
+                    # A capture launched by mct-scheduler must not treat its OWN
+                    # booking as a conflict. Booking-awareness was added to this
+                    # function after the scheduler's end-to-end test had already
+                    # passed, so every scheduled capture would refuse at launch.
+                    if self_booking_id and str(b.get("id")) == str(self_booking_id):
                         continue
                     try:
                         b_s = datetime.fromisoformat(b["start"]).astimezone(timezone.utc)
@@ -416,6 +423,7 @@ def calculate_hard_cap(
     max_extension_sec: int,
     fixed_pad_sec: int,
     fixture: dict[str, Any] | None,
+    self_booking_id: str | None = None,
 ) -> tuple[int, datetime, str, bool, str]:
     """Calculate the hard cap duration and end time, clamped to following timers."""
     start_utc = start_dt.astimezone(timezone.utc)
@@ -456,6 +464,12 @@ def calculate_hard_cap(
             if isinstance(bookings_data, list):
                 for b in bookings_data:
                     if b.get("status") in ("cancelled", "canceled", "done", "error"):
+                        continue
+                    # Our own booking starts exactly at start_utc, so the b_s >=
+                    # start_utc test below matches it and clamps the extension to
+                    # zero -- silently discarding auto-extend for every scheduled
+                    # capture (extra innings would have been cut off).
+                    if self_booking_id and str(b.get("id")) == str(self_booking_id):
                         continue
                     try:
                         b_s = datetime.fromisoformat(b["start"]).astimezone(timezone.utc)
@@ -514,6 +528,7 @@ def main() -> int:
     parser.add_argument("--max-extension", default="90m", help="Maximum auto-extension duration (default: 90m)")
     parser.add_argument("--fixed-pad", default="5m", help="Fixed pad duration when no ESPN fixture exists (default: 5m)")
     parser.add_argument("--poll-interval", type=int, default=120, help="Supervisor ESPN polling interval in seconds (default: 120)")
+    parser.add_argument("--booking-id", help="mct-bookings.json id of the booking this run fulfils, so it is not treated as a conflict")
     parser.add_argument("--dry-run", action="store_true", help="Show planned action without capturing or touching tuner")
     args = parser.parse_args()
 
@@ -585,7 +600,8 @@ def main() -> int:
             f"Book it through the DVR dashboard instead of holding a process open that long.")
         return 2
 
-    ok, err = check_exclusion(start_dt.astimezone(timezone.utc), nominal_end_dt.astimezone(timezone.utc))
+    ok, err = check_exclusion(start_dt.astimezone(timezone.utc), nominal_end_dt.astimezone(timezone.utc),
+                                  getattr(args, 'booking_id', None))
     if not ok:
         log(f"REFUSING CAPTURE: {err}")
         push_loki_alert(f"level=alert source=mct msg='Refusing capture: {err}'")
@@ -595,7 +611,8 @@ def main() -> int:
     espn_games = load_espn_schedule()
     fixture = find_espn_fixture(title, ch["name"], start_dt, espn_games)
     hard_cap_sec, hard_cap_end_dt, ext_reason, is_clamped, clamp_info = calculate_hard_cap(
-        start_dt, duration_sec, max_ext_sec, fixed_pad_sec, fixture
+        start_dt, duration_sec, max_ext_sec, fixed_pad_sec, fixture,
+        getattr(args, 'booking_id', None),
     )
 
     nfo_content = build_nfo_xml(safe_title, start_dt, meta["plot"], meta["genres"], meta["lockdata"])
@@ -652,7 +669,8 @@ def main() -> int:
     if lead > 1:
         log(f"Waiting {lead:.0f}s until {start_dt.isoformat()} before opening the tuner")
         time.sleep(lead)
-        ok, err = check_exclusion(start_dt.astimezone(timezone.utc), nominal_end_dt.astimezone(timezone.utc))
+        ok, err = check_exclusion(start_dt.astimezone(timezone.utc), nominal_end_dt.astimezone(timezone.utc),
+                                  getattr(args, 'booking_id', None))
         if not ok:
             log(f"REFUSING CAPTURE: {err} (appeared while waiting for start time)")
             push_loki_alert(f"level=alert source=mct msg='Refusing capture after wait: {err}'")
