@@ -1,0 +1,12 @@
+[Unit]
+Description=Start the OpenLigaDB latency probe for Schalke v Bayern (2026-09-05)
+
+[Timer]
+# Kickoff 18:30 CEST, expected final whistle ~20:25. Start after kickoff so goal
+# updates are sampled too; the probe exits as soon as matchIsFinished flips.
+OnCalendar=2026-09-05 19:00:00
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
