@@ -1892,6 +1892,12 @@ class Handler(BaseHTTPRequestHandler):
         if engine in ("mct", ""):
             bookings = load_mct_bookings()
             for b in bookings:
+                # Ids are not unique in this store - a game re-booked after an earlier
+                # cancel leaves both records under the same id. Matching the first hit
+                # silently "cancelled" an already-cancelled record and left the live
+                # booking running, so skip anything already in a terminal state.
+                if b.get("status") in ("cancelled", "done", "failed"):
+                    continue
                 if str(b.get("id")) == bid or str(b.get("name")) == bid or str(b.get("title")) == bid:
                     if b.get("status") == "running" and b.get("pid"):
                         try:
@@ -1979,6 +1985,30 @@ class Handler(BaseHTTPRequestHandler):
         jf_channels = get_jellyfin_channels()
         chmap = channel_names()
         cid, cname = resolve_channel_id(target_game, jf_channels)
+        # resolve_channel_id can pick a channel carrying no guide data at all: for the
+        # 2026-09-04 Brewers game it chose 1509 "MLB" (zero programmes) over 121
+        # "Milwaukee Brewers HD", which carried the fixture. Let the caller name one.
+        ch_override = str(body.get("channel") or "").strip()
+        if ch_override:
+            # jf_channels is name -> id, so a numeric override needs the LiveTv
+            # channel list, which carries Number alongside Name.
+            _cid = _cname = None
+            if ch_override.isdigit():
+                _r = jf_request("/emby/LiveTv/Channels?Limit=3000") or {}
+                for _c in (_r.get("Items") or []):
+                    if str(_c.get("Number") or "") == ch_override:
+                        _cid, _cname = _c.get("Id"), _c.get("Name")
+                        break
+            else:
+                for _n, _i in jf_channels.items():
+                    if _n.lower() == ch_override.lower():
+                        _cid, _cname = _i, _n
+                        break
+            if not _cid:
+                return self._send(400, json.dumps(
+                    {"error": f"channel '{ch_override}' not found"}).encode(),
+                    "application/json")
+            cid, cname = _cid, _cname
         if not cid:
             return self._send(422, json.dumps({
                 "ok": False,
