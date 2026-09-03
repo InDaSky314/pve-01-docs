@@ -1281,5 +1281,31 @@ When external service APIs (such as IPTV Xtream Codes / player_api) require spec
 
 Crucially, scrapers and detectors must never swallow network exceptions or missing schedule data with `return []` / `exit 0`. Network failures, empty fixture fetches during active seasons, and provider timeouts must fail loudly by exiting non-zero and pushing an alert line to Loki `job="media-core-alerts"`, ensuring systemd and Grafana alert rules catch failures immediately.
 
+## An `mp0` mount means two different files at the same path (2026-09-03)
 
+Rotating a credential stored at `/srv/media-core/.jellyfin_api_key` looked done after the file
+inside CT 105 was updated. It was not. `/srv/media-core` is an **`mp0` mount**
+(`local-lvm:vm-105-disk-1`) that exists inside the container; the Proxmox host has its own
+separate directory at the same path. Host-side tools (`dvr-dashboard`, `dvr-preflight-digest`,
+`dvr-recording-report`, `sports-dvr-auto`) read the **host** copy, which still held the old
+value. Revoking would have broken all four at once.
+
+Related: a fallback of `/var/lib/lxc/105/rootfs/srv/media-core/...` is useless for anything
+under an `mp0` mount — that path does not exist, because the mount is not part of the
+container rootfs. Check `pct config <id>` for `mp` entries before assuming a
+`/var/lib/lxc/<id>/rootfs/...` path reaches container data.
+
+The durable fix is one source of truth plus a symlink, so a future rotation touches one file:
+`/srv/media-core/.jellyfin_api_key -> /etc/media-core/jellyfin-prod.key`.
+
+## A successful auth test does not prove you rotated anything
+
+Every consumer was exercised after the new key was in place and all passed — while still using
+the **old** key, which had not been revoked yet. The test could not tell the two apart, so it
+confirmed nothing about the rotation.
+
+**Assert on which credential is resolved, not on whether the call succeeded.** Print the key
+prefix the code path actually loads and compare it to the expected new value. The same applies
+to any change where the old state remains valid during cutover: pick an assertion that fails
+if the change did not take.
 

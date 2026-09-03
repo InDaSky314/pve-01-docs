@@ -100,3 +100,126 @@ secret scan is the control that closes that gap — see the follow-on security w
   `3389`); establish what is reachable from LAN vs Tailscale and what actually has auth.
   Note `/srv/log-server/docker-compose.yml` still carries `GF_SECURITY_ADMIN_PASSWORD=changeme-initial-setup`
   even though the running Grafana password is not that value.
+
+## Rotation executed — 2026-09-03
+
+Both keys rotated. The exposed values are no longer in use anywhere.
+
+| Server | old (exposed) | new | app name |
+|---|---|---|---|
+| CT 105 production | `3f579d40…` (app `media-core-agent`, created 2026-07-05) | `9940e2da…` | `media-core-automation-20260903` |
+| CT 112 jellyfin-npvr | `1f74eabb…` (app `claude-iconfix`, created 2026-08-02) | `96cb2db4…` | `npvr-automation-20260903` |
+
+Useful finding from `GET /Auth/Keys`: each server had **exactly one** key — the exposed one.
+No third-party app depended on either, which is what made rotation low-risk.
+
+New keys were written straight into the 0600 key files by the minting script and **never
+printed**, so no full key value appears in any transcript or log from this work.
+
+### Consumers converted
+
+Ten in total. Seven on the host/repo were converted on 2026-09-02 (commit `93deb73`). Three
+more were found inside the containers and converted on 2026-09-03 — they are untracked,
+ad-hoc scripts, which is exactly why a host-only sweep missed them:
+
+* `CT105:/root/prod_verify.py`, `CT105:/root/prod_audit.py`
+* `CT112:/root/enduser.py`
+
+Key files, all 0600:
+
+| Path | Server |
+|---|---|
+| `/etc/media-core/jellyfin-prod.key` (host, dir 0700) | CT 105 |
+| `/etc/media-core/jellyfin-npvr.key` (host, dir 0700) | CT 112 |
+| `/srv/media-core/.jellyfin_api_key` | CT 105, pre-existing |
+| `/srv/jellyfin-npvr/.jellyfin_api_key` | CT 112, created 2026-09-02 (did not exist) |
+
+`dvr-dashboard` and the reporting jobs built on 2026-09-02 needed **no** change — they already
+read `.jellyfin_api_key`, and `dvr-dashboard` carries a fallback list that includes
+`/var/lib/lxc/105/rootfs/srv/media-core/.jellyfin_api_key`, letting a host process read CT 105's
+file directly. That pattern is worth copying.
+
+### Verified before revoking
+
+| Consumer | Result |
+|---|---|
+| `dvr-dashboard /api/status` | OK, `problems=[]`, 3 recordings |
+| `dvr-recording-report --dry-run` | exit 0 |
+| `dvr-preflight-digest --dry-run` | `ALL CLEAR` |
+| `epg-sync-ct112` (live timer, daily 12:28) | key resolves, auths as `jellyfin-npvr` |
+| CT 105 in-container scripts | auth OK as `media-core` |
+| CT 112 in-container scripts | auth OK as `jellyfin-npvr` |
+
+### Ordering is the safety property
+
+Mint → verify new key works → swap file contents → exercise every consumer → **revoke last**.
+Until revocation the old key stays valid, so every step before it is revertible by writing the
+old value back (kept at `*.old-20260903` beside each key file, and in
+`/root/keyrotate-bak-20260903/`). Those backups hold live credentials and stay off git.
+
+## The blocker that nearly broke four tools — `mp0` means two files at one path
+
+Before revoking, an exhaustive consumer sweep was run as a safety net. It found a trap that the
+host-side sweep had missed, and that **contradicted an earlier claim in this document**:
+
+> `/srv/media-core/.jellyfin_api_key` **on the host** still held the OLD key.
+
+`/srv/media-core` is an `mp0` mount (`local-lvm:vm-105-disk-1`) that exists **inside CT 105**.
+The Proxmox host has its own, entirely separate directory at the same path. Updating the file
+inside the container therefore did **not** update the host's copy — they are two different
+files that merely look like one.
+
+`dvr-dashboard`, `dvr-preflight-digest`, `dvr-recording-report` and `sports-dvr-auto` all run on
+the host and search `JF_KEY_FILES` with `/srv/media-core/.jellyfin_api_key` **first**. Revoking
+at that point would have broken all four.
+
+Two further corrections to what was written earlier:
+
+* The fallback `/var/lib/lxc/105/rootfs/srv/media-core/.jellyfin_api_key` is **never reached**,
+  because the primary path exists on the host — and it would not work anyway: that path does
+  not exist, precisely because `/srv/media-core` is an `mp0` mount rather than part of the
+  container rootfs.
+* Verification before this fix **passed while proving nothing**. Every consumer authenticated
+  successfully — using the *old* key, which was still valid. A green test cannot distinguish
+  "using the new credential" from "using the old one that has not been revoked yet".
+  **Verify which credential is resolved, not merely that the call succeeds.**
+
+**Fix:** the host path is now a symlink to the single source of truth, so a future rotation
+touches one file:
+
+```
+/srv/media-core/.jellyfin_api_key -> /etc/media-core/jellyfin-prod.key
+```
+
+### A second exposure, found by the same sweep
+
+`docs/handoff-20260803b.md:196` contained the CT 112 key as a literal — a second copy in the
+public repo that the original grep of `scripts/` had not covered. Replaced with
+`<redacted-rotated-20260903>`. A `git grep` for both keys across the whole tracked tree now
+returns nothing.
+
+## Revocation — completed 2026-09-03
+
+```
+CT 105 : keys before ['3f579d40','9940e2da'] -> DELETE 204 -> after ['9940e2da']
+         old key now REJECTED (HTTP 401); new key OK (media-core)
+CT 112 : keys before ['1f74eabb','96cb2db4'] -> DELETE 204 -> after ['96cb2db4']
+         old key now REJECTED (HTTP 401); new key OK (jellyfin-npvr)
+```
+
+Re-verified **after** revocation, when a stale credential could no longer mask a mistake:
+
+| Consumer | Result |
+|---|---|
+| `dvr-dashboard` `/api/status`, `/api/schedule` | OK, `problems=[]`, 348 games |
+| `dvr-recording-report` | exit 0 |
+| `dvr-preflight-digest` | ALL CLEAR |
+| `sports-dvr-auto` | exit 0 |
+| `epg-sync-ct112` | auths as `jellyfin-npvr` |
+| CT 105 sync scripts | auth as `media-core` |
+| Saturday Bayern timer | intact |
+| media stack | jellyfin + threadfin healthy |
+
+The only 401 seen afterwards was a throwaway diagnostic script written earlier in the session
+that had the old key inline — which is itself confirmation that revocation took effect.
+
