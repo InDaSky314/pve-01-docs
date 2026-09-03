@@ -1326,3 +1326,12 @@ Worth generalising: a tool or hostname named in the docs is not evidence of the 
 relationship. When an agent states a vendor, check it against configuration
 (`uci show openvpn`, the profile filenames), not against prose.
 
+## IPTV streams 511 while player_api authenticates = exit IP blocked (2026-09-03)
+
+**Streams 511 while `player_api` authenticates fine = the exit IP is blocked, not the account. Bounce `wgclient1` for a new IP.**
+
+When the IPTV provider blocks a VPN exit IP, all stream `.ts` endpoints return `HTTP 511 Network Authentication Required` (or timeout / 502) while `player_api.php` continues returning `status=Active auth=1 active_cons=0`. The block is per-IP on the streaming edge, not an account suspension or global datacenter ban.
+
+Bounce WireGuard tunnel 2430 (`wgclient1`) on the GL.iNet router (`192.168.9.1`) via `gl-session` to draw a fresh IP from Surfshark's Zurich pool. Note this **will recur** periodically as Surfshark rotates IP addresses.
+
+
