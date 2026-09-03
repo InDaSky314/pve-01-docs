@@ -151,6 +151,38 @@ def output_path_for(host_path):
     return os.path.join(RECORDINGS, COMFREE_ROOT, *parts)
 
 
+def copy_sidecars(src_media, out_path):
+    """Carry poster/NFO across into the commercial-free tree.
+
+    comskip only ever moved the .mkv, so a Commercial Free folder held the video
+    and nothing else. That was invisible while the library pointed at the whole
+    recordings tree and picked metadata up from the raw copy -- but once it points
+    at COMFREE_ROOT, artwork and plot come from here or not at all. The NFO is
+    renamed to the output basename because Jellyfin matches sidecars by filename.
+    """
+    src_dir = os.path.dirname(src_media)
+    out_dir = os.path.dirname(out_path)
+    out_base = os.path.splitext(os.path.basename(out_path))[0]
+    src_base = os.path.splitext(os.path.basename(src_media))[0]
+    try:
+        for fn in os.listdir(src_dir):
+            low = fn.lower()
+            src = os.path.join(src_dir, fn)
+            if not os.path.isfile(src):
+                continue
+            if low.startswith(("poster.", "folder.", "fanart.")):
+                dst = os.path.join(out_dir, fn)
+            elif low.endswith(".nfo") and os.path.splitext(fn)[0] == src_base:
+                dst = os.path.join(out_dir, out_base + ".nfo")
+            else:
+                continue
+            if not os.path.exists(dst):
+                shutil.copy2(src, dst)
+                log(f"sidecar: {os.path.basename(dst)}")
+    except Exception as e:
+        log(f"WARN (sidecar copy failed, video is fine): {e}")
+
+
 def process_one(container_path):
     if not container_path.startswith(CONTAINER_PREFIX + "/"):
         log(f"SKIP (not a recordings path): {container_path}")
@@ -286,9 +318,18 @@ def process_one(container_path):
     clamped_cuts = [(max(0.0, min(s, orig_dur)), max(0.0, min(e, orig_dur))) for s, e in cuts if e > s]
     total_cut = sum(e - s for s, e in clamped_cuts)
     if total_cut < MIN_COMMERCIAL_TOTAL:
-        log(f"NO COMMERCIALS detected ({total_cut:.0f}s) — no cut version made: {rel}")
-        return True
-    keeps = keep_segments(cuts, orig_dur)
+        # Previously this returned with no output at all. Once the Jellyfin
+        # Recordings library points at COMFREE_ROOT, "no output" means the
+        # recording is invisible -- a clean game with no detected ad breaks
+        # would silently never appear. Pass it through uncut instead, reusing
+        # the same cut/concat/remux path so the MKV timeline fix still applies.
+        log(f"NO COMMERCIALS detected ({total_cut:.0f}s) — passing through uncut "
+            f"so it still lands in {COMFREE_ROOT}: {rel}")
+        clamped_cuts = []
+        total_cut = 0.0
+        keeps = [(0.0, orig_dur)]
+    else:
+        keeps = keep_segments(cuts, orig_dur)
     log(f"EDL: {len(cuts)} commercial breaks, {total_cut/60:.1f} min to remove, "
         f"{len(keeps)} keep-segments")
 
@@ -339,6 +380,7 @@ def process_one(container_path):
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     shutil.move(tmp_out, out_path)
+    copy_sidecars(host_path, out_path)
     # keep the EDL next to the log for future tuning
     shutil.copy(edl, os.path.join(LOG_DIR, os.path.basename(edl)))
     shutil.rmtree(job_work, ignore_errors=True)
