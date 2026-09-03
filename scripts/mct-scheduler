@@ -144,6 +144,7 @@ def trigger_upcoming(bookings: list[dict], now: datetime, changed: list[bool], d
                 "--duration", str(duration_sec),
                 "--title", str(b.get("title") or b.get("name") or "Capture"),
                 "--start-time", start_dt.isoformat(),
+                "--booking-id", str(b.get("id", "")),
             ]
             if b.get("category"):
                 cmd.extend(["--category", str(b["category"])])
