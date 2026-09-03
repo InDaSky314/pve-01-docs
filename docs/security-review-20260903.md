@@ -77,3 +77,40 @@ of success is the `router_dashboard` scrape target returning to `up`.
 Also open: a pre-commit `gitleaks` hook plus a scheduled scan, so a public repo cannot silently
 accumulate credentials again. The control must fail loudly; a scanner that exits 0 on error is
 worthless.
+
+## Upgrades applied — 2026-09-03 maintenance window
+
+Owner opened a window to 17:00 with nothing watching. Executed least-valuable-first so a
+failure would be cheap: CT 112 (staging) -> CT 105 (production) -> CT 107.
+
+| Component | From | To | Verified |
+|---|---|---|---|
+| Jellyfin CT 112 | `10.11.9` | `10.11.11` | version, timers, item counts, 957 channels, 25,128 programmes |
+| Jellyfin CT 105 | `10.11.9` | `10.11.11` | version, **Saturday Bayern timer identical**, 25,731/7,691/216,903 items, 1,225 channels |
+| Grafana CT 107 | `11.6.16` | `12.4.10` | 11 alert rules intact and all in `Normal`; Loki, Prometheus and Infinity datasources all present |
+
+No rollbacks were needed. A fresh config backup (718 MB) was taken first and confirmed written
+before anything was touched.
+
+**The three deliberately-disabled tasks on CT 105 survived the Jellyfin upgrade with empty
+triggers** — Media Segment Scan, Generate Trickplay Images, Extract Chapter Images. That was
+the specific risk of this bump and it was checked explicitly rather than assumed.
+
+### Post-upgrade function test — all green
+
+Containers on CT 105/107/108/112 healthy; 11 host timers and 6 CT 105 timers active; 8/8
+Prometheus targets up; Loki ingest OK; `dvr-dashboard` `problems=[]` with 348 games;
+`router-dashboard` 200 on the rotated credential; `dvr-recording-report`, `dvr-preflight-digest`
+(ALL CLEAR) and `sports-dvr-auto` all exit 0; Threadfin serving 1,225 channels; `epg.xml` fresh;
+and the Saturday Bayern fixture still resolvable in Jellyfin's guide after the upgrade.
+
+### Credential rotation completed
+
+`router-dashboard` and `dvr-dashboard` turned out to **share one credential** — both read
+`/etc/dvr-dashboard.auth`, and Prometheus presents the same password from
+`CT107:/srv/log-server/prometheus/router_dashboard.pw`. Rotated across all four touchpoints:
+new secret in both files, both services restarted, Prometheus restarted. Verified new credential
+`200` on both dashboards, **old credential `401`**, and the `router_dashboard` scrape target back
+to `up` (8/8). Backups at `/root/dvr-dashboard.auth.pre-rotate-20260903` and the matching
+`.pre-rotate-20260903` on CT 107.
+
