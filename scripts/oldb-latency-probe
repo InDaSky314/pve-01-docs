@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Measure how fast OpenLigaDB reports a Bundesliga match as finished.
+
+Bundesliga is not on ESPN, so MCT cannot use the sports-dvr-auto extender to know
+when to stop. OpenLigaDB carries matchIsFinished, but before trusting it to cut a
+recording we need to know WHEN it flips relative to the real final whistle -- on
+completed matchday 1, lastUpdateDateTime clustered 116-125min after kickoff, yet
+one match showed 6906min (a later correction), so that field cannot stand in for
+the flip. This samples a live match and records the transition, costing nothing:
+the match is already being recorded by Jellyfin on a fixed timer.
+"""
+import json, sys, time, urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+MATCH_ID = sys.argv[1] if len(sys.argv) > 1 else "83172"
+OUT = Path(f"/var/lib/dvr-dashboard/oldb-latency-{MATCH_ID}.jsonl")
+INTERVAL = 60
+
+
+def sample():
+    url = f"https://api.openligadb.de/getmatchdata/{MATCH_ID}"
+    with urllib.request.urlopen(url, timeout=20) as r:
+        m = json.load(r)
+    return m[0] if isinstance(m, list) else m
+
+
+def main() -> int:
+    prev = None
+    while True:
+        now = datetime.now(timezone.utc)
+        try:
+            m = sample()
+            goals = m.get("goals") or []
+            state = {
+                "finished": bool(m.get("matchIsFinished")),
+                "lastUpdate": m.get("lastUpdateDateTime"),
+                "nGoals": len(goals),
+                "lastGoalMinute": (goals[-1].get("matchMinute") if goals else None),
+                "result": [r.get("pointsTeam1") for r in (m.get("matchResults") or [])],
+            }
+        except Exception as e:
+            state = {"error": str(e)[:120]}
+
+        if state != prev:
+            rec = {"observedAt": now.isoformat(), **state}
+            with OUT.open("a") as f:
+                f.write(json.dumps(rec) + "\n")
+            print(json.dumps(rec), flush=True)
+            prev = state
+
+        if state.get("finished"):
+            print("matchIsFinished observed true -- stopping probe", flush=True)
+            return 0
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
