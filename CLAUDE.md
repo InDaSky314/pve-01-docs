@@ -12,7 +12,7 @@ pct list; qm list                         # CT 105 running; VMs 102/104 exist
 pct exec 105 -- docker ps                 # jellyfin + threadfin up
 curl -so /dev/null -w '%{http_code}\n' http://192.168.9.50:8096       # 200
 curl -so /dev/null -w '%{http_code}\n' http://192.168.9.50:34400/web/ # 200
-pct exec 105 -- wget -qO- https://am.i.mullvad.net/json               # Switzerland
+pct exec 105 -- wget -qO- https://am.i.mullvad.net/json               # Switzerland (public IP-check service; our VPN provider is Surfshark)
 ```
 
 The media stack lives in `/srv/media-core/` inside CT 105; drive it with

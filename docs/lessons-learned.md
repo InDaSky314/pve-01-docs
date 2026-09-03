@@ -1277,7 +1277,7 @@ configuration in <0.04s without unpacking disk filesystems:
 
 ## Host vs LXC egress for provider APIs & silent-failure traps (2026-09-02)
 
-When external service APIs (such as IPTV Xtream Codes / player_api) require specific egress routing (e.g. CT 105's Swiss Mullvad VPN tunnel and `User-Agent: MediaCoreSync/1.0`), host systemd scripts running on `pve-01` must shell the API calls through `pct exec 105 -- ...` rather than curling directly from the host.
+When external service APIs (such as IPTV Xtream Codes / player_api) require specific egress routing (e.g. CT 105's Swiss Surfshark VPN tunnel and `User-Agent: MediaCoreSync/1.0`), host systemd scripts running on `pve-01` must shell the API calls through `pct exec 105 -- ...` rather than curling directly from the host.
 
 Crucially, scrapers and detectors must never swallow network exceptions or missing schedule data with `return []` / `exit 0`. Network failures, empty fixture fetches during active seasons, and provider timeouts must fail loudly by exiting non-zero and pushing an alert line to Loki `job="media-core-alerts"`, ensuring systemd and Grafana alert rules catch failures immediately.
 
@@ -1308,4 +1308,21 @@ confirmed nothing about the rotation.
 prefix the code path actually loads and compare it to the expected new value. The same applies
 to any change where the old state remains valid during cutover: pick an assertion that fails
 if the change did not take.
+
+## `am.i.mullvad.net` is a checking service, not our VPN provider (2026-09-03)
+
+The VPN provider for every tunnel on this network is **Surfshark** — all profiles are
+`*.prod.surfshark.com`, under OpenVPN config `group_id=1792` and WireGuard `group_id=4557`.
+
+`https://am.i.mullvad.net/json` appears in `CLAUDE.md` and `README.md` purely as the
+**IP/geolocation check endpoint** (it is public and works from any provider). Separately,
+`dns.mullvad.net` is used as a DoT resolver alongside Quad9. Neither means Mullvad is the VPN.
+
+agy read "mullvad" in the standing docs and reported **"CT 105's Swiss Mullvad egress"** in a
+build report, which was then repeated in a DVR recording-report email to the owner and in a
+lesson in this file before being caught. Corrected above.
+
+Worth generalising: a tool or hostname named in the docs is not evidence of the vendor
+relationship. When an agent states a vendor, check it against configuration
+(`uci show openvpn`, the profile filenames), not against prose.
 
