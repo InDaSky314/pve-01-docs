@@ -1214,7 +1214,30 @@ def _save_probe_state(state: dict[str, Any]) -> None:
         logging.error("Could not save PPV probe state: %s", exc)
 
 
+# 2026-08-28: probe disabled for tonight's Bayern fixture. Set back to False to re-enable.
+#
+# Measured today: the provider allows ONE concurrent stream, and a second
+# request PREEMPTS the first rather than being refused. Proven - stream 1 was
+# flowing at 17.5MB, stream 2 started and took 8.7MB, stream 1 stalled dead at
+# 20.1MB and never resumed.
+#
+# The probe starts an English PPV capture at kickoff-40min, while the German
+# recording (running since 18:55) holds the only tuner - so it would kill the
+# in-progress recording. The designed protection (cancel the fallback first)
+# cannot fire: Jellyfin names the timer from the EPG programme ("Live: BL") and
+# ignores a rename, so it matches neither base_name nor fb_name and
+# PPV_FALLBACK_MARKER never appears in it.
+#
+# Trade: no English PPV option, guaranteed German recording.
+PPV_PROBE_DISABLED = True
+
+
 def run_ppv_probe_commit(dry_run: bool = True, games: list[dict[str, Any]] | None = None) -> None:
+    if PPV_PROBE_DISABLED:
+        logging.info("PPV probe disabled (PPV_PROBE_DISABLED=True) -- "
+                     "single-tuner preemption would kill the in-progress recording")
+        return
+
     """Prove the English PPV channel during pregame, then commit to it or
     put the German fallback back -- the owner's sequencing, 2026-08-25.
 
@@ -2079,6 +2102,21 @@ def trigger_auto_restore(timer: dict[str, Any], dry_run: bool = True) -> tuple[b
     # the multi-segment stitcher had nothing to stitch and comskip processed
     # 9 raw fragments instead of one stitched game. Retry the search a few
     # times with a short sleep before declaring failure.
+    # Cycle prevention, added 2026-09-03 after the Brewers @ Cubs double-stall wrote a
+    # mutually-circular chain (T1 -> T2 and T2 -> T1). The candidate search below matches on
+    # channel + recency and never excluded the timer we had just cancelled, nor any earlier
+    # link in this recording's restore chain -- so a "restore" could resolve to an already
+    # dead timer. sports-dvr-auto then believed a replacement recording was running when
+    # none was, and check_restore_stitching silently skipped the whole chain.
+    _forbidden_tids = {orig_tid} if orig_tid else set()
+    try:
+        _rs = load_restore_state() or {}
+        _forbidden_tids |= set(_rs)
+        _forbidden_tids |= {e.get("restore_timer_id") for e in _rs.values() if e.get("restore_timer_id")}
+    except Exception as exc:                                # noqa: BLE001
+        logging.warning("[AUTO-RESTORE] Could not load restore state for cycle guard: %s", exc)
+    _forbidden_tids.discard(None)
+
     for confirm_attempt in range(4):
         if restore_tid:
             break
@@ -2094,6 +2132,8 @@ def trigger_auto_restore(timer: dict[str, Any], dry_run: bool = True) -> tuple[b
         timers = get_existing_timers() or read_live_timers()
         candidates = []
         for tm in (timers or []):
+            if tm.get("Id") in _forbidden_tids:
+                continue        # never adopt the cancelled original or an existing chain link
             if tm.get("ChannelId") != cid and tm.get("ExternalChannelId") != cid:
                 continue
             try:
@@ -2120,6 +2160,17 @@ def trigger_auto_restore(timer: dict[str, Any], dry_run: bool = True) -> tuple[b
                     "closest to now (%s, diff=%.1fs). Others: %s",
                     len(candidates), restore_name, restore_tid, candidates[0][1],
                     [c[0].get("Id") for c in candidates[1:]])
+
+    # Belt and braces: even if Jellyfin handed back an id we already know about (it indexes
+    # timers by ProgramId and can re-map to a cancelled record rather than minting a new one),
+    # refuse to record a self- or back-reference. A failed restore we KNOW about beats a
+    # circular one we do not.
+    if restore_tid and restore_tid in _forbidden_tids:
+        logging.error(
+            "[AUTO-RESTORE] Jellyfin returned timer %s for '%s', but that id is the cancelled "
+            "original or an existing link in this restore chain -- refusing to write a circular "
+            "reference. Treating as a failed restore instead.", restore_tid, restore_name)
+        restore_tid = None
 
     if restore_tid:
         logging.info("  [SUCCESS] Auto-restore timer created for '%s' (Id: %s)", restore_name, restore_tid)
@@ -2745,13 +2796,24 @@ def build_restore_chain(root_tid: str, restore_state: dict[str, Any]) -> list[st
     independent original+restore PAIR, so even with the path-resolution bug
     below fixed, it could only ever have produced up to 4 separate 2-piece
     stitches -- never one combined 5-piece file."""
+    # Cycle guard added 2026-09-03. Without `seen`, a circular link (A -> B and
+    # B -> A) makes this loop append forever -- an infinite loop inside a script
+    # the stallwatch timer runs every 90s. A real circular pair was produced by
+    # the 2026-09-03 Brewers double-stall, so this is not hypothetical.
     chain = [root_tid]
+    seen = {root_tid}
     entry = restore_state.get(root_tid)
     while entry and entry.get("restore_timer_id") in restore_state:
         next_tid = entry["restore_timer_id"]
+        if next_tid in seen:
+            logging.error(
+                "[STITCH] Circular restore chain detected at %s (chain so far: %s) -- "
+                "truncating here rather than looping.", next_tid, " -> ".join(chain))
+            return chain
         chain.append(next_tid)
+        seen.add(next_tid)
         entry = restore_state[next_tid]
-    if entry and entry.get("restore_timer_id"):
+    if entry and entry.get("restore_timer_id") and entry["restore_timer_id"] not in seen:
         chain.append(entry["restore_timer_id"])  # tail: never itself restored
     return chain
 
@@ -2831,6 +2893,50 @@ def check_restore_stitching(dry_run: bool = True) -> None:
     # gets handled when that root is processed.
     all_restore_targets = {e.get("restore_timer_id") for e in restore_state.values()}
     roots = [tid for tid in restore_state if tid not in all_restore_targets]
+
+    # 2026-09-03 real incident (Brewers @ Cubs, two stalls): the chain entries
+    # pointed at each other, so EVERY id was somebody's restore_timer_id, roots
+    # came back empty, and the whole stitch pass was silently skipped. The two
+    # real on-disk segments were never combined, and the anomaly monitor then
+    # judged the second segment alone as 66.6% of the window and called the
+    # recording FAILED. Silence was the worst part -- nothing logged.
+    #
+    # If there are entries but no root, the graph has a cycle. Pick a
+    # deterministic root (earliest restored_at, falling back to sorted id) so
+    # the chain is still stitched, and say so loudly.
+    # First attempt at this guard (2026-09-03) tested `if restore_state and not roots`,
+    # which only fires when the WHOLE dict is rootless. Production state holds several
+    # unrelated games at once (7 entries / 3 roots today), so a cycle inside one game
+    # hides behind another game's valid root and is silently dropped -- the exact bug
+    # this guard existed to prevent. Resolve per connected component instead: walk every
+    # known root, then adopt a root for each leftover cluster until nothing is orphaned.
+    covered: set[str] = set()
+    for r in roots:
+        covered.update(build_restore_chain(r, restore_state))
+    # Only chase clusters that still have work left. A cycle whose entries are all in a
+    # terminal state (stitched / failed_*) needs no root -- adopting one anyway logged an
+    # ERROR every 90s forever for the already-stitched 2026-09-03 Brewers pair, which is
+    # exactly the alert-fatigue that makes people stop reading logs.
+    _TERMINAL = ("stitched", "failed_missing_original", "failed_missing_restore",
+                 "failed_restore_creation", "failed_concat", "failed_overlap_suspected")
+    uncovered = {t for t in set(restore_state) - covered
+                 if restore_state[t].get("status") not in _TERMINAL}
+    while uncovered:
+        cluster_root = min(
+            uncovered, key=lambda t: (str(restore_state[t].get("restored_at") or ""), t))
+        cluster_chain = build_restore_chain(cluster_root, restore_state)
+        roots.append(cluster_root)
+        logging.error(
+            "[STITCH] Unrooted/cyclic restore cluster found -- adopted earliest-restored_at "
+            "root %s so its segments are still stitched. Chain: %s | links: %s",
+            cluster_root, " -> ".join(cluster_chain),
+            {t: restore_state[t].get("restore_timer_id") for t in cluster_chain})
+        before = len(uncovered)
+        uncovered -= set(cluster_chain)
+        if len(uncovered) >= before:            # belt and braces: never spin
+            logging.error("[STITCH] Cluster walk made no progress; abandoning %d entries: %s",
+                          len(uncovered), sorted(uncovered))
+            break
 
     for root_tid in roots:
         root_entry = restore_state[root_tid]
