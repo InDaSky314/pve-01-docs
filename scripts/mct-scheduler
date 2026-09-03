@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""MCT Scheduler — poll-based runner for scheduled MCT captures.
+
+Driven by systemd timer (mct-scheduler.timer, OnUnitActiveSec=60s, Persistent=true).
+Reads /var/lib/dvr-dashboard/mct-bookings.json atomically.
+Launches mct detached with --start-time for any booked record starting within 5 minutes.
+Reaps finished mct processes and records their exit status (done/failed).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+BOOKINGS_FILE = Path("/var/lib/dvr-dashboard/mct-bookings.json")
+LOG_DIR = Path("/var/log/mct")
+MCT_BIN = "/usr/local/bin/mct"
+LOCAL_TZ = ZoneInfo("Europe/Berlin")
+LOOKAHEAD_SECONDS = 300  # 5 minutes ahead
+
+
+def log(msg: str) -> None:
+    now = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] [mct-scheduler] {msg}", flush=True)
+
+
+def load_bookings() -> list[dict]:
+    if not BOOKINGS_FILE.exists():
+        return []
+    try:
+        data = json.loads(BOOKINGS_FILE.read_text())
+        if isinstance(data, list):
+            return data
+    except Exception as exc:
+        log(f"WARNING: Could not parse {BOOKINGS_FILE}: {exc}")
+    return []
+
+
+def save_bookings(bookings: list[dict]) -> None:
+    BOOKINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = BOOKINGS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(bookings, indent=2) + "\n")
+    tmp.replace(BOOKINGS_FILE)
+
+
+def is_pid_running(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def reap_running(bookings: list[dict], changed: list[bool]) -> None:
+    for b in bookings:
+        if b.get("status") != "running":
+            continue
+        pid = b.get("pid")
+        if is_pid_running(pid):
+            continue
+
+        # Process is no longer running — determine exit status
+        statusfile = b.get("statusfile")
+        exit_code = None
+        if statusfile and Path(statusfile).exists():
+            try:
+                content = Path(statusfile).read_text().strip()
+                if content != "":
+                    exit_code = int(content)
+                Path(statusfile).unlink(missing_ok=True)
+            except Exception as exc:
+                log(f"Warning: could not read statusfile {statusfile}: {exc}")
+
+        logfile = b.get("logfile")
+        log_success = False
+        if logfile and Path(logfile).exists():
+            try:
+                log_text = Path(logfile).read_text()
+                if "Capture and post-processing pipeline complete." in log_text:
+                    log_success = True
+            except Exception:
+                pass
+
+        if exit_code == 0 or (exit_code is None and log_success):
+            b["status"] = "done"
+            b["exit_code"] = 0
+            b["completed_at"] = datetime.now(LOCAL_TZ).isoformat()
+            log(f"Capture completed successfully: '{b.get('title') or b.get('name')}' (id={b.get('id')})")
+        else:
+            b["status"] = "failed"
+            b["exit_code"] = exit_code if exit_code is not None else -1
+            b["failed_at"] = datetime.now(LOCAL_TZ).isoformat()
+            log(f"Capture failed (exit={b['exit_code']}): '{b.get('title') or b.get('name')}' (id={b.get('id')})")
+        changed[0] = True
+
+
+def trigger_upcoming(bookings: list[dict], now: datetime, changed: list[bool], dry_run: bool = False) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    for b in bookings:
+        if b.get("status") != "booked":
+            continue
+        try:
+            start_dt = datetime.fromisoformat(b["start"])
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=LOCAL_TZ)
+            duration_sec = int(b.get("duration_sec", 0))
+            end_dt = start_dt + timedelta(seconds=duration_sec)
+        except Exception as exc:
+            log(f"Invalid booking record (id={b.get('id')}): {exc}")
+            continue
+
+        lead = (start_dt - now).total_seconds()
+        # If the start time is within the lookahead window (<= 300s)
+        if lead <= LOOKAHEAD_SECONDS:
+            if now >= end_dt:
+                b["status"] = "failed"
+                b["error"] = "Booking expired before execution"
+                b["failed_at"] = now.isoformat()
+                changed[0] = True
+                log(f"Booking expired without running: '{b.get('title') or b.get('name')}' (id={b.get('id')})")
+                continue
+
+            slug = re.sub(r'[^a-zA-Z0-9_-]', '_', str(b.get('id', 'mct')))
+            logfile = str(LOG_DIR / f"mct-{slug}.log")
+            statusfile = str(LOG_DIR / f"mct-{slug}.status")
+
+            cmd = [
+                MCT_BIN,
+                "--channel", str(b["channel"]),
+                "--duration", str(duration_sec),
+                "--title", str(b.get("title") or b.get("name") or "Capture"),
+                "--start-time", start_dt.isoformat(),
+            ]
+            if b.get("category"):
+                cmd.extend(["--category", str(b["category"])])
+            if b.get("genre"):
+                cmd.extend(["--genre", str(b["genre"])])
+
+            if dry_run:
+                log(f"[DRY-RUN] Would launch: {' '.join(cmd)} (lead={lead:.1f}s)")
+                continue
+
+            wrapper = f'"{MCT_BIN}" "$@" > "{logfile}" 2>&1; echo $? > "{statusfile}"'
+            try:
+                proc = subprocess.Popen(
+                    ["bash", "-c", wrapper, "mct-runner", *cmd[1:]],
+                    start_new_session=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                b["status"] = "running"
+                b["pid"] = proc.pid
+                b["logfile"] = logfile
+                b["statusfile"] = statusfile
+                b["launched_at"] = now.isoformat()
+                changed[0] = True
+                log(f"Launched MCT capture for '{b.get('title') or b.get('name')}' (PID {proc.pid}, log={logfile}, lead={lead:.1f}s)")
+            except Exception as exc:
+                b["status"] = "failed"
+                b["error"] = f"Failed to spawn mct: {exc}"
+                b["failed_at"] = now.isoformat()
+                changed[0] = True
+                log(f"ERROR launching MCT for '{b.get('title') or b.get('name')}': {exc}")
+
+
+def cancel_booking(booking_id: str) -> bool:
+    bookings = load_bookings()
+    target = None
+    for b in bookings:
+        if str(b.get("id")) == str(booking_id):
+            target = b
+            break
+    if not target:
+        print(f"Booking ID '{booking_id}' not found.")
+        return False
+
+    if target.get("status") == "running" and target.get("pid"):
+        pid = target["pid"]
+        try:
+            os.kill(pid, signal.SIGTERM)
+            log(f"Sent SIGTERM to running process PID {pid}")
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            log(f"Failed to kill PID {pid}: {exc}")
+
+    target["status"] = "cancelled"
+    target["cancelled_at"] = datetime.now(LOCAL_TZ).isoformat()
+    save_bookings(bookings)
+    print(f"Booking '{target.get('title') or target.get('name')}' (id={booking_id}) cancelled.")
+    return True
+
+
+def list_bookings() -> None:
+    bookings = load_bookings()
+    if not bookings:
+        print("No MCT bookings found.")
+        return
+    print(f"{'ID':<16} {'STATUS':<10} {'CHANNEL':<12} {'START':<22} {'TITLE'}")
+    print("-" * 80)
+    for b in bookings:
+        bid = str(b.get("id", ""))[:15]
+        status = b.get("status", "")
+        ch = str(b.get("channel", ""))[:10]
+        start = str(b.get("start", ""))[:20]
+        title = b.get("title") or b.get("name", "")
+        print(f"{bid:<16} {status:<10} {ch:<12} {start:<22} {title}")
+
+
+def tick(dry_run: bool = False) -> None:
+    now = datetime.now(LOCAL_TZ)
+    bookings = load_bookings()
+    changed = [False]
+    reap_running(bookings, changed)
+    trigger_upcoming(bookings, now, changed, dry_run=dry_run)
+    if changed[0] and not dry_run:
+        save_bookings(bookings)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="MCT Scheduler")
+    parser.add_argument("--tick", action="store_true", help="Run a single scheduler tick (default)")
+    parser.add_argument("--list", action="store_true", help="List all MCT bookings")
+    parser.add_argument("--cancel", help="Cancel a booking by ID")
+    parser.add_argument("--dry-run", action="store_true", help="Evaluate tick without launching processes")
+    args = parser.parse_args()
+
+    if args.list:
+        list_bookings()
+        return 0
+    if args.cancel:
+        return 0 if cancel_booking(args.cancel) else 1
+
+    tick(dry_run=args.dry_run)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
