@@ -98,3 +98,28 @@ ffprobe reported 17.3h for a 3h game).
   dead, but it reads like a live credential.
 * NextPVR: 657 Crit/High from an unpatched Debian 12 base; pinned tag is already current
   upstream. Accepted and documented.
+
+## MCT built 2026-09-03 — status and what still needs doing
+
+`/usr/local/bin/mct` exists and dry-runs correctly. **It has never captured anything live.**
+
+Verified by Claude Code:
+* exclusion works **both** ways — refuses against Saturday's real Bayern timer
+  ("REFUSING CAPTURE: Overlapping Jellyfin timer"), passes on a clear window
+* proven reconnect flags, pre-remux step, and comskip enqueue all present in the emitted commands
+* dashboard still serves `/api/status` and `/api/schedule` with `problems: []`
+* Saturday Bayern timer untouched
+
+Fixed during inspection: MCT **logged the provider URL including credentials**, which would
+have reached journald and Loki. Now redacted to `/live/<REDACTED>/<REDACTED>/<id>.ts`.
+Backup at `mct.pre-redact-20260903`.
+
+### Before trusting it
+1. **Do a real capture on a throwaway game** — it has only ever dry-run.
+2. Confirm the file lands where Jellyfin ingests it, that the `.nfo` is accepted, and that
+   comskip actually picks it up end to end.
+3. Confirm scheduling fires at kickoff (check what mechanism was wired; verify a booked game
+   actually starts).
+4. Only then use it for something wanted. **Do not use it for the 2026-09-05 Bayern match** —
+   that stays on Jellyfin, which is proven.
+

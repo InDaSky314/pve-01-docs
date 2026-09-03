@@ -136,6 +136,7 @@ def keep_awake_cutoff(now: datetime) -> datetime:
 
 OVERRIDE = Path("/var/lib/dvr-dashboard/override-until")
 SPORTS_CONFIG = Path("/var/lib/dvr-dashboard/sports-config.json")
+MCT_BOOKINGS = Path("/var/lib/dvr-dashboard/mct-bookings.json")
 DEFAULT_SPORTS_CONFIG = {
     "Packers": True,
     "Badgers Football": True,
@@ -148,6 +149,25 @@ DEFAULT_SPORTS_CONFIG = {
     # appears). The toggle governs that path like any other team.
     "Bayern Munich": True,
 }
+
+
+def load_mct_bookings() -> list[dict[str, Any]]:
+    if not MCT_BOOKINGS.exists():
+        return []
+    try:
+        data = json.loads(MCT_BOOKINGS.read_text())
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return []
+
+
+def save_mct_bookings(bookings: list[dict[str, Any]]) -> None:
+    MCT_BOOKINGS.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MCT_BOOKINGS.with_suffix(".tmp")
+    tmp.write_text(json.dumps(bookings, indent=2) + "\n")
+    tmp.replace(MCT_BOOKINGS)
 
 CT = "105"
 JELLYFIN_URL = "http://127.0.0.1:8096"
@@ -1101,7 +1121,8 @@ def recordings(now: datetime) -> tuple[list[dict], list[str]]:
             num = "".join(ch for ch in raw_cid if ch.isdigit())
             c_name = t.get("ChannelName") or ""
             c_disp = chmap.get(raw_cid) or chmap.get(num) or chmap.get(c_name) or (f"ch {num}" if num else "")
-            items.append({"source": "Jellyfin", "name": t.get("Name", "recording"),
+            items.append({"source": "Jellyfin", "engine": "jellyfin",
+                          "name": t.get("Name", "recording"),
                           "channel": c_disp,
                           "subtitle": t.get("EpisodeTitle") or "",
                           "start": start.isoformat(), "end": end.isoformat(),
@@ -1109,6 +1130,26 @@ def recordings(now: datetime) -> tuple[list[dict], list[str]]:
                           "needsPower": outside_window(start, end)})
     except Exception as exc:                                # noqa: BLE001
         problems.append(f"Jellyfin timers unreadable ({type(exc).__name__})")
+
+    try:
+        for b in load_mct_bookings():
+            try:
+                b_start = datetime.fromisoformat(b["timer_start"]).astimezone(LOCAL)
+                b_end = datetime.fromisoformat(b["end"]).astimezone(LOCAL) + timedelta(minutes=15)
+            except Exception:
+                continue
+            if b_end < now:
+                continue
+            c_disp = b.get("channel_display") or f"{b.get('channel_number', '')} {b.get('channel_name', '')}".strip()
+            items.append({"source": "MCT", "engine": "mct",
+                          "name": b.get("name", "MCT recording"),
+                          "channel": c_disp,
+                          "subtitle": "",
+                          "start": b_start.isoformat(), "end": b_end.isoformat(),
+                          "live": b_start <= now <= b_end,
+                          "needsPower": outside_window(b_start, b_end)})
+    except Exception as exc:
+        problems.append(f"MCT bookings unreadable ({type(exc).__name__})")
 
     items.sort(key=lambda r: r["start"])
     return items, problems
@@ -1129,6 +1170,7 @@ def tag_recordings(games: list[dict], recs: list[dict]) -> None:
                 and datetime.fromisoformat(r["end"]) > gs]
         g["recording"] = hits[0]["name"] if hits else None
         g["recordingIsThisGame"] = False
+        g["engine"] = hits[0].get("engine", hits[0].get("source", "jellyfin").lower()) if hits else None
         team = g.get("team") or ""
         gch = g.get("channel") or ""
         # Third signal, for the ESPN-sourced US teams: those games carry no
@@ -1147,6 +1189,7 @@ def tag_recordings(games: list[dict], recs: list[dict]) -> None:
                     len(tok) >= 4 and (tok in rname.lower() or tok in rch.lower())):
                 g["recording"] = rname
                 g["recordingIsThisGame"] = True
+                g["engine"] = r.get("engine", r.get("source", "jellyfin").lower())
                 break
 
 
@@ -1227,6 +1270,9 @@ margin:0 0 10px;font-weight:600}
 button.pill.btn-rec{background:var(--card);border:1px solid var(--accent);color:var(--accent);cursor:pointer;font-family:inherit;line-height:1.2}
 button.pill.btn-rec:hover{background:var(--accent);color:#fff}
 button.pill.btn-rec:disabled{opacity:.5;cursor:not-allowed}
+.rec-control{display:inline-flex;align-items:center;gap:4px}
+.engine-select{font-family:inherit;font-size:.7rem;font-weight:600;padding:2px 4px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--fg);height:22px;line-height:1.2;cursor:pointer}
+.engine-select:focus{outline:2px solid var(--accent);outline-offset:1px}
 .status{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .dot{width:10px;height:10px;border-radius:50%;flex:0 0 auto}
 .big{font-size:1.05rem;font-weight:600}
@@ -1437,8 +1483,9 @@ async function toggleTeam(team, newState) {
   }
 }
 
-async function recordGame(btn, encodedGame) {
+async function recordGame(btn, encodedGame, engine) {
   const game = JSON.parse(decodeURIComponent(encodedGame));
+  game.engine = engine || 'jellyfin';
   const origText = btn.textContent;
   btn.disabled = true;
   btn.textContent = 'Scheduling…';
@@ -1467,12 +1514,20 @@ function pills(g, past){let h='';
   const sameGame = g.recordingIsThisGame ||
     (g.team && g.recording && g.recording.startsWith(g.team + ':'));
   if(g.recording){
-    const label=sameGame?'recording':'other recording overlaps';
+    const eng = (g.engine || 'Jellyfin').toUpperCase();
+    const label=sameGame?`recording (${eng})`:`other recording overlaps (${eng})`;
     h+=`<span class="pill rec" title="${esc(g.recording)}">${label}</span>`;
   }
   if(!past && !g.done && !sameGame && g.team && g.kind){
     const enc = encodeURIComponent(JSON.stringify(g));
-    h+=`<button class="pill btn-rec" onclick="recordGame(this, '${enc}')">Record</button>`;
+    const gid = 'g' + (g.id || Math.random().toString(36).substring(2, 8));
+    h+=`<div class="rec-control">
+      <select class="engine-select" id="eng-${gid}" aria-label="Recording engine for ${esc(g.name)}">
+        <option value="jellyfin" selected>Jellyfin</option>
+        <option value="mct">MCT</option>
+      </select>
+      <button class="pill btn-rec" onclick="recordGame(this, '${enc}', document.getElementById('eng-${gid}').value)">Record</button>
+    </div>`;
   }
   if(g.needsPower&&!g.done)h+='<span class="pill warn">needs power</span>';
   return h}
@@ -1567,8 +1622,11 @@ async function load(){
       'Shuts down at '+d.shutdownAt+' unless a recording is due.'}
   document.getElementById('recs').innerHTML=
     (d.problems||[]).map(p=>`<div class="err">${esc(p)}</div>`).join('')+
-    (d.recordings.length?d.recordings.map(r=>row({...r,team:r.source},false,
-      r.live?'<span class="pill live">RECORDING</span>':'')).join('')
+    (d.recordings.length?d.recordings.map(r=>{
+      const eng = (r.engine || r.source || 'Jellyfin').toUpperCase();
+      const livePill = r.live?`<span class="pill live">RECORDING (${esc(eng)})</span>`:`<span class="pill rec">${esc(eng)}</span>`;
+      return row({...r,team:r.source},false,livePill);
+    }).join('')
      :'<div class="empty">Nothing scheduled.</div>');
   document.getElementById('games').innerHTML=d.games.length
     ? d.games.map(g=>row(g,false)).join('')
@@ -1785,10 +1843,14 @@ class Handler(BaseHTTPRequestHandler):
         team = body.get("team")
         event_id = body.get("id")
         start_str = body.get("start")
+        engine = str(body.get("engine", "jellyfin")).lower()
         dry_run_req = bool(body.get("dryRun")) or bool(os.environ.get("DVR_DRY_RUN"))
 
         if not team or (not event_id and not start_str):
             return self._send(400, b'{"error":"missing game identity (team and id or start required)"}', "application/json")
+
+        if engine not in ("jellyfin", "mct"):
+            return self._send(400, b'{"error":"engine must be jellyfin or mct"}', "application/json")
 
         now = datetime.now(LOCAL)
         games = all_games(now)
@@ -1826,6 +1888,7 @@ class Handler(BaseHTTPRequestHandler):
             }
 
         jf_channels = get_jellyfin_channels()
+        chmap = channel_names()
         cid, cname = resolve_channel_id(target_game, jf_channels)
         if not cid:
             return self._send(422, json.dumps({
@@ -1841,29 +1904,109 @@ class Handler(BaseHTTPRequestHandler):
 
         t_start = start_dt - timedelta(minutes=5)
         t_end = end_dt + timedelta(minutes=15)
+        c_disp = chmap.get(cid) or chmap.get(cname) or cname
 
+        # 1. Check for overlapping Jellyfin timers
         existing_timers = get_existing_timers()
         if is_overlapping_timer(cid, t_start, t_end, existing_timers):
             return self._send(409, json.dumps({
                 "ok": False,
-                "error": f"An overlapping timer already exists on {cname} for {target_game['name']}"
+                "error": f"An overlapping Jellyfin timer already exists on {c_disp} for {target_game['name']}"
             }).encode(), "application/json")
 
-        ok, msg, payload = schedule_game_timer(target_game, cid, cname, dry_run=dry_run_req)
-        if ok:
+        # 2. Check for overlapping MCT bookings
+        mct_bookings = load_mct_bookings()
+        for b in mct_bookings:
+            try:
+                bs = datetime.fromisoformat(b["timer_start"])
+                be = datetime.fromisoformat(b["end"]) + timedelta(minutes=15)
+            except Exception:
+                continue
+            if bs < t_end and be > t_start:
+                return self._send(409, json.dumps({
+                    "ok": False,
+                    "error": f"An overlapping MCT capture already exists for '{b.get('name')}' ({bs.strftime('%H:%M')} to {be.strftime('%H:%M')})"
+                }).encode(), "application/json")
+
+        if engine == "jellyfin":
+            ok, msg, payload = schedule_game_timer(target_game, cid, cname, dry_run=dry_run_req)
+            if ok:
+                with _lock:
+                    _sched["at"] = None
+                return self._send(200, json.dumps({
+                    "ok": True,
+                    "engine": "jellyfin",
+                    "message": f"Jellyfin timer created for {target_game['name']} on {c_disp}",
+                    "channel": c_disp,
+                    "dryRun": dry_run_req,
+                    "payload": payload
+                }).encode(), "application/json")
+            else:
+                return self._send(500, json.dumps({
+                    "ok": False,
+                    "error": f"Failed to create Jellyfin timer: {msg}"
+                }).encode(), "application/json")
+
+        elif engine == "mct":
+            duration_sec = int((t_end - t_start).total_seconds())
+            team_slug = re.sub(r'[^a-zA-Z0-9]', '', target_game.get("team", "game")).lower()
+            date_slug = t_start.strftime("%Y%m%d-%H%M")
+            unit_name = f"mct-{team_slug}-{date_slug}"
+            cal_str = t_start.astimezone(LOCAL).strftime("%Y-%m-%d %H:%M:%S")
+
+            c_num = "".join(ch for ch in c_disp.split()[0] if ch.isdigit()) if c_disp else ""
+            mct_ch_arg = c_num if c_num else cname
+            game_title = f"{target_game['team']}: {target_game['name']}"
+
+            cmd = [
+                "systemd-run",
+                f"--unit={unit_name}",
+                f"--on-calendar={cal_str}",
+                "/usr/local/bin/mct",
+                "--channel", mct_ch_arg,
+                "--duration", str(duration_sec),
+                "--title", game_title,
+                "--start-time", start_dt.isoformat()
+            ]
+
+            if not dry_run_req:
+                try:
+                    subprocess.run(cmd, capture_output=True, text=True, check=True)
+                except Exception as exc:
+                    return self._send(500, json.dumps({
+                        "ok": False,
+                        "error": f"Failed to schedule MCT via systemd: {exc}"
+                    }).encode(), "application/json")
+
+            booking_entry = {
+                "id": target_game.get("id") or str(t_start.timestamp()),
+                "team": target_game.get("team"),
+                "name": game_title,
+                "channel_number": c_num,
+                "channel_name": cname,
+                "channel_display": c_disp,
+                "start": start_dt.isoformat(),
+                "end": end_dt.isoformat(),
+                "timer_start": t_start.isoformat(),
+                "duration_sec": duration_sec,
+                "unit_name": unit_name,
+                "engine": "mct",
+                "created_at": now.isoformat()
+            }
+            if not dry_run_req:
+                mct_bookings.append(booking_entry)
+                save_mct_bookings(mct_bookings)
+
             with _lock:
                 _sched["at"] = None
+
             return self._send(200, json.dumps({
                 "ok": True,
-                "message": f"Timer created for {target_game['name']} on {cname}",
-                "channel": cname,
+                "engine": "mct",
+                "message": f"MCT capture scheduled for {game_title} on {c_disp} at {cal_str}",
+                "channel": c_disp,
                 "dryRun": dry_run_req,
-                "payload": payload
-            }).encode(), "application/json")
-        else:
-            return self._send(500, json.dumps({
-                "ok": False,
-                "error": f"Failed to create timer: {msg}"
+                "booking": booking_entry
             }).encode(), "application/json")
 
     def _override(self):
