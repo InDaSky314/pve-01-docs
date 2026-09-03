@@ -2,25 +2,36 @@
 """Manual Capture Tool (MCT) — robust direct TS capture with in-file reconnect.
 
 Captures a stream inside CT 105 (Swiss egress) using proven ffmpeg resilience
-flags, performs pre-remux to eliminate DTS irregularities, generates Jellyfin
-NFO metadata, and enqueues the output for comskip commercial removal.
+flags, performs pre-remux to eliminate DTS irregularities, populates rich EPG
+metadata and poster artwork for Jellyfin, and enqueues the output for comskip.
 
-Mutual exclusion: refuses to start if any Jellyfin recording is active or any
-Jellyfin timer overlaps the capture window.
+Features:
+1. Live-aware auto-extension via ESPN schedule polling with clean stdin 'q' termination.
+2. Hard-cap timer protection: clamps extension window against upcoming Jellyfin timers
+   and MCT bookings to prevent single-tuner collisions.
+3. Fallback to fixed padding when no ESPN fixture exists (e.g. Bundesliga).
+4. Real EPG metadata extraction (title, plot/overview, genres) and poster artwork
+   download (program image fallback to channel logo).
+5. Safe lockdata handling: only locks metadata once plot, genres, and poster are populated.
 """
 from __future__ import annotations
 
 import argparse
+import html
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
-import time
 import subprocess
 import sys
-import urllib.request
+import time
 import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 LOCAL_TZ = ZoneInfo("Europe/Berlin")
@@ -28,7 +39,8 @@ LOKI_URL = "http://192.168.9.164:3100/loki/api/v1/push"
 JF_BASE_URL = "http://192.168.9.50:8096"
 JF_KEY_FILE = Path("/srv/media-core/.jellyfin_api_key")
 CT_ID = "105"
-
+MCT_BOOKINGS_FILE = Path("/var/lib/dvr-dashboard/mct-bookings.json")
+SPORTS_DVR_AUTO_SCRIPT = Path("/usr/local/bin/sports-dvr-auto")
 
 
 def _redact_url(text: str) -> str:
@@ -38,8 +50,9 @@ def _redact_url(text: str) -> str:
     into a public repo on 2026-08-03 (see docs/secret-exposure-20260902.md)."""
     return re.sub(r"(/live/)[^/]+/[^/]+/", r"\1<REDACTED>/<REDACTED>/", str(text))
 
+
 def log(msg: str) -> None:
-    msg = _redact_url(msg) if 'msg' in dir() or True else msg
+    msg = _redact_url(msg)
     now = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now}] {msg}", flush=True)
 
@@ -93,6 +106,18 @@ def jf_api(endpoint: str, method: str = "GET", data: dict | None = None) -> dict
         with urllib.request.urlopen(req, timeout=10) as resp:
             body = resp.read()
             return json.loads(body) if body else {}
+    except Exception:
+        return None
+
+
+def jf_get_image_bytes(item_id: str) -> bytes | None:
+    token = get_jf_token()
+    headers = {"Authorization": f'MediaBrowser Token="{token}"', "User-Agent": "MCT/1.0"}
+    url = f"{JF_BASE_URL}/Items/{item_id}/Images/Primary"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.read()
     except Exception:
         return None
 
@@ -157,7 +182,7 @@ def parse_duration(dstr: str) -> int:
             secs += int(m.group("m")) * 60
         if m.group("s"):
             secs += int(m.group("s"))
-        if secs > 0:
+        if secs >= 0:
             return secs
     raise ValueError(f"Invalid duration format: {dstr}")
 
@@ -181,7 +206,301 @@ def check_exclusion(start_dt: datetime, end_dt: datetime) -> tuple[bool, str]:
             if t_s < end_dt and t_e > start_dt:
                 t_name = t.get("Name", "unnamed")
                 return False, f"Overlapping Jellyfin timer '{t_name}' ({t_s.astimezone(LOCAL_TZ).strftime('%Y-%m-%d %H:%M')} to {t_e.astimezone(LOCAL_TZ).strftime('%H:%M')})"
+
+    if MCT_BOOKINGS_FILE.exists():
+        try:
+            bookings = json.loads(MCT_BOOKINGS_FILE.read_text())
+            if isinstance(bookings, list):
+                for b in bookings:
+                    if b.get("status") in ("cancelled", "canceled", "done", "error"):
+                        continue
+                    try:
+                        b_s = datetime.fromisoformat(b["start"]).astimezone(timezone.utc)
+                        b_e = datetime.fromisoformat(b["end"]).astimezone(timezone.utc)
+                    except Exception:
+                        continue
+                    if b_s < end_dt and b_e > start_dt:
+                        b_title = b.get("title") or b.get("name") or "unnamed booking"
+                        return False, f"Overlapping MCT booking '{b_title}' ({b_s.astimezone(LOCAL_TZ).strftime('%Y-%m-%d %H:%M')} to {b_e.astimezone(LOCAL_TZ).strftime('%H:%M')})"
+        except Exception:
+            pass
+
     return True, ""
+
+
+def load_espn_schedule() -> list[dict[str, Any]]:
+    """Reuse ESPN schedule plumbing from sports-dvr-auto."""
+    if SPORTS_DVR_AUTO_SCRIPT.exists():
+        try:
+            loader = importlib.machinery.SourceFileLoader("sports_dvr_auto", str(SPORTS_DVR_AUTO_SCRIPT))
+            spec = importlib.util.spec_from_file_location("sports_dvr_auto", str(SPORTS_DVR_AUTO_SCRIPT), loader=loader)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                loader.exec_module(mod)
+                if hasattr(mod, "fetch_espn_schedule"):
+                    return mod.fetch_espn_schedule()
+        except Exception as exc:
+            log(f"WARNING: Could not import sports-dvr-auto ({exc}), falling back to direct ESPN API")
+
+    # Direct ESPN fallback if sports-dvr-auto is unavailable
+    games: list[dict[str, Any]] = []
+    teams = [
+        ("Brewers", "baseball/mlb", "mil"),
+        ("Packers", "football/nfl", "gb"),
+        ("Bucks", "basketball/nba", "mil"),
+        ("Badgers Football", "football/college-football", "275"),
+        ("Badgers Basketball", "basketball/mens-college-basketball", "275"),
+    ]
+    seen_ids: set[str] = set()
+    for team_label, sport_path, team_id in teams:
+        for stype in (1, 2, 3):
+            url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/teams/{team_id}/schedule?seasontype={stype}"
+            req = urllib.request.Request(url)
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.load(resp)
+            except Exception:
+                continue
+            for event in data.get("events", []):
+                eid = event.get("id")
+                if not eid or eid in seen_ids:
+                    continue
+                seen_ids.add(eid)
+                try:
+                    s_dt = datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                comp = (event.get("competitions") or [{}])[0]
+                status_type = ((comp.get("status") or {}).get("type") or {})
+                games.append({
+                    "id": eid,
+                    "team": team_label,
+                    "name": event.get("name") or event.get("shortName") or "Game",
+                    "shortName": event.get("shortName") or "",
+                    "start": s_dt,
+                    "end": s_dt + timedelta(hours=3, minutes=15),
+                    "state": status_type.get("state", "pre"),
+                    "completed": bool(status_type.get("completed", False)),
+                    "status_detail": status_type.get("detail") or status_type.get("shortDetail") or "",
+                })
+    return games
+
+
+def find_espn_fixture(title: str, channel_name: str, start_dt: datetime, games: list[dict[str, Any]]) -> dict[str, Any] | None:
+    start_utc = start_dt.astimezone(timezone.utc)
+    target_str = f"{title} {channel_name}".lower()
+
+    for g in games:
+        if abs((g["start"] - start_utc).total_seconds()) > 4 * 3600:
+            continue
+
+        team_lead = g.get("team", "").lower().split()[0]
+        if team_lead and team_lead in target_str:
+            return g
+
+        tokens = {w.lower() for w in re.findall(r"[A-Za-z]{3,}", g.get("name", ""))}
+        tokens -= {"live", "the", "and"}
+        if sum(1 for w in tokens if w in target_str) >= 2:
+            return g
+
+    return None
+
+
+def lookup_epg_and_artwork(ch: dict[str, str], start_dt: datetime, custom_title: str | None = None, custom_genre: str = "Sports") -> dict[str, Any]:
+    """Look up Jellyfin EPG program airing on channel at start_dt, and retrieve artwork."""
+    jf_chans_resp = jf_api("/LiveTv/Channels")
+    jf_chans = (jf_chans_resp or {}).get("Items", []) if isinstance(jf_chans_resp, dict) else []
+
+    matched_ch = None
+    if ch.get("chno"):
+        for c in jf_chans:
+            if str(c.get("ChannelNumber")) == str(ch["chno"]) or str(c.get("Number")) == str(ch["chno"]):
+                matched_ch = c
+                break
+    if not matched_ch:
+        q_norm = ch.get("name", "").lower().strip()
+        for c in jf_chans:
+            if c.get("Name", "").lower().strip() == q_norm:
+                matched_ch = c
+                break
+        if not matched_ch:
+            for c in jf_chans:
+                c_norm = c.get("Name", "").lower().strip()
+                if q_norm in c_norm or c_norm in q_norm:
+                    matched_ch = c
+                    break
+
+    channel_id = matched_ch.get("Id") if matched_ch else None
+    channel_name = matched_ch.get("Name") if matched_ch else ch.get("name", "")
+    channel_img_tag = (matched_ch.get("ImageTags") or {}).get("Primary") if matched_ch else None
+
+    matched_prog = None
+    if channel_id:
+        start_utc = start_dt.astimezone(timezone.utc)
+        progs_resp = jf_api(f"/LiveTv/Programs?ChannelIds={channel_id}&Fields=Overview,Genres,Tags,People,Studios,OfficialRating&Limit=100")
+        progs = (progs_resp or {}).get("Items", []) if isinstance(progs_resp, dict) else []
+
+        for p in progs:
+            try:
+                p_s = datetime.fromisoformat(p["StartDate"].replace("Z", "+00:00"))
+                p_e = datetime.fromisoformat(p["EndDate"].replace("Z", "+00:00"))
+                if p_s <= start_utc < p_e:
+                    matched_prog = p
+                    break
+            except Exception:
+                continue
+
+        if not matched_prog and progs:
+            best_diff = 1800
+            for p in progs:
+                try:
+                    p_s = datetime.fromisoformat(p["StartDate"].replace("Z", "+00:00"))
+                    diff = abs((p_s - start_utc).total_seconds())
+                    if diff < best_diff:
+                        best_diff = diff
+                        matched_prog = p
+                except Exception:
+                    continue
+
+    prog_title = matched_prog.get("Name") if matched_prog else ""
+    prog_overview = matched_prog.get("Overview") if matched_prog else ""
+    prog_genres = matched_prog.get("Genres") or [] if matched_prog else []
+    prog_img_tag = (matched_prog.get("ImageTags") or {}).get("Primary") if matched_prog else None
+    prog_id = matched_prog.get("Id") if matched_prog else None
+
+    final_title = custom_title or prog_title or channel_name
+    final_plot = prog_overview
+
+    genres_list: list[str] = []
+    for g in prog_genres:
+        if g and g not in genres_list:
+            genres_list.append(g)
+    if custom_genre and custom_genre not in genres_list:
+        genres_list.append(custom_genre)
+    if "Sports" not in genres_list:
+        genres_list.append("Sports")
+
+    poster_bytes: bytes | None = None
+    poster_source = "none"
+
+    if prog_id and prog_img_tag:
+        img_data = jf_get_image_bytes(prog_id)
+        if img_data:
+            poster_bytes = img_data
+            poster_source = f"programme image ({prog_id})"
+
+    if not poster_bytes and channel_id and channel_img_tag:
+        img_data = jf_get_image_bytes(channel_id)
+        if img_data:
+            poster_bytes = img_data
+            poster_source = f"channel logo ({channel_id})"
+
+    has_full_metadata = bool(final_plot and final_plot.strip()) and bool(genres_list) and bool(poster_bytes)
+
+    return {
+        "title": final_title,
+        "plot": final_plot,
+        "genres": genres_list,
+        "poster_bytes": poster_bytes,
+        "poster_source": poster_source,
+        "has_full_metadata": has_full_metadata,
+        "lockdata": has_full_metadata,
+        "channel_matched": channel_name,
+        "prog_matched": prog_title,
+    }
+
+
+def calculate_hard_cap(
+    start_dt: datetime,
+    duration_sec: int,
+    max_extension_sec: int,
+    fixed_pad_sec: int,
+    fixture: dict[str, Any] | None,
+) -> tuple[int, datetime, str, bool, str]:
+    """Calculate the hard cap duration and end time, clamped to following timers."""
+    start_utc = start_dt.astimezone(timezone.utc)
+    nominal_end_utc = start_utc + timedelta(seconds=duration_sec)
+
+    if fixture:
+        if fixture.get("completed") or fixture.get("state") == "post":
+            potential_ext = 0
+            detail = fixture.get("status_detail") or "completed"
+            ext_reason = f"ESPN fixture is final ({detail}) -> 0s extension"
+        else:
+            potential_ext = max_extension_sec
+            state_val = fixture.get("state")
+            ext_reason = f"ESPN fixture active/upcoming (state={state_val}) -> {max_extension_sec}s max extension"
+    else:
+        potential_ext = fixed_pad_sec
+        ext_reason = f"No ESPN fixture -> {fixed_pad_sec}s fixed pad"
+
+    target_end_utc = nominal_end_utc + timedelta(seconds=potential_ext)
+
+    upcoming_events: list[tuple[datetime, str]] = []
+    timers_data = jf_api("/LiveTv/Timers")
+    if timers_data and isinstance(timers_data, dict):
+        for t in timers_data.get("Items", []):
+            if t.get("Status") in ("Completed", "Cancelled", "Error"):
+                continue
+            try:
+                t_s = datetime.fromisoformat(t["StartDate"].replace("Z", "+00:00")) - timedelta(seconds=t.get("PrePaddingSeconds", 0))
+                if t_s >= start_utc:
+                    name = t.get("Name", "unnamed")
+                    upcoming_events.append((t_s, f"Jellyfin timer '{name}'"))
+            except Exception:
+                continue
+
+    if MCT_BOOKINGS_FILE.exists():
+        try:
+            bookings_data = json.loads(MCT_BOOKINGS_FILE.read_text())
+            if isinstance(bookings_data, list):
+                for b in bookings_data:
+                    if b.get("status") in ("cancelled", "canceled", "done", "error"):
+                        continue
+                    try:
+                        b_s = datetime.fromisoformat(b["start"]).astimezone(timezone.utc)
+                        if b_s >= start_utc:
+                            btitle = b.get("title") or b.get("name") or "unnamed"
+                            upcoming_events.append((b_s, f"MCT booking '{btitle}'"))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    clamped = False
+    clamp_info = ""
+    if upcoming_events:
+        earliest_t, label = min(upcoming_events, key=lambda x: x[0])
+        if target_end_utc > earliest_t:
+            clamped = True
+            t_str = earliest_t.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+            old_str = target_end_utc.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+            clamp_info = f"Clamped by {label} at {t_str} (was {old_str})"
+            target_end_utc = earliest_t
+
+    hard_cap_sec = max(duration_sec, int((target_end_utc - start_utc).total_seconds()))
+    return hard_cap_sec, target_end_utc, ext_reason, clamped, clamp_info
+
+
+def build_nfo_xml(title: str, start_dt: datetime, plot: str, genres: list[str], lockdata: bool) -> str:
+    xml_lines = [
+        '<?xml version="1.0" encoding="utf-8" standalone="yes"?>',
+        '<movie>',
+        f'  <title>{html.escape(title)}</title>',
+        f'  <dateadded>{start_dt.strftime("%Y-%m-%d %H:%M:%S")}</dateadded>',
+    ]
+    if plot and plot.strip():
+        xml_lines.append(f'  <plot>{html.escape(plot.strip())}</plot>')
+    else:
+        xml_lines.append('  <plot />')
+
+    for g in genres:
+        if g:
+            xml_lines.append(f'  <genre>{html.escape(g)}</genre>')
+
+    xml_lines.append(f'  <lockdata>{"true" if lockdata else "false"}</lockdata>')
+    xml_lines.append('</movie>\n')
+    return '\n'.join(xml_lines)
 
 
 def main() -> int:
@@ -192,6 +511,9 @@ def main() -> int:
     parser.add_argument("--category", default="Sports", help="Category folder (default: Sports)")
     parser.add_argument("--genre", default="Sports", help="Genre for NFO (default: Sports)")
     parser.add_argument("--start-time", help="ISO start time for window calculation / naming (default: now)")
+    parser.add_argument("--max-extension", default="90m", help="Maximum auto-extension duration (default: 90m)")
+    parser.add_argument("--fixed-pad", default="5m", help="Fixed pad duration when no ESPN fixture exists (default: 5m)")
+    parser.add_argument("--poll-interval", type=int, default=120, help="Supervisor ESPN polling interval in seconds (default: 120)")
     parser.add_argument("--dry-run", action="store_true", help="Show planned action without capturing or touching tuner")
     args = parser.parse_args()
 
@@ -200,6 +522,18 @@ def main() -> int:
     except ValueError as exc:
         log(f"ERROR: {exc}")
         push_loki_alert(f"level=alert source=mct msg='Invalid duration: {args.duration}'")
+        return 1
+
+    try:
+        max_ext_sec = parse_duration(args.max_extension)
+    except ValueError as exc:
+        log(f"ERROR: Invalid max-extension: {exc}")
+        return 1
+
+    try:
+        fixed_pad_sec = parse_duration(args.fixed_pad)
+    except ValueError as exc:
+        log(f"ERROR: Invalid fixed-pad: {exc}")
         return 1
 
     try:
@@ -226,10 +560,13 @@ def main() -> int:
     else:
         start_dt = now
 
-    end_dt = start_dt + timedelta(seconds=duration_sec)
-    title = args.title or ch["name"]
-    ts_str = start_dt.strftime("%Y_%m_%d_%H_%M_%S")
+    nominal_end_dt = start_dt + timedelta(seconds=duration_sec)
+
+    # 1. EPG & Artwork lookup
+    meta = lookup_epg_and_artwork(ch, start_dt, custom_title=args.title, custom_genre=args.genre)
+    title = meta["title"]
     safe_title = re.sub(r'[/\\:*?"<>|]', "", title).strip()
+    ts_str = start_dt.strftime("%Y_%m_%d_%H_%M_%S")
 
     container_dir = f"/media/recordings/{args.category}/{safe_title}"
     ct105_dir = f"/srv/media-core{container_dir}"
@@ -237,43 +574,41 @@ def main() -> int:
     raw_path = f"{container_dir}/{base_file}.raw.ts"
     clean_path = f"{container_dir}/{base_file}.ts"
     nfo_path = f"{container_dir}/{base_file}.nfo"
+    poster_path = f"{container_dir}/poster.jpg"
     queue_entry = clean_path
 
-    # --start-time used to affect only the filename and the exclusion window: nothing
-    # ever waited, so a future start time produced a file NAMED for kickoff holding
-    # content captured at the moment you ran the command. Re-check exclusion after
-    # sleeping, because a Jellyfin timer can be created while we wait.
+    # 2. Check exclusion for nominal recording window
     MAX_WAIT_SECONDS = 12 * 3600
     lead = (start_dt - datetime.now(LOCAL_TZ)).total_seconds()
-    if lead > MAX_WAIT_SECONDS:
+    if lead > MAX_WAIT_SECONDS and not args.dry_run:
         log(f"REFUSING CAPTURE: start time is {lead/3600:.1f}h away (max {MAX_WAIT_SECONDS/3600:.0f}h). "
             f"Book it through the DVR dashboard instead of holding a process open that long.")
         return 2
 
-    ok, err = check_exclusion(start_dt.astimezone(timezone.utc), end_dt.astimezone(timezone.utc))
+    ok, err = check_exclusion(start_dt.astimezone(timezone.utc), nominal_end_dt.astimezone(timezone.utc))
     if not ok:
         log(f"REFUSING CAPTURE: {err}")
         push_loki_alert(f"level=alert source=mct msg='Refusing capture: {err}'")
         return 2
 
-    if lead > 1 and not args.dry_run:
-        log(f"Waiting {lead:.0f}s until {start_dt.isoformat()} before opening the tuner")
-        time.sleep(lead)
-        ok, err = check_exclusion(start_dt.astimezone(timezone.utc), end_dt.astimezone(timezone.utc))
-        if not ok:
-            log(f"REFUSING CAPTURE: {err} (appeared while waiting for start time)")
-            push_loki_alert(f"level=alert source=mct msg='Refusing capture after wait: {err}'")
-            return 2
+    # 3. ESPN fixture matching and Hard Cap calculation
+    espn_games = load_espn_schedule()
+    fixture = find_espn_fixture(title, ch["name"], start_dt, espn_games)
+    hard_cap_sec, hard_cap_end_dt, ext_reason, is_clamped, clamp_info = calculate_hard_cap(
+        start_dt, duration_sec, max_ext_sec, fixed_pad_sec, fixture
+    )
+
+    nfo_content = build_nfo_xml(safe_title, start_dt, meta["plot"], meta["genres"], meta["lockdata"])
 
     ffmpeg_cmd = [
         "/usr/sbin/pct", "exec", CT_ID, "--",
-        "docker", "exec", "jellyfin",
+        "docker", "exec", "-i", "jellyfin",
         "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-y",
         "-reconnect", "1", "-reconnect_streamed", "1",
         "-reconnect_on_network_error", "1", "-reconnect_delay_max", "10",
         "-rw_timeout", "15000000",
         "-i", ch["url"],
-        "-t", str(duration_sec),
+        "-t", str(hard_cap_sec),
         "-c", "copy",
         raw_path,
     ]
@@ -290,39 +625,117 @@ def main() -> int:
         clean_path,
     ]
 
-    nfo_content = (
-        '<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n'
-        '<movie>\n'
-        f'  <title>{safe_title}</title>\n'
-        f'  <dateadded>{start_dt.strftime("%Y-%m-%d %H:%M:%S")}</dateadded>\n'
-        '  <plot />\n'
-        f'  <genre>{args.genre}</genre>\n'
-        '  <genre>Sports</genre>\n'
-        '  <lockdata>true</lockdata>\n'
-        '</movie>\n'
-    )
-
     if args.dry_run:
         log("=== MCT DRY RUN ===")
-        log(f"Channel:      {ch['chno']} {ch['name']}")
-        log(f"Stream URL:   {ch['url']}")
-        log(f"Start Time:   {start_dt.isoformat()}")
-        log(f"Duration:     {duration_sec}s ({timedelta(seconds=duration_sec)})")
-        log(f"Target TS:    {clean_path}")
-        log(f"Target NFO:   {nfo_path}")
-        log(f"Comskip Q:    {queue_entry}")
-        log(f"Exclusion:    PASS (no overlapping Jellyfin timers or active recordings)")
-        log(f"FFmpeg CMD:   {' '.join(ffmpeg_cmd)}")
-        log(f"Pre-remux:    {' '.join(preremux_cmd)}")
+        log(f"Channel:        {ch['chno']} {ch['name']} (Jellyfin: {meta['channel_matched']})")
+        log(f"Stream URL:     {ch['url']}")
+        log(f"Start Time:     {start_dt.isoformat()}")
+        log(f"Nominal Dur:    {duration_sec}s ({timedelta(seconds=duration_sec)}) -> {nominal_end_dt.isoformat()}")
+        if fixture:
+            log(f"ESPN Fixture:   {fixture['team']} - {fixture['name']} (state={fixture['state']}, detail={fixture['status_detail'] or 'N/A'})")
+        else:
+            log("ESPN Fixture:   None (No matching fixture found)")
+        log(f"Auto-Extend:    {ext_reason}")
+        if is_clamped:
+            log(f"Clamp Warning:  {clamp_info}")
+        log(f"Hard Cap:       {hard_cap_sec}s ({timedelta(seconds=hard_cap_sec)}) -> {hard_cap_end_dt.isoformat()}")
+        log(f"Target TS:      {clean_path}")
+        log(f"Target NFO:     {nfo_path}")
+        log(f"Target Poster:  {poster_path} (Source: {meta['poster_source']}, Bytes: {len(meta['poster_bytes']) if meta['poster_bytes'] else 0})")
+        log(f"Metadata Lock:  {meta['lockdata']} (plot={'yes' if meta['plot'] else 'empty'}, genres={meta['genres']})")
+        log(f"Comskip Q:      {queue_entry}")
+        log("Exclusion:      PASS (no overlapping Jellyfin timers or active recordings)")
+        log(f"FFmpeg CMD:     {' '.join(ffmpeg_cmd)}")
+        log(f"Pre-remux:      {' '.join(preremux_cmd)}")
         return 0
 
-    log(f"Starting capture: {title} on {ch['chno']} {ch['name']} ({duration_sec}s)")
+    if lead > 1:
+        log(f"Waiting {lead:.0f}s until {start_dt.isoformat()} before opening the tuner")
+        time.sleep(lead)
+        ok, err = check_exclusion(start_dt.astimezone(timezone.utc), nominal_end_dt.astimezone(timezone.utc))
+        if not ok:
+            log(f"REFUSING CAPTURE: {err} (appeared while waiting for start time)")
+            push_loki_alert(f"level=alert source=mct msg='Refusing capture after wait: {err}'")
+            return 2
+
+    log(f"Starting capture: {title} on {ch['chno']} {ch['name']} (Nominal: {duration_sec}s, Hard Cap: {hard_cap_sec}s)")
+    if fixture:
+        log(f"Supervising ESPN game '{fixture['name']}' (state={fixture['state']}, detail={fixture['status_detail']})")
+    if is_clamped:
+        log(f"Extension window: {clamp_info}")
+
     subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "mkdir", "-p", ct105_dir], check=True)
 
-    res = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        log(f"ERROR: ffmpeg capture exited with code {res.returncode}: {res.stderr.strip()[-300:]}")
-        push_loki_alert(f"level=alert source=mct msg='ffmpeg capture failed on {ch['name']}: {res.stderr.strip()[-200:]}'")
+    # Launch ffmpeg inside container with interactive stdin
+    start_mono = time.monotonic()
+    p = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    stopped_cleanly = False
+    is_supervising = fixture is not None and not (fixture.get("completed") or fixture.get("state") == "post")
+
+    if is_supervising:
+        while True:
+            poll_start = time.monotonic()
+            while time.monotonic() - poll_start < args.poll_interval:
+                ret = p.poll()
+                if ret is not None:
+                    break
+                time.sleep(2)
+
+            if p.poll() is not None:
+                break
+
+            elapsed = time.monotonic() - start_mono
+            try:
+                latest_games = load_espn_schedule()
+                cur_fixture = find_espn_fixture(title, ch["name"], start_dt, latest_games)
+            except Exception as exc:
+                log(f"[Supervisor] ESPN poll error ({exc}), continuing...")
+                continue
+
+            if not cur_fixture:
+                log("[Supervisor] Fixture no longer visible in ESPN schedule, continuing to hard cap...")
+                continue
+
+            fixture_state = cur_fixture.get("state")
+            is_completed = bool(cur_fixture.get("completed") or fixture_state == "post")
+            detail = cur_fixture.get("status_detail") or fixture_state or "unknown"
+
+            if elapsed < duration_sec:
+                log(f"[Supervisor] Game status: {detail} (elapsed {int(elapsed)}s / nominal {duration_sec}s)")
+            else:
+                if is_completed:
+                    log(f"[Supervisor] Game is FINAL ({detail}). Stopping ffmpeg capture cleanly...")
+                    try:
+                        if p.stdin:
+                            p.stdin.write(b"q\n")
+                            p.stdin.flush()
+                            p.stdin.close()
+                    except Exception as e:
+                        log(f"[Supervisor] Failed writing q to stdin: {e}")
+                    stopped_cleanly = True
+                    break
+                elif fixture_state == "in":
+                    log(f"[Supervisor] Game is IN PROGRESS ({detail}). Auto-extending capture (elapsed {int(elapsed)}s / hard cap {hard_cap_sec}s)...")
+    else:
+        pass
+
+    try:
+        stdout_data, stderr_data = p.communicate(timeout=15 if stopped_cleanly else None)
+    except subprocess.TimeoutExpired:
+        log("[Supervisor] ffmpeg did not terminate within 15s of 'q'; sending SIGINT fallback...")
+        subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "docker", "exec", "jellyfin", "sh", "-c", "kill -INT $(pidof ffmpeg)"], check=False)
+        try:
+            stdout_data, stderr_data = p.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            log("[Supervisor] ffmpeg failed to respond to SIGINT; terminating...")
+            p.kill()
+            stdout_data, stderr_data = p.communicate()
+
+    if p.returncode != 0 and not stopped_cleanly:
+        err_msg = stderr_data.decode("utf-8", errors="replace").strip()[-300:]
+        log(f"ERROR: ffmpeg capture exited with code {p.returncode}: {err_msg}")
+        push_loki_alert(f"level=alert source=mct msg='ffmpeg capture failed on {ch['name']}: {err_msg[-200:]}'")
         return 4
 
     log(f"Capture completed. Pre-remuxing to normalise DTS: {clean_path}")
@@ -335,10 +748,19 @@ def main() -> int:
     # Remove raw file after successful pre-remux
     subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "rm", "-f", f"/srv/media-core{raw_path}"], check=False)
 
+    # Write poster.jpg artwork if retrieved
+    if meta.get("poster_bytes"):
+        try:
+            write_poster_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{poster_path}'"]
+            subprocess.run(write_poster_cmd, input=meta["poster_bytes"], check=True)
+            log(f"Wrote poster: {poster_path} ({len(meta['poster_bytes'])} bytes from {meta['poster_source']})")
+        except Exception as exc:
+            log(f"WARNING: Failed writing poster.jpg: {exc}")
+
     # Write NFO metadata
     write_nfo_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{nfo_path}'"]
     subprocess.run(write_nfo_cmd, input=nfo_content, text=True, check=True)
-    log(f"Wrote NFO: {nfo_path}")
+    log(f"Wrote NFO: {nfo_path} (lockdata={meta['lockdata']}, genres={meta['genres']}, plot_len={len(meta['plot'])})")
 
     # Enqueue for comskip postprocessing
     enqueue_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"echo '{clean_path}' >> /srv/media-core/media/recordings/.postprocess/queue"]
