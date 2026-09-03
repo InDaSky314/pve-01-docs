@@ -1,0 +1,11 @@
+[Unit]
+Description=Measure OpenLigaDB matchIsFinished latency against a live Bundesliga match
+Documentation=file:///root/pve-01-docs/docs/mct-bundesliga-stop-signal.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/oldb-latency-probe 83172
+# Host powers down after the Jellyfin timer ends; bound the run regardless.
+RuntimeMaxSec=3h
+StandardOutput=journal
+StandardError=journal
