@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""Manual Capture Tool (MCT) — robust direct TS capture with in-file reconnect.
+
+Captures a stream inside CT 105 (Swiss egress) using proven ffmpeg resilience
+flags, performs pre-remux to eliminate DTS irregularities, generates Jellyfin
+NFO metadata, and enqueues the output for comskip commercial removal.
+
+Mutual exclusion: refuses to start if any Jellyfin recording is active or any
+Jellyfin timer overlaps the capture window.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+import urllib.error
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+LOCAL_TZ = ZoneInfo("Europe/Berlin")
+LOKI_URL = "http://192.168.9.164:3100/loki/api/v1/push"
+JF_BASE_URL = "http://192.168.9.50:8096"
+JF_KEY_FILE = Path("/srv/media-core/.jellyfin_api_key")
+CT_ID = "105"
+
+
+
+def _redact_url(text: str) -> str:
+    """Never log provider credentials. They live in the URL path
+    (/live/<user>/<pass>/<id>.ts) and MCT log lines reach journald and Loki, so a
+    raw command echo would leak them exactly the way two Jellyfin API keys leaked
+    into a public repo on 2026-08-03 (see docs/secret-exposure-20260902.md)."""
+    return re.sub(r"(/live/)[^/]+/[^/]+/", r"\1<REDACTED>/<REDACTED>/", str(text))
+
+def log(msg: str) -> None:
+    msg = _redact_url(msg) if 'msg' in dir() or True else msg
+    now = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {msg}", flush=True)
+
+
+def push_loki_alert(msg: str, level: str = "alert") -> None:
+    """Fire-and-forget push to Loki job='media-core-alerts'."""
+    stream = {"job": "media-core-alerts", "level": level, "source": "mct"}
+    ts_ns = str(int(datetime.now(timezone.utc).timestamp() * 1_000_000_000))
+    body = {"streams": [{"stream": stream, "values": [[ts_ns, msg]]}]}
+    try:
+        req = urllib.request.Request(
+            LOKI_URL,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5).read()
+    except Exception:
+        pass
+
+
+def get_jf_token() -> str:
+    if JF_KEY_FILE.exists():
+        try:
+            tok = JF_KEY_FILE.read_text().strip()
+            if tok:
+                return tok
+        except Exception:
+            pass
+    try:
+        tok = subprocess.run(
+            ["/usr/sbin/pct", "exec", CT_ID, "--", "cat", "/srv/media-core/.jellyfin_api_key"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.strip()
+        if tok:
+            return tok
+    except Exception:
+        pass
+    return ""
+
+
+def jf_api(endpoint: str, method: str = "GET", data: dict | None = None) -> dict | list | None:
+    token = get_jf_token()
+    headers = {"Authorization": f'MediaBrowser Token="{token}"', "User-Agent": "MCT/1.0"}
+    payload = json.dumps(data).encode("utf-8") if data is not None else None
+    if payload:
+        headers["Content-Type"] = "application/json"
+    url = f"{JF_BASE_URL}{endpoint}"
+    req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read()
+            return json.loads(body) if body else {}
+    except Exception:
+        return None
+
+
+def parse_playlist() -> list[dict[str, str]]:
+    raw = subprocess.check_output(
+        ["/usr/sbin/pct", "exec", CT_ID, "--", "cat", "/srv/media-core/threadfin/conf/playlist.m3u"],
+        text=True, timeout=15,
+    )
+    channels = []
+    lines = raw.splitlines()
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if line.startswith("#EXTINF:"):
+            chno_m = re.search(r'tvg-chno="([^"]+)"', line)
+            chno = chno_m.group(1).strip() if chno_m else ""
+            name_m = re.search(r'tvg-name="([^"]+)"', line)
+            name = name_m.group(1).strip() if name_m else ""
+            if not name and "," in line:
+                name = line.split(",", 1)[1].strip()
+            url = ""
+            if i + 1 < len(lines) and lines[i + 1].strip().startswith("http"):
+                url = lines[i + 1].strip()
+            if url:
+                channels.append({"chno": chno, "name": name, "url": url})
+    return channels
+
+
+def resolve_channel(query: str, channels: list[dict[str, str]]) -> dict[str, str] | None:
+    q = query.strip()
+    m = re.match(r"^(\d+)\s*(.*)$", q)
+    if m:
+        cno = m.group(1)
+        for c in channels:
+            if c["chno"] == cno:
+                return c
+    for c in channels:
+        if c["chno"] == q or c["name"].lower() == q.lower():
+            return c
+    for c in channels:
+        if q.lower() in c["name"].lower():
+            return c
+    return None
+
+
+def parse_duration(dstr: str) -> int:
+    dstr = dstr.strip().lower()
+    if dstr.isdigit():
+        return int(dstr)
+    if ":" in dstr:
+        parts = [int(p) for p in dstr.split(":")]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+    m = re.match(r"^((?P<h>\d+(\.\d+)?)h)?\s*((?P<m>\d+)m(in)?)?\s*((?P<s>\d+)s)?$", dstr)
+    if m:
+        secs = 0
+        if m.group("h"):
+            secs += int(float(m.group("h")) * 3600)
+        if m.group("m"):
+            secs += int(m.group("m")) * 60
+        if m.group("s"):
+            secs += int(m.group("s"))
+        if secs > 0:
+            return secs
+    raise ValueError(f"Invalid duration format: {dstr}")
+
+
+def check_exclusion(start_dt: datetime, end_dt: datetime) -> tuple[bool, str]:
+    recs = jf_api("/LiveTv/Recordings?IsInProgress=true")
+    if recs and isinstance(recs, dict) and recs.get("Items"):
+        names = [r.get("Name", "unnamed") for r in recs["Items"]]
+        return False, f"Jellyfin recording currently in progress ({', '.join(names)})"
+
+    timers = jf_api("/LiveTv/Timers")
+    if timers and isinstance(timers, dict):
+        for t in timers.get("Items", []):
+            if t.get("Status") in ("Completed", "Cancelled", "Error"):
+                continue
+            try:
+                t_s = datetime.fromisoformat(t["StartDate"].replace("Z", "+00:00")) - timedelta(seconds=t.get("PrePaddingSeconds", 0))
+                t_e = datetime.fromisoformat(t["EndDate"].replace("Z", "+00:00")) + timedelta(seconds=t.get("PostPaddingSeconds", 0))
+            except Exception:
+                continue
+            if t_s < end_dt and t_e > start_dt:
+                t_name = t.get("Name", "unnamed")
+                return False, f"Overlapping Jellyfin timer '{t_name}' ({t_s.astimezone(LOCAL_TZ).strftime('%Y-%m-%d %H:%M')} to {t_e.astimezone(LOCAL_TZ).strftime('%H:%M')})"
+    return True, ""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Manual Capture Tool (MCT)")
+    parser.add_argument("-c", "--channel", required=True, help="Channel number or name (e.g. 121 or 'Milwaukee Brewers HD')")
+    parser.add_argument("-d", "--duration", required=True, help="Duration (e.g. 3h15m, 195m, 11700)")
+    parser.add_argument("-t", "--title", help="Recording title (e.g. 'Milwaukee Brewers at Chicago Cubs')")
+    parser.add_argument("--category", default="Sports", help="Category folder (default: Sports)")
+    parser.add_argument("--genre", default="Sports", help="Genre for NFO (default: Sports)")
+    parser.add_argument("--start-time", help="ISO start time for window calculation / naming (default: now)")
+    parser.add_argument("--dry-run", action="store_true", help="Show planned action without capturing or touching tuner")
+    args = parser.parse_args()
+
+    try:
+        duration_sec = parse_duration(args.duration)
+    except ValueError as exc:
+        log(f"ERROR: {exc}")
+        push_loki_alert(f"level=alert source=mct msg='Invalid duration: {args.duration}'")
+        return 1
+
+    try:
+        channels = parse_playlist()
+    except Exception as exc:
+        log(f"ERROR: Could not read playlist from CT 105: {exc}")
+        push_loki_alert(f"level=alert source=mct msg='Playlist read failure: {exc}'")
+        return 1
+
+    ch = resolve_channel(args.channel, channels)
+    if not ch:
+        log(f"ERROR: Could not resolve channel '{args.channel}' in playlist.m3u")
+        push_loki_alert(f"level=alert source=mct msg='Channel resolution failure for {args.channel}'")
+        return 1
+
+    now = datetime.now(LOCAL_TZ)
+    if args.start_time:
+        try:
+            start_dt = datetime.fromisoformat(args.start_time)
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=LOCAL_TZ)
+        except ValueError:
+            start_dt = now
+    else:
+        start_dt = now
+
+    end_dt = start_dt + timedelta(seconds=duration_sec)
+    title = args.title or ch["name"]
+    ts_str = start_dt.strftime("%Y_%m_%d_%H_%M_%S")
+    safe_title = re.sub(r'[/\\:*?"<>|]', "", title).strip()
+
+    container_dir = f"/media/recordings/{args.category}/{safe_title}"
+    ct105_dir = f"/srv/media-core{container_dir}"
+    base_file = f"{safe_title} {ts_str}"
+    raw_path = f"{container_dir}/{base_file}.raw.ts"
+    clean_path = f"{container_dir}/{base_file}.ts"
+    nfo_path = f"{container_dir}/{base_file}.nfo"
+    queue_entry = clean_path
+
+    ok, err = check_exclusion(start_dt.astimezone(timezone.utc), end_dt.astimezone(timezone.utc))
+    if not ok:
+        log(f"REFUSING CAPTURE: {err}")
+        push_loki_alert(f"level=alert source=mct msg='Refusing capture: {err}'")
+        return 2
+
+    ffmpeg_cmd = [
+        "/usr/sbin/pct", "exec", CT_ID, "--",
+        "docker", "exec", "jellyfin",
+        "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-y",
+        "-reconnect", "1", "-reconnect_streamed", "1",
+        "-reconnect_on_network_error", "1", "-reconnect_delay_max", "10",
+        "-rw_timeout", "15000000",
+        "-i", ch["url"],
+        "-t", str(duration_sec),
+        "-c", "copy",
+        raw_path,
+    ]
+
+    preremux_cmd = [
+        "/usr/sbin/pct", "exec", CT_ID, "--",
+        "docker", "exec", "jellyfin",
+        "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-y", "-v", "error",
+        "-err_detect", "ignore_err",
+        "-fflags", "+genpts+discardcorrupt",
+        "-i", raw_path,
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        clean_path,
+    ]
+
+    nfo_content = (
+        '<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n'
+        '<movie>\n'
+        f'  <title>{safe_title}</title>\n'
+        f'  <dateadded>{start_dt.strftime("%Y-%m-%d %H:%M:%S")}</dateadded>\n'
+        '  <plot />\n'
+        f'  <genre>{args.genre}</genre>\n'
+        '  <genre>Sports</genre>\n'
+        '  <lockdata>true</lockdata>\n'
+        '</movie>\n'
+    )
+
+    if args.dry_run:
+        log("=== MCT DRY RUN ===")
+        log(f"Channel:      {ch['chno']} {ch['name']}")
+        log(f"Stream URL:   {ch['url']}")
+        log(f"Start Time:   {start_dt.isoformat()}")
+        log(f"Duration:     {duration_sec}s ({timedelta(seconds=duration_sec)})")
+        log(f"Target TS:    {clean_path}")
+        log(f"Target NFO:   {nfo_path}")
+        log(f"Comskip Q:    {queue_entry}")
+        log(f"Exclusion:    PASS (no overlapping Jellyfin timers or active recordings)")
+        log(f"FFmpeg CMD:   {' '.join(ffmpeg_cmd)}")
+        log(f"Pre-remux:    {' '.join(preremux_cmd)}")
+        return 0
+
+    log(f"Starting capture: {title} on {ch['chno']} {ch['name']} ({duration_sec}s)")
+    subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "mkdir", "-p", ct105_dir], check=True)
+
+    res = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        log(f"ERROR: ffmpeg capture exited with code {res.returncode}: {res.stderr.strip()[-300:]}")
+        push_loki_alert(f"level=alert source=mct msg='ffmpeg capture failed on {ch['name']}: {res.stderr.strip()[-200:]}'")
+        return 4
+
+    log(f"Capture completed. Pre-remuxing to normalise DTS: {clean_path}")
+    res_remux = subprocess.run(preremux_cmd, capture_output=True, text=True)
+    if res_remux.returncode != 0:
+        log(f"ERROR: Pre-remux failed: {res_remux.stderr.strip()[-300:]}")
+        push_loki_alert(f"level=alert source=mct msg='Pre-remux failed on {clean_path}'")
+        return 5
+
+    # Remove raw file after successful pre-remux
+    subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "rm", "-f", f"/srv/media-core{raw_path}"], check=False)
+
+    # Write NFO metadata
+    write_nfo_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{nfo_path}'"]
+    subprocess.run(write_nfo_cmd, input=nfo_content, text=True, check=True)
+    log(f"Wrote NFO: {nfo_path}")
+
+    # Enqueue for comskip postprocessing
+    enqueue_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"echo '{clean_path}' >> /srv/media-core/media/recordings/.postprocess/queue"]
+    subprocess.run(enqueue_cmd, check=True)
+    log(f"Enqueued for comskip: {clean_path}")
+
+    # Refresh Jellyfin library
+    jf_api("/Library/Refresh", method="POST")
+    log("Capture and post-processing pipeline complete.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
