@@ -1335,3 +1335,9 @@ When the IPTV provider blocks a VPN exit IP, all stream `.ts` endpoints return `
 Bounce WireGuard tunnel 2430 (`wgclient1`) on the GL.iNet router (`192.168.9.1`) via `gl-session` to draw a fresh IP from Surfshark's Zurich pool. Note this **will recur** periodically as Surfshark rotates IP addresses.
 
 
+
+## MCT auto-extend: clamp before launching, stop cleanly via stdin 'q' (2026-09-03)
+
+1. **Single-tuner auto-extension must clamp before ffmpeg launch.** In a single-connection IPTV setup, an auto-extending capture running past its nominal duration into the start window of a scheduled Jellyfin recording or MCT booking silently destroys that subsequent recording. MCT calculates a hard cap (`nominal + max_extension`) and strictly clamps it against `min(upcoming_timer_start - prepadding)` before launching ffmpeg with `-t <hard_cap>`. Even if the supervisor crashes, ffmpeg self-terminates at the hard cap without colliding with the next timer or filling the disk.
+2. **Clean ffmpeg container finalization requires `docker exec -i`.** When driving ffmpeg inside a Docker container via `pct exec <id> -- docker exec -i <container> ffmpeg ...`, interactive stdin (`-i`) is required so sending `q\n` on stdin cleanly closes the TS container and generates valid muxing headers without dropping frames or corrupting timestamps.
+3. **Safe `<lockdata>` handling in NFO.** Setting `<lockdata>true</lockdata>` on an empty NFO permanently freezes the empty state in Jellyfin and prevents future scraper enrichment. Only set `<lockdata>true</lockdata>` once real EPG plot, genres, and `poster.jpg` are populated on disk.
