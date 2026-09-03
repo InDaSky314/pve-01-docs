@@ -98,3 +98,54 @@ plane.
 
 **Prerequisite before any of that is worth writing:** resolve why an independent client cannot
 fetch the stream at all. Until that is understood, a manual tool cannot be built either.
+
+## RESOLVED 2026-09-03 — ffmpeg in-file reconnect WORKS
+
+Fourth attempt, first valid one. Live channel confirmed streaming at ~1x before severing
+(the gate that voided attempt three), then a **60s** iptables DROP — comfortably exceeding the
+15s `-rw_timeout`.
+
+```
+-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1
+-reconnect_delay_max 10 -rw_timeout 15000000 -c copy
+```
+
+**Result: reconnected inside the same file.** Growth resumed ~3s after the network returned;
+the file went 64.7 MB -> 111.1 MB with no split. Independently verified: 116,523,528 bytes,
+`duration=240.047678` against `-t 240` — the requested length exactly.
+
+That overturns three earlier conclusions, all of which were mine or agy's:
+
+* my "reconnect FAILED" (attempt 1) — the provider was down, nothing was tested
+* my near-miss on attempt 3 — ffmpeg had *completed* at `speed=509x`, not stalled
+* agy's dissent that DTS corruption made this unsafe — the catastrophic case did not occur
+
+### One correction to the pass, and it matters
+
+agy reported "**0** DTS/PTS discontinuities". That is **not** right. Re-muxing the capture
+produces **4,556** `Application provided invalid, non monotonically increasing dts to muxer`
+warnings. My own follow-up grep reported "0 hard timeline errors", which was also wrong — it
+searched for `non-monotonous` while ffmpeg emits `non monotonically increasing`. Two opposite
+errors, both from pattern-matching instead of reading the output.
+
+The substantive risk nevertheless did **not** materialise. The 2026-08-17 precedent was a
+*catastrophic* timeline break — `ffprobe` reporting 17.3h for a 3h game. Here the duration is
+exactly correct, so the DTS irregularity is the ordinary kind seen in live MPEG-TS captures,
+not corruption.
+
+**Implication:** pre-remux before comskip, which `perform_ffmpeg_concat` already does. Do not
+feed a raw reconnected capture straight into post-processing without it.
+
+### HLS is worse, not better
+
+The provider advertises `m3u8`, and an HLS client re-fetching a playlist *sounds* more
+drop-tolerant. Measured, it is not: streamcopying HLS produces missing SPS/PPS slice headers
+across segment transitions. **Direct TS with `-reconnect` is cleaner.** A reasonable hypothesis,
+disproved by testing.
+
+### What this changes
+
+Recovery for an in-file reconnect is **~3s**, against ~122s for Jellyfin's cancel-and-recreate
+path — because it skips detection latency, the 60s timer quantization, and the segment split
+entirely. For overnight sport, where watch-while-recording does not apply, a manual capture
+tool is now genuinely worth building.
