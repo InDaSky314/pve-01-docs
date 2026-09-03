@@ -38,6 +38,14 @@ MAILTO = "nathan.karras@gmail.com"
 AGY_TASK = "/root/bin/agy-task.sh"
 AGY_TIMEOUT_MIN = 20
 
+# Source allowlist added 2026-09-03 after a security review flagged this listener
+# as an unauthenticated remote-execution vector: it binds 0.0.0.0:9106 and a bare
+# POST dispatches an agy job and sends outbound mail, so anyone on the LAN or the
+# tailnet could trigger both. Grafana is the only legitimate caller and it runs on
+# CT 107. Source-IP allowlisting is used rather than a shared secret because it
+# needs no change to Grafana's contact point (whose admin password we do not hold).
+ALLOWED_SOURCES = {"127.0.0.1", "::1", "::ffff:127.0.0.1", "192.168.9.164"}
+
 
 def load_cooldowns() -> dict:
     f = STATE_DIR / "cooldowns.json"
@@ -109,8 +117,8 @@ def render_html_email(subject: str, body_lines: list[str]) -> str:
         )
         summary_block = f"""\
   <div style="padding:4px 24px 18px 24px;">
-    <div style="background:#eef4ff;border:1px solid #d6e4ff;border-radius:8px;padding:16px 18px;
-                color:#1a1d29;font-size:14.5px;line-height:1.6;">{summary_html}</div>
+    <div style="background:#eef4ff;border-left:4px solid #2f6fed;border-radius:6px;padding:16px 18px;
+                color:#1a1d29;font-size:14.5px;line-height:1.6;"><div style="color:#1d4ed8;font-size:11px;font-weight:700;letter-spacing:.08em;margin-bottom:8px;">SUMMARY</div>{summary_html}</div>
   </div>"""
         details_label = "Full technical details"
     else:
@@ -242,6 +250,18 @@ def dispatch_and_notify(alertname: str, summary: str, labels: dict) -> None:
 
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
+        src = self.client_address[0] if self.client_address else "?"
+        if src not in ALLOWED_SOURCES:
+            # Drain the body so the client gets a clean 403 rather than a reset.
+            try:
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            except Exception:                               # noqa: BLE001
+                pass
+            print(f"REJECTED POST from {src} (not in ALLOWED_SOURCES)", flush=True)
+            self.send_response(403)
+            self.end_headers()
+            self.wfile.write(b"forbidden")
+            return
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length)
         self.send_response(200)

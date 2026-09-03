@@ -38,7 +38,7 @@ See `docs/handoff-20260804.md` for the current state and
 | Health check | `curl -so /dev/null -w '%{http_code}' http://192.168.9.50:8096` → 200; same for `:34400/web/` |
 | Sync (playlist/EPG/VOD) | `systemctl status media-core-sync.timer` in CT; manual run: `python3 /srv/media-core/sync/xtream-sync.py` |
 | Threadfin auto-recovery | `systemctl status media-core-healthcheck.timer` (every 5 min) + `media-core-guard.timer` (every 1 min, pre-recording) in CT |
-| VPN check | `pct exec 105 -- wget -qO- https://am.i.mullvad.net/json` → must say Switzerland |
+| VPN check | `pct exec 105 -- wget -qO- https://am.i.mullvad.net/json` → must say Switzerland (public IP-check service; the VPN provider is **Surfshark**) |
 | Recordings SMB share | `\\192.168.9.50\recordings` — user `tivimate` (password not in this repo) |
 
 ## 2. Hardware & host
