@@ -32,6 +32,7 @@ import json
 import os
 import re
 import shutil
+import urllib.request
 import subprocess
 import sys
 import time
@@ -149,6 +150,32 @@ def output_path_for(host_path):
     parts = rel.split(os.sep)
     parts[-1] = os.path.splitext(parts[-1])[0] + ".mkv"
     return os.path.join(RECORDINGS, COMFREE_ROOT, *parts)
+
+
+def jellyfin_refresh():
+    """Ask Jellyfin to rescan after a commercial-free file lands.
+
+    The Recordings library points at COMFREE_ROOT as of 2026-09-03, and
+    EnableRealtimeMonitor is off for it, so without this a finished recording stays
+    invisible until the next daily scan -- an overnight game would not show up until
+    the following afternoon. This is a single HTTP POST from CT105; it does not run
+    anything inside the jellyfin container, so the "never touches the container"
+    property at the top of this file still holds.
+    """
+    try:
+        key = open("/srv/media-core/.jellyfin_api_key").read().strip()
+    except Exception:
+        return
+    if not key:
+        return
+    req = urllib.request.Request(
+        "http://127.0.0.1:8096/Library/Refresh",
+        method="POST", data=b"", headers={"X-Emby-Token": key, "Content-Length": "0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20):
+            log("jellyfin: library refresh requested")
+    except Exception as e:
+        log(f"WARN (jellyfin refresh failed, file is on disk): {e}")
 
 
 def copy_sidecars(src_media, out_path):
@@ -381,6 +408,7 @@ def process_one(container_path):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     shutil.move(tmp_out, out_path)
     copy_sidecars(host_path, out_path)
+    jellyfin_refresh()
     # keep the EDL next to the log for future tuning
     shutil.copy(edl, os.path.join(LOG_DIR, os.path.basename(edl)))
     shutil.rmtree(job_work, ignore_errors=True)
