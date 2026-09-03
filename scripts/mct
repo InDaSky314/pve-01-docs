@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import re
+import time
 import subprocess
 import sys
 import urllib.request
@@ -238,11 +239,31 @@ def main() -> int:
     nfo_path = f"{container_dir}/{base_file}.nfo"
     queue_entry = clean_path
 
+    # --start-time used to affect only the filename and the exclusion window: nothing
+    # ever waited, so a future start time produced a file NAMED for kickoff holding
+    # content captured at the moment you ran the command. Re-check exclusion after
+    # sleeping, because a Jellyfin timer can be created while we wait.
+    MAX_WAIT_SECONDS = 12 * 3600
+    lead = (start_dt - datetime.now(LOCAL_TZ)).total_seconds()
+    if lead > MAX_WAIT_SECONDS:
+        log(f"REFUSING CAPTURE: start time is {lead/3600:.1f}h away (max {MAX_WAIT_SECONDS/3600:.0f}h). "
+            f"Book it through the DVR dashboard instead of holding a process open that long.")
+        return 2
+
     ok, err = check_exclusion(start_dt.astimezone(timezone.utc), end_dt.astimezone(timezone.utc))
     if not ok:
         log(f"REFUSING CAPTURE: {err}")
         push_loki_alert(f"level=alert source=mct msg='Refusing capture: {err}'")
         return 2
+
+    if lead > 1 and not args.dry_run:
+        log(f"Waiting {lead:.0f}s until {start_dt.isoformat()} before opening the tuner")
+        time.sleep(lead)
+        ok, err = check_exclusion(start_dt.astimezone(timezone.utc), end_dt.astimezone(timezone.utc))
+        if not ok:
+            log(f"REFUSING CAPTURE: {err} (appeared while waiting for start time)")
+            push_loki_alert(f"level=alert source=mct msg='Refusing capture after wait: {err}'")
+            return 2
 
     ffmpeg_cmd = [
         "/usr/sbin/pct", "exec", CT_ID, "--",
