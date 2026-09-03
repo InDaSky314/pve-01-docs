@@ -95,7 +95,18 @@ STALL_MIN_GROWTH_BYTES = 2_000_000
 # brief provider hiccup that would have self-healed -- and a false restore
 # is expensive (it splits the recording and forces a stitch). That is what
 # STALL_STRIKES_REQUIRED below is for: confirm, then act.
-STALL_MIN_CHECK_GAP = timedelta(seconds=80)
+# 2026-09-03: 80s -> 30s. Detection, not reconnection, was the dominant cost of the
+# 4m43s gap on the Brewers @ Cubs stall: 2 strikes x 80s = ~160s floor, observed 221s.
+# The two-strike rule is what protects against false restores -- the GAP is what made it
+# slow -- so both strikes are kept and only the sampling interval tightens. Detection
+# floor becomes ~60s. Headroom on STALL_MIN_GROWTH_BYTES is still an order of magnitude:
+# this system records at ~600-750 KB/s, so 30s of healthy recording is ~18-22 MB against
+# an unchanged 2 MB threshold (~10%), versus ~48 MB (~4%) at 80s.
+# The stallwatch timer cadence drops to 30s to match -- a gap this short is pointless if
+# samples are still 90s apart. Measured cost of --stall-check-only is ~1.25s CPU per run,
+# so 30s cadence is ~4% of one core, up from ~1.4%.
+# Revert: set this back to 80 and the timer's OnUnitActiveSec back to 90s.
+STALL_MIN_CHECK_GAP = timedelta(seconds=30)
 # Consecutive stalled samples required before a restore is triggered. Two
 # samples at an 80s floor means a stall must persist ~160s to be believed,
 # while a one-off hiccup between samples costs nothing at all.

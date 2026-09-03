@@ -170,3 +170,45 @@ Phases 1 and 2 as originally written are moot; there is nothing to probe. What r
 instrument `active_cons` at stall-detection time and observe it across several real stalls
 before changing any behaviour based on it.
 
+## Option A applied — 2026-09-03
+
+`STALL_MIN_CHECK_GAP` 80s -> 30s, `STALL_STRIKES_REQUIRED` unchanged at 2, and
+`sports-dvr-stallwatch.timer` `OnUnitActiveSec` 90s -> 30s (a 30s gap is pointless if samples
+are still 90s apart).
+
+Cost measured rather than assumed: `--stall-check-only` consumes **~1.19-1.25s CPU per run**,
+so 30s cadence is ~4% of one core, up from ~1.4%. The 3.5s figure quoted in earlier notes was
+the *full* run, not the stall check. Verified running clean at the new cadence with no false
+stalls.
+
+Detection floor: ~160s -> ~60s. Expected total gap ~122s versus the 283s measured on the
+Brewers stall.
+
+**Revert:** `STALL_MIN_CHECK_GAP = timedelta(seconds=80)` and `OnUnitActiveSec=90s`, then
+`systemctl daemon-reload`. Backups at `sports-dvr-auto.pre-optiona-20260903` and
+`/root/sports-dvr-stallwatch.timer.pre-optiona-20260903`.
+
+## Threadfin is already out of the data path — what that means
+
+Established while testing: a clean request to a Threadfin stream endpoint returns
+**HTTP 302 with a `Location:` pointing straight at the provider**. Threadfin is configured
+`buffer: "-"`, so it is a pure redirector — Jellyfin follows the 302 and pulls the bytes from
+the provider itself.
+
+**So there is no Threadfin hop to remove.** The only component in the data path is Jellyfin's
+own HTTP client. Any "record outside the ecosystem" idea therefore does not gain reliability by
+removing a component; it gains only if the replacement *client* is more robust.
+
+### The 511s were self-inflicted
+
+Repeated `HTTP 511 Network Authentication Required` during testing was **tuner contention from
+the tests themselves**, not a provider block and not a client-identity problem. Threadfin
+advertises `TunerCount: 1`, the subscription is `max_connections=1`, and a probe that leaves a
+slot occupied makes the next request fail. A single clean request after a pause returns 302
+normally, with `active_cons=0` on the provider side throughout.
+
+Correcting the Phase 0 write-up above: "the endpoint refuses out-of-band clients" was the wrong
+conclusion. The right one is **"you get one connection, and a probe spends it."** That is a
+stronger argument against probing than the original finding, and it also explains agy's
+concurrency objection being directionally right for the wrong reason.
+

@@ -3,7 +3,7 @@ Description=Run the fast DVR stall watchdog every 90s
 
 [Timer]
 OnBootSec=3min
-OnUnitActiveSec=90s
+OnUnitActiveSec=30s
 AccuracySec=15s
 
 [Install]
