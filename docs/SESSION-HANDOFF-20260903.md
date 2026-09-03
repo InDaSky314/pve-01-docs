@@ -44,10 +44,19 @@ streamed fine while our Swiss tunnel IP got 511; same country, same VPN vendor, 
    `provider_stream_up`, `provider_active_cons`, `provider_days_to_expiry` to
    `/root/bin/stack-monitor.py`, plus `docs/provider-ip-block-20260903.md`. Verify its work,
    then commit. Report lands in `/root/agy-reports/`.
-2. **ffmpeg reconnect experiment** — `/tmp/claude-0/.../scratchpad/rec3.sh`, log at
-   `/tmp/rec3.log`. Records via the Threadfin 302, severs the provider 40s with iptables, and
-   measures whether ffmpeg heals **inside one file**. Earlier attempts were void because the
-   provider was down; this is the first valid run. **Check `/tmp/rec3.log`.**
+2. **ffmpeg reconnect experiment — STILL UNRESOLVED after three attempts.** Each failed for a
+   different reason, and each nearly produced a false conclusion:
+   * attempt 1: provider was down (511) — tested nothing, but reported "reconnect FAILED"
+   * attempt 2: added a flow gate, correctly aborted (stream never started)
+   * attempt 3 (2026-09-03 11:47): stream DID flow, but ffmpeg reported `speed=509x` and
+     finished the full `-t 300` in ~12s with **0 reconnect attempts**. That channel serves a
+     cached/looped chunk, not a 1x live feed, so ffmpeg exited normally before the sever
+     mattered. "did not recover" was a completed process misread as a stalled one.
+
+   **For the next attempt: verify the channel streams at ~1x BEFORE severing.** Check ffmpeg's
+   `speed=` field — it must be near 1.0x. Anything much above that is not a live feed and the
+   test is void. Pick a genuine live channel (news/sport currently airing), confirm ~1x for
+   30s, and only then sever.
 
 ## Next: the manual capture tool (owner wants this)
 
