@@ -5,6 +5,7 @@ Monitors:
 1. Recording sanity (detects fragmented/multi-file recordings & undersized recordings in /srv/shared-recordings)
 2. Stack health (probes jellyfin-live, jellyfin-vod, jellyfin-npvr, nextpvr-live HTTP endpoints)
 3. EPG freshness per stack (measures EPG file modification age in hours)
+4. IPTV provider health (probes player_api.php auth/status, days to expiry, active connections, and stream playability via CT 105 Swiss egress)
 
 Exposes Prometheus metrics on port 9105 and sends alert events to Loki on CT 107 (192.168.9.164:3100).
 """
@@ -53,7 +54,126 @@ metrics_data = {
     "recording_sanity_ok": 1,
     "recording_fragment_count": 0,
     "recording_undersized_count": 0,
+    "provider_api_up": None,
+    "provider_stream_up": None,
+    "provider_active_cons": None,
+    "provider_days_to_expiry": None,
 }
+
+_last_provider_api_probe = 0.0
+_last_provider_stream_probe = 0.0
+PROVIDER_API_INTERVAL = 60.0       # Probe API every 60s (free/lightweight)
+PROVIDER_STREAM_INTERVAL = 900.0   # Probe stream every 15m (infrequent to protect 1-tuner limit)
+
+CT105_PROBE_SCRIPT = r"""
+import json, sys, time, urllib.request, subprocess
+from pathlib import Path
+
+probe_stream = (len(sys.argv) > 1 and sys.argv[1] == "1")
+
+res = {
+    "api_up": 0,
+    "active_cons": None,
+    "days_to_expiry": None,
+    "stream_up": None,
+    "ffmpeg_active": 0,
+    "stream_skipped": None,
+    "error": None
+}
+
+try:
+    p = subprocess.run(["pgrep", "-c", "-x", "ffmpeg"], capture_output=True, text=True)
+    if p.returncode == 0 and int(p.stdout.strip() or 0) > 0:
+        res["ffmpeg_active"] = int(p.stdout.strip())
+except Exception:
+    pass
+
+env_file = Path("/srv/media-core/.env")
+if not env_file.exists():
+    res["error"] = "env_file_missing"
+    print(json.dumps(res))
+    sys.exit(0)
+
+env = {}
+for line in env_file.read_text().splitlines():
+    line = line.strip()
+    if line and not line.startswith("#") and "=" in line:
+        k, v = line.split("=", 1)
+        env[k.strip()] = v.strip()
+
+base = env.get("XTREAM_BASE", "").rstrip("/")
+user = env.get("XTREAM_USER", "")
+pw = env.get("XTREAM_PASS", "")
+
+if not (base and user and pw):
+    res["error"] = "env_credentials_incomplete"
+    print(json.dumps(res))
+    sys.exit(0)
+
+# 1. API Probe
+api_url = f"{base}/player_api.php?username={user}&password={pw}"
+req = urllib.request.Request(api_url, headers={"User-Agent": "MediaCoreSync/1.0"})
+try:
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.load(resp)
+    uinfo = data.get("user_info", {})
+    auth = int(uinfo.get("auth", 0))
+    status = str(uinfo.get("status", ""))
+    if auth == 1 and status.lower() == "active":
+        res["api_up"] = 1
+    else:
+        res["api_up"] = 0
+
+    try:
+        res["active_cons"] = int(uinfo.get("active_cons", 0))
+    except (ValueError, TypeError):
+        pass
+
+    exp_raw = uinfo.get("exp_date")
+    if exp_raw:
+        try:
+            exp_ts = float(exp_raw)
+            res["days_to_expiry"] = round((exp_ts - time.time()) / 86400.0, 2)
+        except (ValueError, TypeError):
+            pass
+except Exception as e:
+    res["api_up"] = 0
+    res["error"] = str(e)
+    print(json.dumps(res))
+    sys.exit(0)
+
+# 2. Stream Probe (only when requested and tuner is idle)
+if probe_stream:
+    if (res.get("active_cons") or 0) > 0 or res.get("ffmpeg_active", 0) > 0:
+        res["stream_skipped"] = "tuner_busy"
+        print(json.dumps(res))
+        sys.exit(0)
+
+    stream_url = None
+    m3u = Path("/srv/media-core/threadfin/conf/playlist.m3u")
+    if m3u.exists():
+        for line in m3u.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("http://") and line.endswith(".ts"):
+                stream_url = line
+                break
+    if not stream_url:
+        stream_url = f"{base}/live/{user}/{pw}/430234.ts"
+
+    s_req = urllib.request.Request(stream_url, headers={"User-Agent": "MediaCoreSync/1.0"})
+    try:
+        with urllib.request.urlopen(s_req, timeout=10) as s_resp:
+            if s_resp.status == 200:
+                chunk = s_resp.read(8192)
+                res["stream_up"] = 1 if len(chunk) > 0 else 0
+            else:
+                res["stream_up"] = 0
+    except Exception as e:
+        res["stream_up"] = 0
+        res["stream_error"] = str(e)
+
+print(json.dumps(res))
+"""
 
 def push_loki_log(job, level, msg, extra_labels=None):
     labels = {"job": job, "host": "pve-01", "level": level}
@@ -77,6 +197,86 @@ def push_loki_log(job, level, msg, extra_labels=None):
         urllib.request.urlopen(req, timeout=5)
     except Exception:
         pass
+
+def check_jellyfin_recording_in_progress():
+    """Check if Jellyfin has active in-progress recordings."""
+    key = None
+    for p in ["/etc/media-core/jellyfin-prod.key", "/srv/media-core/.jellyfin_api_key"]:
+        try:
+            if os.path.exists(p):
+                with open(p) as f:
+                    k = f.read().strip()
+                    if k:
+                        key = k
+                        break
+        except Exception:
+            pass
+    if not key:
+        return None
+
+    url = "http://192.168.9.50:8096/LiveTv/Recordings?IsInProgress=true&Limit=1"
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f'MediaBrowser Token="{key}"', "User-Agent": "StackMonitor/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.load(resp)
+            return data.get("TotalRecordCount", 0) > 0
+    except Exception:
+        return None
+
+def check_provider_health():
+    global _last_provider_api_probe, _last_provider_stream_probe
+    now = time.time()
+
+    # Rate-limit API probe
+    if now - _last_provider_api_probe < PROVIDER_API_INTERVAL:
+        return
+
+    # Determine if stream probe is due (infrequent: every 15 min)
+    stream_due = (now - _last_provider_stream_probe >= PROVIDER_STREAM_INTERVAL)
+    should_probe_stream = False
+
+    if stream_due:
+        rec_in_progress = check_jellyfin_recording_in_progress()
+        # Only probe stream if recordings check explicitly returned False (idle)
+        if rec_in_progress is False:
+            should_probe_stream = True
+
+    cmd = ["pct", "exec", "105", "--", "python3", "-c", CT105_PROBE_SCRIPT, "1" if should_probe_stream else "0"]
+    try:
+        out = subprocess.check_output(cmd, timeout=25).decode().strip()
+        _last_provider_api_probe = now
+        res = json.loads(out)
+    except Exception:
+        # Fail soft on container exec failure or container stopped
+        return
+
+    # Update API gauge
+    if res.get("api_up") is not None:
+        metrics_data["provider_api_up"] = res["api_up"]
+        if res["api_up"] == 0:
+            push_loki_log("provider-health", "error", f"event=provider_api_down error={res.get('error')}", {"event": "provider_api_down"})
+
+    # Update active connections gauge
+    if res.get("active_cons") is not None:
+        metrics_data["provider_active_cons"] = res["active_cons"]
+
+    # Update days to expiry gauge
+    if res.get("days_to_expiry") is not None:
+        metrics_data["provider_days_to_expiry"] = res["days_to_expiry"]
+
+    # Update stream gauge if probed
+    if should_probe_stream:
+        if res.get("stream_up") is not None:
+            metrics_data["provider_stream_up"] = res["stream_up"]
+            _last_provider_stream_probe = now
+            if res["stream_up"] == 0:
+                push_loki_log("provider-health", "error", f"event=provider_stream_down error={res.get('stream_error')}", {"event": "provider_stream_down"})
+        elif res.get("stream_skipped"):
+            # Tuner busy inside CT 105; skip and retry next cycle
+            pass
 
 def check_recording_sanity():
     base_dir = "/srv/shared-recordings"
@@ -236,6 +436,26 @@ class MetricsHandler(BaseHTTPRequestHandler):
             lines.append(f'recording_fragment_count {metrics_data["recording_fragment_count"]}')
             lines.append(f'recording_undersized_count {metrics_data["recording_undersized_count"]}')
 
+            if metrics_data["provider_api_up"] is not None:
+                lines.append("# HELP provider_api_up Provider Xtream API reachable and authenticated (1 = up, 0 = down)")
+                lines.append("# TYPE provider_api_up gauge")
+                lines.append(f'provider_api_up {metrics_data["provider_api_up"]}')
+
+            if metrics_data["provider_stream_up"] is not None:
+                lines.append("# HELP provider_stream_up Provider live stream playable (1 = up, 0 = down)")
+                lines.append("# TYPE provider_stream_up gauge")
+                lines.append(f'provider_stream_up {metrics_data["provider_stream_up"]}')
+
+            if metrics_data["provider_active_cons"] is not None:
+                lines.append("# HELP provider_active_cons Active connections on IPTV provider account")
+                lines.append("# TYPE provider_active_cons gauge")
+                lines.append(f'provider_active_cons {metrics_data["provider_active_cons"]}')
+
+            if metrics_data["provider_days_to_expiry"] is not None:
+                lines.append("# HELP provider_days_to_expiry Days until IPTV provider subscription expires")
+                lines.append("# TYPE provider_days_to_expiry gauge")
+                lines.append(f'provider_days_to_expiry {metrics_data["provider_days_to_expiry"]}')
+
             content = "\n".join(lines) + "\n"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
@@ -255,6 +475,7 @@ def run_loop():
             check_recording_sanity()
             check_epg_freshness()
             check_epg_coverage()
+            check_provider_health()
         except Exception:
             pass
         time.sleep(30)
@@ -265,6 +486,7 @@ if __name__ == "__main__":
         check_recording_sanity()
         check_epg_freshness()
         check_epg_coverage()
+        check_provider_health()
     except Exception:
         pass
     t = threading.Thread(target=run_loop, daemon=True)
