@@ -42,6 +42,10 @@ JF_KEY_FILE = Path("/srv/media-core/.jellyfin_api_key")
 CT_ID = "105"
 MCT_BOOKINGS_FILE = Path("/var/lib/dvr-dashboard/mct-bookings.json")
 SPORTS_DVR_AUTO_SCRIPT = Path("/usr/local/bin/sports-dvr-auto")
+MAX_RESTARTS = 4
+MIN_RESTART_REMAINING_SEC = 60
+RESTART_BACKOFF_BASE_SEC = 5.0
+_SPORTS_DVR_AUTO_MOD: Any = None
 
 
 def _redact_url(text: str) -> str:
@@ -236,19 +240,43 @@ def check_exclusion(start_dt: datetime, end_dt: datetime,
     return True, ""
 
 
-def load_espn_schedule() -> list[dict[str, Any]]:
-    """Reuse ESPN schedule plumbing from sports-dvr-auto."""
+def _find_sports_dvr_auto_script() -> Path:
     if SPORTS_DVR_AUTO_SCRIPT.exists():
+        return SPORTS_DVR_AUTO_SCRIPT
+    local_script = Path(__file__).resolve().parent / "sports-dvr-auto"
+    if local_script.exists():
+        return local_script
+    return SPORTS_DVR_AUTO_SCRIPT
+
+
+def get_sports_dvr_auto_module() -> Any:
+    """Dynamically import and cache sports-dvr-auto module."""
+    global _SPORTS_DVR_AUTO_MOD
+    if _SPORTS_DVR_AUTO_MOD is not None:
+        return _SPORTS_DVR_AUTO_MOD
+    script_path = _find_sports_dvr_auto_script()
+    if script_path.exists():
         try:
-            loader = importlib.machinery.SourceFileLoader("sports_dvr_auto", str(SPORTS_DVR_AUTO_SCRIPT))
-            spec = importlib.util.spec_from_file_location("sports_dvr_auto", str(SPORTS_DVR_AUTO_SCRIPT), loader=loader)
+            loader = importlib.machinery.SourceFileLoader("sports_dvr_auto", str(script_path))
+            spec = importlib.util.spec_from_file_location("sports_dvr_auto", str(script_path), loader=loader)
             if spec and spec.loader:
                 mod = importlib.util.module_from_spec(spec)
                 loader.exec_module(mod)
-                if hasattr(mod, "fetch_espn_schedule"):
-                    return mod.fetch_espn_schedule()
+                _SPORTS_DVR_AUTO_MOD = mod
+                return mod
         except Exception as exc:
-            log(f"WARNING: Could not import sports-dvr-auto ({exc}), falling back to direct ESPN API")
+            log(f"WARNING: Could not import sports-dvr-auto ({exc})")
+    return None
+
+
+def load_espn_schedule() -> list[dict[str, Any]]:
+    """Reuse ESPN schedule plumbing from sports-dvr-auto."""
+    mod = get_sports_dvr_auto_module()
+    if mod and hasattr(mod, "fetch_espn_schedule"):
+        try:
+            return mod.fetch_espn_schedule()
+        except Exception as exc:
+            log(f"WARNING: fetch_espn_schedule failed ({exc}), falling back to direct ESPN API")
 
     # Direct ESPN fallback if sports-dvr-auto is unavailable
     games: list[dict[str, Any]] = []
@@ -750,6 +778,195 @@ def finalize_and_promote_capture(
     return True
 
 
+def derive_stitched_path_name(clean_path: str) -> str:
+    mod = get_sports_dvr_auto_module()
+    if mod and hasattr(mod, "derive_stitched_path"):
+        return mod.derive_stitched_path(clean_path)
+    p = Path(clean_path)
+    return str(p.with_name(f"{p.stem} (stitched).mkv"))
+
+
+def probe_ct_duration(path_in_ct: str) -> float:
+    """Probe duration of media file in seconds inside CT 105."""
+    cmd = [
+        "/usr/sbin/pct", "exec", CT_ID, "--",
+        "docker", "exec", "jellyfin",
+        "/usr/lib/jellyfin-ffmpeg/ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path_in_ct,
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if res.returncode == 0 and res.stdout.strip():
+            return float(res.stdout.strip())
+    except Exception:
+        pass
+    return -1.0
+
+
+def concat_and_stitch_segments(
+    segment_paths: list[str],
+    clean_path: str,
+    start_dt: datetime,
+    poster_path: str,
+    meta: dict[str, Any],
+    title: str,
+    container_dir: str,
+) -> bool:
+    """Stitch multiple segments using sports-dvr-auto's proven concat machinery.
+
+    Follows sports-dvr-auto and process-queue precedents:
+    1. perform_ffmpeg_concat: per-segment pre-remux via preremux_segment_on_ct105
+       into MKV (with split-stream fallback for torn AAC packets), then concat demuxer.
+    2. Guard against MKV concat silent truncation (Line ~2575 in sports-dvr-auto):
+       checks that stitched duration matches combined segment duration.
+    3. Write NFO and poster for stitched file.
+    4. archive_segments: moves raw segments out of /media/recordings into /media/segments-archive
+       so they are not indexed as duplicate recordings.
+    5. Enqueues the STITCHED file for comskip - not the individual segments.
+    6. Never lose a segment: if stitch fails, rescues every individual segment as a playable
+       .ts with sidecar NFO and comskip queue entry, and alerts user via Loki.
+    """
+    mod = get_sports_dvr_auto_module()
+    if not mod or not hasattr(mod, "perform_ffmpeg_concat"):
+        log("ERROR: sports-dvr-auto module unavailable for perform_ffmpeg_concat. Triggering segment rescue.")
+        _rescue_segments(segment_paths, start_dt, meta, title, container_dir, poster_path, "sports-dvr-auto unavailable")
+        return False
+
+    stitched_path = derive_stitched_path_name(clean_path)
+    log(f"Stitching {len(segment_paths)} segments into {stitched_path}...")
+
+    # Calculate expected duration to catch silent MKV concat truncation (Line ~2575)
+    expected_dur = 0.0
+    for s_path in segment_paths:
+        d = probe_ct_duration(s_path)
+        if d > 0:
+            expected_dur += d
+    log(f"Combined expected duration across {len(segment_paths)} segments: ~{expected_dur:.1f}s")
+
+    concat_ok, concat_err = mod.perform_ffmpeg_concat(segment_paths, stitched_path)
+
+    if concat_ok:
+        stitched_dur = probe_ct_duration(stitched_path)
+        log(f"Probed stitched duration: {stitched_dur:.1f}s")
+        if expected_dur > 30 and stitched_dur > 0 and stitched_dur < (expected_dur - 15) and stitched_dur < (expected_dur * 0.85):
+            concat_ok = False
+            concat_err = (f"Stitched duration ({stitched_dur:.1f}s) is significantly shorter than combined "
+                          f"segment duration ({expected_dur:.1f}s) -- concat silently truncated at a bad segment")
+            log(f"ERROR: {concat_err}")
+
+    if concat_ok:
+        # Write stitched NFO
+        stitched_nfo_path = str(Path(stitched_path).with_suffix(".nfo"))
+        stitched_stem = Path(stitched_path).stem
+        stitched_nfo_xml = build_nfo_xml(stitched_stem, start_dt, meta["plot"], meta["genres"], meta["lockdata"])
+        try:
+            write_nfo_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{stitched_nfo_path}'"]
+            subprocess.run(write_nfo_cmd, input=stitched_nfo_xml, text=True, check=True)
+            log(f"Wrote stitched NFO: {stitched_nfo_path}")
+        except Exception as exc:
+            log(f"WARNING: Failed writing stitched NFO: {exc}")
+
+        # Write poster
+        if meta.get("poster_bytes"):
+            try:
+                write_poster_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{poster_path}'"]
+                subprocess.run(write_poster_cmd, input=meta["poster_bytes"], check=True)
+                log(f"Wrote poster: {poster_path}")
+            except Exception as exc:
+                log(f"WARNING: Failed writing poster: {exc}")
+
+        # Archive raw segments out of /media/recordings
+        if hasattr(mod, "archive_segments"):
+            try:
+                archived, failed = mod.archive_segments(segment_paths, clean_path)
+                log(f"Archived {len(archived)} segments to /media/segments-archive (failed: {len(failed)})")
+            except Exception as exc:
+                log(f"WARNING: archive_segments encountered error: {exc}")
+
+        # Enqueue the STITCHED file for comskip - NOT the segments
+        try:
+            enqueue_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
+                           f"echo '{stitched_path}' >> /srv/media-core/media/recordings/.postprocess/queue"]
+            subprocess.run(enqueue_cmd, check=True)
+            log(f"Enqueued stitched file for comskip: {stitched_path}")
+        except Exception as exc:
+            log(f"WARNING: Failed enqueuing stitched file for comskip: {exc}")
+
+        jf_api("/Library/Refresh", method="POST")
+        log(f"Capture stitched and post-processing pipeline complete: {stitched_path}")
+        log("MCT-RESULT: success")
+        return True
+
+    # Stitch failed: rescue every segment
+    _rescue_segments(segment_paths, start_dt, meta, title, container_dir, poster_path, concat_err)
+    return False
+
+
+def _rescue_segments(
+    segment_paths: list[str],
+    start_dt: datetime,
+    meta: dict[str, Any],
+    title: str,
+    container_dir: str,
+    poster_path: str,
+    reason: str,
+) -> None:
+    """Rescue segments when stitch fails. Precedent: rescue_original in process-queue.py.
+    Never lose a segment: a rescued partial beats a silent loss.
+    """
+    log(f"ALERT: Stitch failed ({reason}). Preserving all {len(segment_paths)} individual segments in library.")
+    push_loki_alert(f"level=alert source=mct msg='Stitch failed for {title}: {reason} -- segments rescued'")
+
+    for idx, seg_p in enumerate(segment_paths, start=1):
+        seg_clean_p = seg_p[:-7] + ".ts" if seg_p.endswith(".raw.ts") else (seg_p if seg_p.endswith(".ts") else f"{seg_p}.ts")
+        seg_raw_ct = f"/srv/media-core{seg_p}"
+        seg_clean_ct = f"/srv/media-core{seg_clean_p}"
+
+        log(f"[Rescue] Promoting segment {idx}: {seg_p} -> {seg_clean_p}")
+        remux_cmd = [
+            "/usr/sbin/pct", "exec", CT_ID, "--",
+            "docker", "exec", "jellyfin",
+            "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-y", "-v", "error",
+            "-err_detect", "ignore_err",
+            "-fflags", "+genpts+discardcorrupt",
+            "-i", seg_p,
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            seg_clean_p,
+        ]
+        res_remux = subprocess.run(remux_cmd, capture_output=True, text=True)
+        if res_remux.returncode == 0 and get_ct_file_size(seg_clean_ct) > 0:
+            if seg_raw_ct != seg_clean_ct:
+                subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "rm", "-f", seg_raw_ct], check=False)
+        else:
+            # Fallback: direct move, preserving bytes without parsing
+            log(f"[Rescue] Pre-remux failed on {seg_p}, using direct move fallback")
+            if seg_raw_ct != seg_clean_ct:
+                subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "mv", "-f", seg_raw_ct, seg_clean_ct], check=False)
+
+        seg_nfo_ct = str(Path(seg_clean_ct).with_suffix(".nfo"))
+        seg_stem = Path(seg_clean_p).stem
+        seg_nfo_xml = build_nfo_xml(seg_stem, start_dt, meta["plot"], meta["genres"], meta["lockdata"])
+        subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '{seg_nfo_ct}'"],
+                       input=seg_nfo_xml, text=True, check=False)
+
+        subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
+                        f"echo '{seg_clean_p}' >> /srv/media-core/media/recordings/.postprocess/queue"],
+                       check=False)
+
+    if meta.get("poster_bytes"):
+        try:
+            write_poster_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{poster_path}'"]
+            subprocess.run(write_poster_cmd, input=meta["poster_bytes"], check=True)
+        except Exception:
+            pass
+
+    jf_api("/Library/Refresh", method="POST")
+    log(f"All {len(segment_paths)} partial segments promoted and rescued. Playable in Jellyfin.")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Manual Capture Tool (MCT)")
     parser.add_argument("-c", "--channel", help="Channel number or name (e.g. 121 or 'Milwaukee Brewers HD')")
@@ -765,15 +982,32 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Show planned action without capturing or touching tuner")
     parser.add_argument("--sweep-orphans", action="store_true", help="Sweep or promote orphaned .raw.ts recordings")
     parser.add_argument("--threshold-hours", type=float, default=1.0, help="Age threshold in hours before sweeping terminal stubs (default: 1.0)")
+    parser.add_argument("--restart-and-stitch", action="store_true", default=False,
+                        help="Restart interrupted captures into segments and stitch at completion (default: disabled)")
+    parser.add_argument("--stitch", dest="restart_and_stitch", action="store_true",
+                        help="Alias for --restart-and-stitch")
+    parser.add_argument("--max-restarts", type=int, default=MAX_RESTARTS,
+                        help=f"Maximum restart attempts (default: {MAX_RESTARTS})")
+    parser.add_argument("--restart-backoff", type=float, default=RESTART_BACKOFF_BASE_SEC,
+                        help=f"Seconds to backoff before restart (default: {RESTART_BACKOFF_BASE_SEC}s)")
+    parser.add_argument("--min-restart-remaining", type=int, default=MIN_RESTART_REMAINING_SEC,
+                        help=f"Minimum remaining capture window in seconds to allow restart (default: {MIN_RESTART_REMAINING_SEC}s)")
+    parser.add_argument("--stream-url",
+                        help="Direct stream URL override (for tests, bypasses playlist and tuner)")
     args = parser.parse_args()
+
+    if not args.restart_and_stitch and os.environ.get("MCT_RESTART_AND_STITCH", "0").lower() in ("1", "true", "yes"):
+        args.restart_and_stitch = True
 
     if args.sweep_orphans:
         swept, promoted = sweep_orphans(threshold_hours=args.threshold_hours, dry_run=args.dry_run)
         log(f"Orphan sweep complete: {swept} swept, {promoted} promoted.")
         return 0
 
-    if not args.channel or not args.duration:
+    if not args.stream_url and (not args.channel or not args.duration):
         parser.error("-c/--channel and -d/--duration are required for capture.")
+    elif args.stream_url and not args.duration:
+        parser.error("-d/--duration is required for capture.")
 
     try:
         duration_sec = parse_duration(args.duration)
@@ -799,18 +1033,21 @@ def main() -> int:
     except Exception as exc:
         log(f"Warning: startup orphan sweep encountered error: {exc}")
 
-    try:
-        channels = parse_playlist()
-    except Exception as exc:
-        log(f"ERROR: Could not read playlist from CT 105: {exc}")
-        push_loki_alert(f"level=alert source=mct msg='Playlist read failure: {exc}'")
-        return 1
+    if args.stream_url:
+        ch = {"chno": "999", "name": args.channel or "Test Stream", "url": args.stream_url}
+    else:
+        try:
+            channels = parse_playlist()
+        except Exception as exc:
+            log(f"ERROR: Could not read playlist from CT 105: {exc}")
+            push_loki_alert(f"level=alert source=mct msg='Playlist read failure: {exc}'")
+            return 1
 
-    ch = resolve_channel(args.channel, channels)
-    if not ch:
-        log(f"ERROR: Could not resolve channel '{args.channel}' in playlist.m3u")
-        push_loki_alert(f"level=alert source=mct msg='Channel resolution failure for {args.channel}'")
-        return 1
+        ch = resolve_channel(args.channel, channels)
+        if not ch:
+            log(f"ERROR: Could not resolve channel '{args.channel}' in playlist.m3u")
+            push_loki_alert(f"level=alert source=mct msg='Channel resolution failure for {args.channel}'")
+            return 1
 
     now = datetime.now(LOCAL_TZ)
     if args.start_time:
@@ -848,12 +1085,13 @@ def main() -> int:
             f"Book it through the DVR dashboard instead of holding a process open that long.")
         return 2
 
-    ok, err = check_exclusion(start_dt.astimezone(timezone.utc), nominal_end_dt.astimezone(timezone.utc),
+    if not args.stream_url:
+        ok, err = check_exclusion(start_dt.astimezone(timezone.utc), nominal_end_dt.astimezone(timezone.utc),
                                   getattr(args, 'booking_id', None))
-    if not ok:
-        log(f"REFUSING CAPTURE: {err}")
-        push_loki_alert(f"level=alert source=mct msg='Refusing capture: {err}'")
-        return 2
+        if not ok:
+            log(f"REFUSING CAPTURE: {err}")
+            push_loki_alert(f"level=alert source=mct msg='Refusing capture: {err}'")
+            return 2
 
     # 3. ESPN fixture matching and Hard Cap calculation
     espn_games = load_espn_schedule()
@@ -869,21 +1107,9 @@ def main() -> int:
         "/usr/sbin/pct", "exec", CT_ID, "--",
         "docker", "exec", "-i", "jellyfin",
         "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-y",
-        # -nostats is load-bearing: ffmpeg writes a progress line to stderr roughly
-        # twice a second, which filled the 64KB pipe buffer and blocked the capture
-        # about 6 minutes in. stderr also goes to a file now, not a pipe.
         "-nostats", "-loglevel", "error",
-        # Reconnect budget, sized for a real ISP outage rather than a blip.
-        # ffmpeg 7.1.4 semantics: reconnect_delay_max is the backoff after which
-        # it GIVES UP, and the retry delay doubles. The previous value of 10 was
-        # a QUARTER of ffmpeg's own default of 120, so the backoff chain
-        # 1,2,4,8,16 exceeded it in about 15 seconds and the capture ended -
-        # far short of the multi-minute PPPoE outages this line actually sees.
-        # 60s backoff with a 900s total budget rides out a router reboot or a
-        # forced Telekom reconnect, while still giving up rather than holding the
-        # tuner to the hard cap against a genuinely dead stream.
-        "-reconnect_delay_max", "60",
-        "-reconnect_delay_total_max", "900",
+        "-reconnect_delay_max", "120",
+        "-reconnect_delay_total_max", "1800",
         "-reconnect_max_retries", "-1",
         "-reconnect", "1", "-reconnect_streamed", "1",
         "-reconnect_on_network_error", "1",
@@ -920,17 +1146,18 @@ def main() -> int:
         if is_clamped:
             log(f"Clamp Warning:  {clamp_info}")
         log(f"Hard Cap:       {hard_cap_sec}s ({timedelta(seconds=hard_cap_sec)}) -> {hard_cap_end_dt.isoformat()}")
+        log(f"Restart-Stitch: {'ENABLED (max ' + str(args.max_restarts) + ' restarts, ' + str(args.restart_backoff) + 's backoff)' if args.restart_and_stitch else 'DISABLED (single-shot)'}")
         log(f"Target TS:      {clean_path}")
         log(f"Target NFO:     {nfo_path}")
         log(f"Target Poster:  {poster_path} (Source: {meta['poster_source']}, Bytes: {len(meta['poster_bytes']) if meta['poster_bytes'] else 0})")
         log(f"Metadata Lock:  {meta['lockdata']} (plot={'yes' if meta['plot'] else 'empty'}, genres={meta['genres']})")
         log(f"Comskip Q:      {queue_entry}")
-        log("Exclusion:      PASS (no overlapping Jellyfin timers or active recordings)")
+        log(f"Exclusion:      {'SKIPPED (stream-url mode)' if args.stream_url else 'PASS (no overlapping Jellyfin timers or active recordings)'}")
         log(f"FFmpeg CMD:     {' '.join(ffmpeg_cmd)}")
         log(f"Pre-remux:      {' '.join(preremux_cmd)}")
         return 0
 
-    if lead > 1:
+    if lead > 1 and not args.stream_url:
         log(f"Waiting {lead:.0f}s until {start_dt.isoformat()} before opening the tuner")
         time.sleep(lead)
         ok, err = check_exclusion(start_dt.astimezone(timezone.utc), nominal_end_dt.astimezone(timezone.utc),
@@ -948,21 +1175,22 @@ def main() -> int:
 
     subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "mkdir", "-p", ct105_dir], check=True)
 
-    # Launch ffmpeg inside container with interactive stdin
+    max_restarts = args.max_restarts if args.restart_and_stitch else 0
+    segment_paths: list[str] = []
+    restart_count = 0
+    segment_idx = 1
     start_mono = time.monotonic()
-    # stdout/stderr must NOT be pipes: nothing reads them until after the
-    # supervising loop, which runs for hours. The 64KB kernel pipe buffer fills
-    # and ffmpeg blocks forever mid-capture.
-    ffmpeg_err_path = f"/var/log/mct/ffmpeg-{base_file}.err"
-    ffmpeg_err_f = open(ffmpeg_err_path, "wb")
-    p = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
-                         stdout=subprocess.DEVNULL, stderr=ffmpeg_err_f)
-
     interrupted = [False]
+    stopped_cleanly = False
+    current_p: list[subprocess.Popen | None] = [None]
+    last_returncode = 0
+    last_err_msg = ""
+    last_ran_to_hard_cap = False
 
     def _sig_handler(signum, frame):
         log(f"[Supervisor] Caught signal {signum}, initiating clean capture shutdown...")
         interrupted[0] = True
+        p = current_p[0]
         try:
             if p and p.stdin and not p.stdin.closed:
                 p.stdin.write(b"q\n")
@@ -974,111 +1202,236 @@ def main() -> int:
     prev_sigterm = signal.signal(signal.SIGTERM, _sig_handler)
     prev_sigint = signal.signal(signal.SIGINT, _sig_handler)
 
-    stopped_cleanly = False
-    is_supervising = fixture is not None and not (fixture.get("completed") or fixture.get("state") == "post")
-
-    if is_supervising:
+    try:
         while True:
-            poll_start = time.monotonic()
-            while time.monotonic() - poll_start < args.poll_interval:
-                ret = p.poll()
-                if ret is not None or interrupted[0]:
-                    break
-                time.sleep(2)
+            elapsed_total = time.monotonic() - start_mono
+            remaining_sec = int(hard_cap_sec - elapsed_total)
 
-            if p.poll() is not None or interrupted[0]:
+            if remaining_sec < args.min_restart_remaining and segment_idx > 1:
+                log(f"[Supervisor] Remaining capture window ({remaining_sec}s) is below threshold ({args.min_restart_remaining}s). Ending capture.")
                 break
 
-            elapsed = time.monotonic() - start_mono
-            try:
-                latest_games = load_espn_schedule()
-                cur_fixture = find_espn_fixture(title, ch["name"], start_dt, latest_games)
-            except Exception as exc:
-                log(f"[Supervisor] ESPN poll error ({exc}), continuing...")
-                continue
-
-            if not cur_fixture:
-                log("[Supervisor] Fixture no longer visible in ESPN schedule, continuing to hard cap...")
-                continue
-
-            fixture_state = cur_fixture.get("state")
-            is_completed = bool(cur_fixture.get("completed") or fixture_state == "post")
-            detail = cur_fixture.get("status_detail") or fixture_state or "unknown"
-
-            if elapsed < duration_sec:
-                log(f"[Supervisor] Game status: {detail} (elapsed {int(elapsed)}s / nominal {duration_sec}s)")
+            if segment_idx == 1:
+                seg_raw_path = raw_path
+                ffmpeg_err_path = f"/var/log/mct/ffmpeg-{base_file}.err"
             else:
-                if is_completed:
-                    log(f"[Supervisor] Game is FINAL ({detail}). Stopping ffmpeg capture cleanly...")
+                seg_raw_path = f"{container_dir}/{base_file}.seg{segment_idx}.raw.ts"
+                ffmpeg_err_path = f"/var/log/mct/ffmpeg-{base_file}-seg{segment_idx}.err"
+
+            seg_ffmpeg_cmd = [
+                "/usr/sbin/pct", "exec", CT_ID, "--",
+                "docker", "exec", "-i", "jellyfin",
+                "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-y",
+                "-nostats", "-loglevel", "error",
+                "-reconnect_delay_max", "120",
+                "-reconnect_delay_total_max", "1800",
+                "-reconnect_max_retries", "-1",
+                "-reconnect", "1", "-reconnect_streamed", "1",
+                "-reconnect_on_network_error", "1",
+                "-rw_timeout", "15000000",
+                "-i", ch["url"],
+                "-t", str(remaining_sec),
+                "-c", "copy",
+                seg_raw_path,
+            ]
+
+            if segment_idx > 1:
+                log(f"[Restart-Guard] Launching segment {segment_idx} (target duration: {remaining_sec}s, output: {seg_raw_path})")
+
+            ffmpeg_err_f = open(ffmpeg_err_path, "wb")
+            p = subprocess.Popen(seg_ffmpeg_cmd, stdin=subprocess.PIPE,
+                                 stdout=subprocess.DEVNULL, stderr=ffmpeg_err_f)
+            current_p[0] = p
+
+            is_supervising = fixture is not None and not (fixture.get("completed") or fixture.get("state") == "post")
+            if is_supervising:
+                while True:
+                    poll_start = time.monotonic()
+                    while time.monotonic() - poll_start < args.poll_interval:
+                        ret = p.poll()
+                        if ret is not None or interrupted[0]:
+                            break
+                        time.sleep(2)
+
+                    if p.poll() is not None or interrupted[0]:
+                        break
+
+                    elapsed = time.monotonic() - start_mono
                     try:
-                        if p.stdin:
-                            p.stdin.write(b"q\n")
-                            p.stdin.flush()
-                            p.stdin.close()
-                    except Exception as e:
-                        log(f"[Supervisor] Failed writing q to stdin: {e}")
-                    stopped_cleanly = True
-                    break
-                elif fixture_state == "in":
-                    log(f"[Supervisor] Game is IN PROGRESS ({detail}). Auto-extending capture (elapsed {int(elapsed)}s / hard cap {hard_cap_sec}s)...")
-    else:
-        pass
+                        latest_games = load_espn_schedule()
+                        cur_fixture = find_espn_fixture(title, ch["name"], start_dt, latest_games)
+                    except Exception as exc:
+                        log(f"[Supervisor] ESPN poll error ({exc}), continuing...")
+                        continue
 
-    def _read_ffmpeg_err() -> bytes:
+                    if not cur_fixture:
+                        log("[Supervisor] Fixture no longer visible in ESPN schedule, continuing to hard cap...")
+                        continue
+
+                    fixture_state = cur_fixture.get("state")
+                    is_completed = bool(cur_fixture.get("completed") or fixture_state == "post")
+                    detail = cur_fixture.get("status_detail") or fixture_state or "unknown"
+
+                    if elapsed < duration_sec:
+                        log(f"[Supervisor] Game status: {detail} (elapsed {int(elapsed)}s / nominal {duration_sec}s)")
+                    else:
+                        if is_completed:
+                            log(f"[Supervisor] Game is FINAL ({detail}). Stopping ffmpeg capture cleanly...")
+                            try:
+                                if p.stdin and not p.stdin.closed:
+                                    p.stdin.write(b"q\n")
+                                    p.stdin.flush()
+                                    p.stdin.close()
+                            except Exception as e:
+                                log(f"[Supervisor] Failed writing q to stdin: {e}")
+                            stopped_cleanly = True
+                            break
+                        elif fixture_state == "in":
+                            log(f"[Supervisor] Game is IN PROGRESS ({detail}). Auto-extending capture (elapsed {int(elapsed)}s / hard cap {hard_cap_sec}s)...")
+            else:
+                while True:
+                    ret = p.poll()
+                    if ret is not None or interrupted[0]:
+                        break
+                    time.sleep(2)
+
+            try:
+                p.wait(timeout=15 if (stopped_cleanly or interrupted[0]) else None)
+            except subprocess.TimeoutExpired:
+                log("[Supervisor] ffmpeg did not terminate within 15s of 'q'; sending SIGINT fallback...")
+                subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "docker", "exec", "jellyfin",
+                                "pkill", "-INT", "-f", seg_raw_path], check=False)
+                try:
+                    p.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    log("[Supervisor] ffmpeg failed to respond to SIGINT; terminating...")
+                    p.kill()
+                    p.wait()
+
+            try:
+                ffmpeg_err_f.flush()
+                ffmpeg_err_f.close()
+            except Exception:
+                pass
+
+            try:
+                with open(ffmpeg_err_path, "rb") as fh:
+                    stderr_data = fh.read()
+            except Exception:
+                stderr_data = b""
+
+            last_returncode = p.returncode
+            last_err_msg = stderr_data.decode("utf-8", errors="replace").strip()[-300:]
+
+            seg_ct_path = f"/srv/media-core{seg_raw_path}"
+            seg_size = get_ct_file_size(seg_ct_path)
+            MIN_USABLE_SIZE = 1_000_000
+            is_usable = (seg_size >= MIN_USABLE_SIZE)
+
+            ran_to_hard_cap = (time.monotonic() - start_mono) >= (hard_cap_sec - 5)
+            last_ran_to_hard_cap = ran_to_hard_cap
+            is_deliberate_stop = stopped_cleanly or interrupted[0]
+
+            if is_deliberate_stop or ran_to_hard_cap:
+                if is_usable:
+                    segment_paths.append(seg_raw_path)
+                    log(f"[Supervisor] Segment {segment_idx} finished cleanly ({seg_size} bytes). Capture complete.")
+                elif seg_size > 0:
+                    log(f"[Supervisor] Segment {segment_idx} finished but is sub-MB stub ({seg_size} bytes).")
+                break
+
+            # Abnormal / premature exit
+            log(f"WARNING: ffmpeg capture exited prematurely on segment {segment_idx} with code {p.returncode}: {last_err_msg}")
+
+            if not is_usable:
+                log(f"[Orphan-Guard] Segment {segment_idx} is unusable stub ({seg_size} bytes < 1MB). Discarding stub.")
+                subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "rm", "-f", seg_ct_path], check=False)
+            else:
+                if segment_idx == 1 and args.restart_and_stitch:
+                    # Rename segment 1 to .seg1.raw.ts so all segments in chain are consistently numbered
+                    renamed_seg1 = f"{container_dir}/{base_file}.seg1.raw.ts"
+                    renamed_ct = f"/srv/media-core{renamed_seg1}"
+                    subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "mv", "-f", seg_ct_path, renamed_ct], check=True)
+                    seg_raw_path = renamed_seg1
+                segment_paths.append(seg_raw_path)
+                log(f"[Restart-Guard] Segment {segment_idx} preserved ({seg_size} bytes): {seg_raw_path}")
+
+            if not args.restart_and_stitch:
+                # Single-shot mode: do not restart
+                break
+
+            restart_count += 1
+            if restart_count > max_restarts:
+                log(f"ERROR: Maximum restart count ({max_restarts}) reached against failing stream. Refusing further restarts to protect tuner.")
+                push_loki_alert(f"level=alert source=mct msg='Maximum restart limit reached ({max_restarts}) for {title}'")
+                break
+
+            rem_time = int(hard_cap_sec - (time.monotonic() - start_mono))
+            if rem_time < args.min_restart_remaining:
+                log(f"[Supervisor] Remaining window ({rem_time}s) below restart threshold ({args.min_restart_remaining}s). Not restarting.")
+                break
+
+            log(f"[Restart-Guard] Initiating restart {restart_count}/{max_restarts} after {args.restart_backoff}s backoff (remaining window: {rem_time}s)...")
+            push_loki_alert(f"level=info source=mct msg='Restarting capture segment {restart_count+1} for {title} (remaining {rem_time}s)'")
+            time.sleep(args.restart_backoff)
+            segment_idx += 1
+
+    finally:
         try:
-            ffmpeg_err_f.flush()
-            with open(ffmpeg_err_path, "rb") as fh:
-                return fh.read()
+            signal.signal(signal.SIGTERM, prev_sigterm)
+            signal.signal(signal.SIGINT, prev_sigint)
         except Exception:
-            return b""
+            pass
 
-    try:
-        p.wait(timeout=15 if (stopped_cleanly or interrupted[0]) else None)
-    except subprocess.TimeoutExpired:
-        log("[Supervisor] ffmpeg did not terminate within 15s of 'q'; sending SIGINT fallback...")
-        # Target OUR ffmpeg by its unique output path. `pidof ffmpeg` signalled
-        # EVERY ffmpeg in the jellyfin container, which would have killed
-        # Jellyfin's own in-progress recordings - the exact cross-engine
-        # interference the whole engine-choice design exists to prevent.
-        subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "docker", "exec", "jellyfin",
-                        "pkill", "-INT", "-f", raw_path], check=False)
-        try:
-            p.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            log("[Supervisor] ffmpeg failed to respond to SIGINT; terminating...")
-            p.kill()
-            p.wait()
-    stderr_data = _read_ffmpeg_err()
-    try:
-        ffmpeg_err_f.close()
-    except Exception:
-        pass
+    # Post-capture processing
+    if len(segment_paths) == 0:
+        log("ERROR: Capture produced no usable segments (all <1MB or missing).")
+        push_loki_alert(f"level=alert source=mct msg='Capture failed with no usable data on {ch['name']}'")
+        return 4
 
-    try:
-        signal.signal(signal.SIGTERM, prev_sigterm)
-        signal.signal(signal.SIGINT, prev_sigint)
-    except Exception:
-        pass
+    if len(segment_paths) == 1:
+        single_seg = segment_paths[0]
+        preremux_cmd = [
+            "/usr/sbin/pct", "exec", CT_ID, "--",
+            "docker", "exec", "jellyfin",
+            "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-y", "-v", "error",
+            "-err_detect", "ignore_err",
+            "-fflags", "+genpts+discardcorrupt",
+            "-i", single_seg,
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            clean_path,
+        ]
+        is_abnormal = (last_returncode != 0 and not stopped_cleanly and not interrupted[0] and not last_ran_to_hard_cap)
+        if is_abnormal:
+            push_loki_alert(f"level=alert source=mct msg='ffmpeg capture failed on {ch['name']}: {last_err_msg[-200:]}'")
 
-    is_abnormal = (p.returncode != 0 and not stopped_cleanly and not interrupted[0])
-    if is_abnormal:
-        err_msg = stderr_data.decode("utf-8", errors="replace").strip()[-300:]
-        log(f"ERROR: ffmpeg capture exited with code {p.returncode}: {err_msg}")
-        push_loki_alert(f"level=alert source=mct msg='ffmpeg capture failed on {ch['name']}: {err_msg[-200:]}'")
+        promoted = finalize_and_promote_capture(
+            raw_path=single_seg,
+            clean_path=clean_path,
+            preremux_cmd=preremux_cmd,
+            nfo_path=nfo_path,
+            poster_path=poster_path,
+            nfo_content=nfo_content,
+            meta=meta,
+            is_abnormal=is_abnormal or interrupted[0],
+            failure_reason=f"ffmpeg exit {last_returncode}" if is_abnormal else ("interrupted" if interrupted[0] else "")
+        )
+        if is_abnormal and not promoted:
+            return 4
+        return 0
 
-    promoted = finalize_and_promote_capture(
-        raw_path=raw_path,
+    # Multi-segment: stitch
+    stitched_ok = concat_and_stitch_segments(
+        segment_paths=segment_paths,
         clean_path=clean_path,
-        preremux_cmd=preremux_cmd,
-        nfo_path=nfo_path,
+        start_dt=start_dt,
         poster_path=poster_path,
-        nfo_content=nfo_content,
         meta=meta,
-        is_abnormal=is_abnormal or interrupted[0],
-        failure_reason=f"ffmpeg exit {p.returncode}" if is_abnormal else ("interrupted" if interrupted[0] else "")
+        title=title,
+        container_dir=container_dir,
     )
-
-    if is_abnormal and not promoted:
+    if not stitched_ok:
         return 4
     return 0
 
