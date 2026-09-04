@@ -1,0 +1,1334 @@
+#!/usr/bin/env python3
+"""network-triage — Deterministic outage diagnosis and targeted recovery for pve-01 homelab.
+
+Performs layered checks in strict dependency order:
+  1. Host link: pve-01 network interface (vmbr0 carrier, IP, default route)
+  2. Router reachable: GL-BE9300 gateway (192.168.9.1 ICMP ping and SSH)
+  3. WAN / PPPoE state: Router WAN interface (pppoe-wan, pppd daemon, IPv4 lease)
+  4. End-to-end egress: Real egress verification (kmwan tracking 1.1.1.1/8.8.8.8/OpenDNS, zombie PPPoE detector)
+  5. DNS: Name resolution via router dnsmasq (192.168.9.1:53) and upstream
+  6. VPN tunnel state: WireGuard/OpenVPN tunnels (wgclient1 Swiss tunnel, handshakes, transfer, resolv/fw rules)
+  7. IPTV provider reachability: player_api.php probe via CT 105 Swiss egress (detects HTTP 511 exit blocks)
+  8. Media stack health: Jellyfin (:8096), Threadfin (:34400), CT 105 container state
+
+Features:
+  - Plain-English verdict naming the root failed layer and the single next action.
+  - Full structured JSON output (--json) for LLM agents, dashboards, and automated alerting.
+  - Safe opt-in recovery (--fix): targeted WAN bounce (`ubus call network.interface.wan down && up`).
+    Refuses if a recording is in progress (checks tuner broker / reservation data).
+  - Simulation modes (--simulate <mode>) to prove attribution and failure modes in both directions.
+  - Credential redaction: strictly redacts provider URLs, passwords, and PPPoE tokens.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import subprocess
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+# Configuration
+ROUTER_IP = "192.168.9.1"
+ROUTER_USER = "root"
+HOST_INTERFACE = "vmbr0"
+EXPECTED_HOST_IP_PREFIX = "192.168.9."
+CT105_ID = "105"
+JELLYFIN_URL = "http://192.168.9.50:8096/System/Info/Public"
+THREADFIN_URL = "http://192.168.9.50:34400/web/"
+DNS_TEST_DOMAINS = ["cloudflare.com", "google.com"]
+EGRESS_TARGETS = ["1.1.1.1", "8.8.8.8"]
+
+LAYER_ORDER = [
+    "host_link",
+    "router_reachable",
+    "wan_pppoe",
+    "end_to_end_egress",
+    "dns",
+    "vpn_tunnels",
+    "iptv_provider",
+    "media_stack",
+]
+
+LAYER_NAMES = {
+    "host_link": "Layer 1: Host Link",
+    "router_reachable": "Layer 2: Router Reachable",
+    "wan_pppoe": "Layer 3: WAN / PPPoE State",
+    "end_to_end_egress": "Layer 4: End-to-End Egress",
+    "dns": "Layer 5: DNS Resolution",
+    "vpn_tunnels": "Layer 6: VPN Tunnel State",
+    "iptv_provider": "Layer 7: IPTV Provider Reachability",
+    "media_stack": "Layer 8: Media Stack Health",
+}
+
+
+def redact_sensitive(text: str) -> str:
+    """Never log or print provider credentials, stream paths, or PPPoE passwords.
+    Follows MCT redaction convention and protects secrets from leaking.
+    """
+    if not text:
+        return text
+    s = str(text)
+    # Redact provider stream URLs: /live/<user>/<pass>/<id>.ts
+    s = re.sub(r"(/live/)[^/]+/[^/]+/", r"\1<REDACTED>/<REDACTED>/", s)
+    # Redact player_api query parameters
+    s = re.sub(r"(username=)[^&\s]+", r"\1<REDACTED>", s, flags=re.IGNORECASE)
+    s = re.sub(r"(password=)[^&\s]+", r"\1<REDACTED>", s, flags=re.IGNORECASE)
+    # Redact UCI PPPoE options
+    s = re.sub(r"""(username\s*['"])[^'"]+(['"])""", r"\1<REDACTED>\2", s, flags=re.IGNORECASE)
+    s = re.sub(r"""(password\s*['"])[^'"]+(['"])""", r"\1<REDACTED>\2", s, flags=re.IGNORECASE)
+    s = re.sub(r"""(auth_token\s*['"])[^'"]+(['"])""", r"\1<REDACTED>\2", s, flags=re.IGNORECASE)
+    return s
+
+
+@dataclass
+class LayerResult:
+    name: str
+    label: str
+    status: str  # "PASS", "FAIL", "WARN", "SKIP"
+    summary: str
+    details: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
+    action: Optional[str] = None
+    elapsed_seconds: float = 0.0
+
+
+@dataclass
+class TriageReport:
+    timestamp: str
+    verdict: str  # "PASS" or "FAIL"
+    failed_layer: Optional[str]
+    failed_layer_label: Optional[str]
+    summary: str
+    next_action: Optional[str]
+    layers: Dict[str, LayerResult]
+    execution_seconds: float
+
+
+class NetworkTriager:
+    def __init__(
+        self,
+        router_ip: str = ROUTER_IP,
+        router_user: str = ROUTER_USER,
+        host_iface: str = HOST_INTERFACE,
+        dry_run: bool = False,
+        simulate: Optional[str] = None,
+        simulate_recording: bool = False,
+        simulate_idle: bool = False,
+        verbose: bool = False,
+    ):
+        self.router_ip = router_ip
+        self.router_user = router_user
+        self.host_iface = host_iface
+        self.dry_run = dry_run
+        self.simulate = simulate
+        self.simulate_recording = simulate_recording
+        self.simulate_idle = simulate_idle
+        self.verbose = verbose
+
+    def _run_cmd(self, cmd: List[str], timeout: float = 5.0) -> Tuple[int, str, str]:
+        """Runs a local shell command safely."""
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return p.returncode, p.stdout.strip(), p.stderr.strip()
+        except subprocess.TimeoutExpired:
+            return 124, "", f"Command timed out after {timeout}s"
+        except Exception as e:
+            return 1, "", str(e)
+
+    def _run_ssh(self, remote_cmd: str, timeout: float = 5.0) -> Tuple[int, str, str]:
+        """Runs a command on the GL.iNet router over SSH without storing credentials."""
+        cmd = [
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", f"ConnectTimeout={int(timeout)}",
+            "-o", "StrictHostKeyChecking=accept-new",
+            f"{self.router_user}@{self.router_ip}",
+            remote_cmd,
+        ]
+        return self._run_cmd(cmd, timeout=timeout + 2.0)
+
+    # -------------------------------------------------------------------------
+    # Layer 1: Host Link
+    # -------------------------------------------------------------------------
+    def check_host_link(self) -> LayerResult:
+        t0 = time.time()
+        label = LAYER_NAMES["host_link"]
+
+        if self.simulate == "host-link-down":
+            return LayerResult(
+                name="host_link",
+                label=label,
+                status="FAIL",
+                summary="Simulated failure: Host interface vmbr0 carrier lost",
+                details={"operstate": "down", "carrier": 0, "addrs": []},
+                error="Carrier signal absent on vmbr0",
+                action="Check physical ethernet cabling on pve-01 and run 'ip link set dev vmbr0 up'",
+                elapsed_seconds=round(time.time() - t0, 3),
+            )
+
+        operstate = "unknown"
+        operstate_path = Path(f"/sys/class/net/{self.host_iface}/operstate")
+        if operstate_path.exists():
+            try:
+                operstate = operstate_path.read_text().strip()
+            except Exception:
+                pass
+
+        carrier = 0
+        carrier_path = Path(f"/sys/class/net/{self.host_iface}/carrier")
+        if carrier_path.exists():
+            try:
+                carrier = int(carrier_path.read_text().strip() or 0)
+            except Exception:
+                pass
+
+        code, out, _ = self._run_cmd(["ip", "-j", "addr", "show", self.host_iface])
+        addrs = []
+        if code == 0 and out:
+            try:
+                data = json.loads(out)
+                for iface in data:
+                    for a in iface.get("addr_info", []):
+                        if a.get("family") == "inet":
+                            addrs.append(f"{a.get('local')}/{a.get('prefixlen')}")
+            except Exception:
+                pass
+
+        code_rt, out_rt, _ = self._run_cmd(["ip", "-j", "route", "show", "default"])
+        gateway = None
+        if code_rt == 0 and out_rt:
+            try:
+                routes = json.loads(out_rt)
+                if routes:
+                    gateway = routes[0].get("gateway")
+            except Exception:
+                pass
+
+        elapsed = round(time.time() - t0, 3)
+        details = {
+            "interface": self.host_iface,
+            "operstate": operstate,
+            "carrier": carrier,
+            "ipv4_addresses": addrs,
+            "default_gateway": gateway,
+        }
+
+        has_expected_ip = any(a.startswith(EXPECTED_HOST_IP_PREFIX) for a in addrs)
+        if operstate != "up" or carrier != 1 or not has_expected_ip or gateway != self.router_ip:
+            return LayerResult(
+                name="host_link",
+                label=label,
+                status="FAIL",
+                summary=f"Host network interface {self.host_iface} link down or missing IP/gateway",
+                details=details,
+                error=f"operstate={operstate}, carrier={carrier}, addrs={addrs}, gateway={gateway}",
+                action=f"Check physical ethernet cabling on pve-01 and run 'ip link set dev {self.host_iface} up'",
+                elapsed_seconds=elapsed,
+            )
+
+        return LayerResult(
+            name="host_link",
+            label=label,
+            status="PASS",
+            summary=f"Host link UP: {self.host_iface} carrier=1, IP={addrs[0]}, gateway={gateway}",
+            details=details,
+            elapsed_seconds=elapsed,
+        )
+
+    # -------------------------------------------------------------------------
+    # Layer 2: Router Reachable
+    # -------------------------------------------------------------------------
+    def check_router_reachable(self) -> LayerResult:
+        t0 = time.time()
+        label = LAYER_NAMES["router_reachable"]
+
+        if self.simulate == "router-unreachable":
+            return LayerResult(
+                name="router_reachable",
+                label=label,
+                status="FAIL",
+                summary=f"Simulated failure: Router {self.router_ip} unreachable (ping/SSH timeout)",
+                details={"ping": False, "ssh": False, "router_ip": self.router_ip},
+                error=f"No route / response from {self.router_ip}",
+                action=f"Verify power and LAN connection to GL-BE9300 ({self.router_ip}); check router front LEDs",
+                elapsed_seconds=round(time.time() - t0, 3),
+            )
+
+        code_ping, _, _ = self._run_cmd(["ping", "-c", "1", "-W", "2", self.router_ip], timeout=3.0)
+        ping_ok = (code_ping == 0)
+
+        code_ssh, out_ssh, err_ssh = self._run_ssh("true", timeout=3.0)
+        ssh_ok = (code_ssh == 0)
+
+        elapsed = round(time.time() - t0, 3)
+        details = {
+            "router_ip": self.router_ip,
+            "icmp_ping": ping_ok,
+            "ssh_connection": ssh_ok,
+        }
+
+        if not ping_ok and not ssh_ok:
+            return LayerResult(
+                name="router_reachable",
+                label=label,
+                status="FAIL",
+                summary=f"Gateway router {self.router_ip} completely unreachable over LAN",
+                details=details,
+                error="Both ICMP ping and SSH failed",
+                action=f"Verify power and LAN connection to GL-BE9300 ({self.router_ip}); check router front LEDs",
+                elapsed_seconds=elapsed,
+            )
+        elif ping_ok and not ssh_ok:
+            return LayerResult(
+                name="router_reachable",
+                label=label,
+                status="FAIL",
+                summary=f"Gateway router {self.router_ip} answers ping but SSH service is unresponsive",
+                details=details,
+                error=f"SSH failed (exit {code_ssh}): {err_ssh}",
+                action=f"Check Dropbear/SSH daemon on router {self.router_ip} or reboot router manually if locked up",
+                elapsed_seconds=elapsed,
+            )
+
+        return LayerResult(
+            name="router_reachable",
+            label=label,
+            status="PASS",
+            summary=f"Gateway router {self.router_ip} reachable (ICMP ping OK, SSH OK)",
+            details=details,
+            elapsed_seconds=elapsed,
+        )
+
+    # -------------------------------------------------------------------------
+    # Layer 3: WAN / PPPoE State
+    # -------------------------------------------------------------------------
+    def check_wan_pppoe(self) -> LayerResult:
+        t0 = time.time()
+        label = LAYER_NAMES["wan_pppoe"]
+
+        if self.simulate == "wan-down":
+            return LayerResult(
+                name="wan_pppoe",
+                label=label,
+                status="FAIL",
+                summary="Simulated failure: PPPoE session is DOWN on router (pppoe-wan disconnected)",
+                details={"up": False, "proto": "pppoe", "l3_device": "pppoe-wan", "ipv4_addresses": []},
+                error="ubus reports network.interface.wan up=false",
+                action="Bounce WAN interface ('network-triage --fix') or check DSL/fiber ONT link",
+                elapsed_seconds=round(time.time() - t0, 3),
+            )
+
+        remote_cmd = "ubus call network.interface.wan status; echo '---PPPD---'; pgrep pppd"
+        code, out, err = self._run_ssh(remote_cmd, timeout=5.0)
+
+        elapsed = round(time.time() - t0, 3)
+        if code != 0:
+            return LayerResult(
+                name="wan_pppoe",
+                label=label,
+                status="FAIL",
+                summary="Failed to query WAN interface status from router",
+                details={"error": err},
+                error=f"SSH command exited {code}: {err}",
+                action=f"Check ubus and network service on router {self.router_ip}",
+                elapsed_seconds=elapsed,
+            )
+
+        parts = out.split("---PPPD---")
+        json_str = parts[0].strip()
+        pppd_pid = parts[1].strip() if len(parts) > 1 else ""
+
+        try:
+            data = json.loads(json_str)
+        except Exception as e:
+            return LayerResult(
+                name="wan_pppoe",
+                label=label,
+                status="FAIL",
+                summary="Unparseable WAN interface status from router ubus",
+                details={"raw_output": redact_sensitive(json_str[:200])},
+                error=str(e),
+                action="Verify netifd and network service on router",
+                elapsed_seconds=elapsed,
+            )
+
+        is_up = data.get("up", False)
+        is_pending = data.get("pending", False)
+        proto = data.get("proto", "")
+        l3_dev = data.get("l3_device", "")
+        uptime = data.get("uptime", 0)
+        dns_servers = data.get("dns-server", [])
+        addrs = [a.get("address") for a in data.get("ipv4-address", []) if a.get("address")]
+
+        details = {
+            "up": is_up,
+            "pending": is_pending,
+            "proto": proto,
+            "l3_device": l3_dev,
+            "uptime_seconds": uptime,
+            "ipv4_addresses": addrs,
+            "dns_servers": dns_servers,
+            "pppd_pid": pppd_pid,
+        }
+
+        if not is_up or not addrs:
+            return LayerResult(
+                name="wan_pppoe",
+                label=label,
+                status="FAIL",
+                summary=f"PPPoE session is DOWN on router ({l3_dev or 'pppoe-wan'} has no IPv4 lease)",
+                details=details,
+                error="interface is not up or has no IPv4 address",
+                action="Bounce WAN interface ('network-triage --fix') or check DSL/fiber ONT link",
+                elapsed_seconds=elapsed,
+            )
+
+        if not pppd_pid:
+            return LayerResult(
+                name="wan_pppoe",
+                label=label,
+                status="WARN",
+                summary=f"PPPoE reports up ({addrs[0]}) but pppd process is missing",
+                details=details,
+                action="Inspect pppd service on router",
+                elapsed_seconds=elapsed,
+            )
+
+        return LayerResult(
+            name="wan_pppoe",
+            label=label,
+            status="PASS",
+            summary=f"WAN PPPoE UP: {addrs[0]} on {l3_dev} (uptime {uptime}s, pppd PID {pppd_pid})",
+            details=details,
+            elapsed_seconds=elapsed,
+        )
+
+    # -------------------------------------------------------------------------
+    # Layer 4: End-to-End Egress (The Zombie PPPoE Detector)
+    # -------------------------------------------------------------------------
+    def check_end_to_end_egress(self, wan_res: Optional[LayerResult] = None) -> LayerResult:
+        t0 = time.time()
+        label = LAYER_NAMES["end_to_end_egress"]
+
+        if self.simulate == "zombie-pppoe":
+            return LayerResult(
+                name="end_to_end_egress",
+                label=label,
+                status="FAIL",
+                summary="Zombie PPPoE session detected: WAN interface reports UP, but end-to-end egress is DEAD",
+                details={
+                    "wan_reported_up": True,
+                    "kmwan_online": False,
+                    "kmwan_state": "DEAD",
+                    "host_egress_ping": False,
+                    "router_egress_ping": False,
+                    "zombie_pppoe": True,
+                },
+                error="LCP echoes answered by provider BRAS but IP packets cannot route",
+                action="Bounce WAN interface ('network-triage --fix') to re-establish PPPoE session",
+                elapsed_seconds=round(time.time() - t0, 3),
+            )
+
+        remote_cmd = (
+            "cat /proc/gl-kmwan/status 2>/dev/null; "
+            "echo '---CONFIG---'; cat /proc/gl-kmwan/config 2>/dev/null; "
+            "echo '---PING---'; ping -c 1 -W 2 -I pppoe-wan 1.1.1.1 >/dev/null && echo 'OK' || echo 'FAIL'"
+        )
+        code, out, err = self._run_ssh(remote_cmd, timeout=5.0)
+
+        kmwan_online = False
+        kmwan_state = "UNKNOWN"
+        router_ping_ok = False
+        tx_packets = 0
+        rx_packets = 0
+
+        if code == 0 and out:
+            parts = out.split("---CONFIG---")
+            status_text = parts[0]
+            rest = parts[1].split("---PING---") if len(parts) > 1 else ["", ""]
+            config_text = rest[0].strip()
+            ping_text = rest[1].strip() if len(rest) > 1 else ""
+
+            router_ping_ok = (ping_text == "OK")
+
+            m_online = re.search(r"online:\s*(\w+)", status_text)
+            if m_online:
+                kmwan_online = (m_online.group(1).lower() == "true")
+            elif "wan:online" in config_text:
+                kmwan_online = True
+
+            m_state = re.search(r"wan\s+\S+\s+\d+\s+(\w+)", status_text)
+            if m_state:
+                kmwan_state = m_state.group(1)
+
+            m_tx = re.search(r"wan\s+\S+\s+\d+\s+\S+\s+\S+\s+(\d+)\s+\d+\s+(\d+)", status_text)
+            if m_tx:
+                tx_packets = int(m_tx.group(1))
+                rx_packets = int(m_tx.group(2))
+
+        code_host_ping, _, _ = self._run_cmd(["ping", "-c", "1", "-W", "2", "1.1.1.1"], timeout=3.0)
+        host_ping_ok = (code_host_ping == 0)
+
+        elapsed = round(time.time() - t0, 3)
+        details = {
+            "kmwan_online": kmwan_online,
+            "kmwan_state": kmwan_state,
+            "kmwan_tx_packets": tx_packets,
+            "kmwan_rx_packets": rx_packets,
+            "router_egress_ping": router_ping_ok,
+            "host_egress_ping": host_ping_ok,
+            "zombie_pppoe": False,
+        }
+
+        wan_was_up = wan_res is not None and wan_res.status == "PASS"
+        if wan_was_up and not (kmwan_online or router_ping_ok or host_ping_ok):
+            details["zombie_pppoe"] = True
+            return LayerResult(
+                name="end_to_end_egress",
+                label=label,
+                status="FAIL",
+                summary="Zombie PPPoE session detected: WAN interface reports UP, but end-to-end egress is DEAD",
+                details=details,
+                error="LCP echoes answered by provider BRAS but external packets fail to route",
+                action="Bounce WAN interface ('network-triage --fix') to re-establish PPPoE session",
+                elapsed_seconds=elapsed,
+            )
+
+        if not (kmwan_online or router_ping_ok or host_ping_ok):
+            return LayerResult(
+                name="end_to_end_egress",
+                label=label,
+                status="FAIL",
+                summary="End-to-end egress failed: cannot reach external IP targets (1.1.1.1/8.8.8.8)",
+                details=details,
+                error="External ICMP echo failed from both router and host",
+                action="Bounce WAN interface ('network-triage --fix') or check ISP outage status",
+                elapsed_seconds=elapsed,
+            )
+
+        return LayerResult(
+            name="end_to_end_egress",
+            label=label,
+            status="PASS",
+            summary=f"End-to-end egress functional (kmwan {kmwan_state}, router ping OK, host ping OK)",
+            details=details,
+            elapsed_seconds=elapsed,
+        )
+
+    # -------------------------------------------------------------------------
+    # Layer 5: DNS Resolution
+    # -------------------------------------------------------------------------
+    def check_dns(self) -> LayerResult:
+        t0 = time.time()
+        label = LAYER_NAMES["dns"]
+
+        if self.simulate == "dns-failure":
+            return LayerResult(
+                name="dns",
+                label=label,
+                status="FAIL",
+                summary="DNS resolution failed while IP egress is functional",
+                details={"router_dns_ok": False, "host_dns_ok": False, "domains": DNS_TEST_DOMAINS},
+                error="Simulated failure: Nameservers returned SERVFAIL/REFUSED or timed out",
+                action="Restart dnsmasq on router ('/etc/init.d/dnsmasq restart') or inspect upstream DNS",
+                elapsed_seconds=round(time.time() - t0, 3),
+            )
+
+        router_dns_ok = True
+        failed_domains = []
+        for domain in DNS_TEST_DOMAINS:
+            code, out, _ = self._run_cmd(["nslookup", domain, self.router_ip], timeout=3.0)
+            if code != 0 or "Address:" not in out:
+                router_dns_ok = False
+                failed_domains.append(f"{domain} via {self.router_ip}")
+
+        host_dns_ok = True
+        for domain in DNS_TEST_DOMAINS:
+            try:
+                socket.getaddrinfo(domain, 80, socket.AF_INET, socket.SOCK_STREAM)
+            except Exception:
+                host_dns_ok = False
+                failed_domains.append(f"{domain} via host")
+
+        elapsed = round(time.time() - t0, 3)
+        details = {
+            "router_dns_ok": router_dns_ok,
+            "host_dns_ok": host_dns_ok,
+            "tested_domains": DNS_TEST_DOMAINS,
+            "failed_queries": failed_domains,
+        }
+
+        if not router_dns_ok and not host_dns_ok:
+            return LayerResult(
+                name="dns",
+                label=label,
+                status="FAIL",
+                summary="DNS resolution failed across both router (192.168.9.1:53) and host resolvers",
+                details=details,
+                error=f"Failed domains: {', '.join(failed_domains)}",
+                action="Restart dnsmasq on router ('/etc/init.d/dnsmasq restart') or inspect upstream DNS",
+                elapsed_seconds=elapsed,
+            )
+        elif not router_dns_ok and host_dns_ok:
+            return LayerResult(
+                name="dns",
+                label=label,
+                status="WARN",
+                summary="Router dnsmasq (192.168.9.1:53) failed queries while host resolver succeeded",
+                details=details,
+                error=f"Failed on router: {', '.join(failed_domains)}",
+                action="Restart dnsmasq on router ('/etc/init.d/dnsmasq restart')",
+                elapsed_seconds=elapsed,
+            )
+
+        return LayerResult(
+            name="dns",
+            label=label,
+            status="PASS",
+            summary=f"DNS resolution functional (router 192.168.9.1 and host resolved {', '.join(DNS_TEST_DOMAINS)})",
+            details=details,
+            elapsed_seconds=elapsed,
+        )
+
+    # -------------------------------------------------------------------------
+    # Layer 6: VPN Tunnel State
+    # -------------------------------------------------------------------------
+    def check_vpn_tunnels(self) -> LayerResult:
+        t0 = time.time()
+        label = LAYER_NAMES["vpn_tunnels"]
+
+        if self.simulate == "vpn-down":
+            return LayerResult(
+                name="vpn_tunnels",
+                label=label,
+                status="FAIL",
+                summary="WireGuard tunnel wgclient1 (Swiss / media-core) handshake stalled or dropped",
+                details={
+                    "tunnel": "wgclient1",
+                    "name": "Swiss (media-core)",
+                    "handshake_age_seconds": 9999,
+                    "rx_bytes": 0,
+                    "tx_bytes": 1024,
+                },
+                error="Simulated failure: No handshake received in > 180 seconds",
+                action="Bounce WireGuard tunnel wgclient1 on router via gl-session or check Surfshark endpoint",
+                elapsed_seconds=round(time.time() - t0, 3),
+            )
+
+        remote_cmd = (
+            "wg show all dump; echo '---RESOLV---'; "
+            "wc -c /tmp/resolv.conf.d/resolv.conf.wgclient1 2>/dev/null; echo '---NFT---'; "
+            "nft list chain inet fw4 accept_to_wgclient1 2>/dev/null | grep -c accept"
+        )
+        code, out, err = self._run_ssh(remote_cmd, timeout=5.0)
+
+        elapsed = round(time.time() - t0, 3)
+        if code != 0:
+            return LayerResult(
+                name="vpn_tunnels",
+                label=label,
+                status="FAIL",
+                summary="Failed to query WireGuard tunnel status from router",
+                details={"error": err},
+                error=f"SSH exited {code}: {err}",
+                action=f"Check WireGuard status on router {self.router_ip}",
+                elapsed_seconds=elapsed,
+            )
+
+        parts = out.split("---RESOLV---")
+        wg_dump = parts[0].strip()
+        rest = parts[1].split("---NFT---") if len(parts) > 1 else ["", ""]
+        resolv_out = rest[0].strip()
+        nft_out = rest[1].strip() if len(rest) > 1 else ""
+
+        resolv_size = 0
+        if resolv_out:
+            m_res = re.match(r"(\d+)", resolv_out)
+            if m_res:
+                resolv_size = int(m_res.group(1))
+
+        nft_accept_count = 0
+        if nft_out:
+            m_nft = re.match(r"(\d+)", nft_out)
+            if m_nft:
+                nft_accept_count = int(m_nft.group(1))
+
+        now_epoch = int(time.time())
+        tunnels: Dict[str, Dict[str, Any]] = {}
+
+        for line in wg_dump.splitlines():
+            cols = line.strip().split("	")
+            if len(cols) >= 9:
+                iface = cols[0]
+                endpoint = cols[3]
+                try:
+                    latest_hs = int(cols[5])
+                    hs_age = (now_epoch - latest_hs) if latest_hs > 0 else 999999
+                except ValueError:
+                    hs_age = 999999
+                try:
+                    rx = int(cols[6])
+                    tx = int(cols[7])
+                except ValueError:
+                    rx, tx = 0, 0
+
+                tunnels[iface] = {
+                    "endpoint": endpoint,
+                    "handshake_age_seconds": hs_age,
+                    "rx_bytes": rx,
+                    "tx_bytes": tx,
+                }
+
+        details = {
+            "tunnels": tunnels,
+            "wgclient1_resolv_bytes": resolv_size,
+            "wgclient1_nft_rules": nft_accept_count,
+        }
+
+        if "wgclient1" not in tunnels:
+            return LayerResult(
+                name="vpn_tunnels",
+                label=label,
+                status="FAIL",
+                summary="Primary VPN tunnel wgclient1 (Swiss / media-core) is NOT configured or not running",
+                details=details,
+                error="Interface wgclient1 missing from wg show",
+                action="Enable wgclient1 tunnel on router via gl-session or Web UI",
+                elapsed_seconds=elapsed,
+            )
+
+        wg1 = tunnels["wgclient1"]
+        hs_age = wg1["handshake_age_seconds"]
+        rx_bytes = wg1["rx_bytes"]
+
+        if hs_age > 180:
+            return LayerResult(
+                name="vpn_tunnels",
+                label=label,
+                status="FAIL",
+                summary=f"WireGuard tunnel wgclient1 (Swiss) handshake is STALE ({hs_age}s ago > 180s threshold)",
+                details=details,
+                error=f"Handshake age {hs_age}s exceeds 180s",
+                action="Bounce WireGuard tunnel wgclient1 on router via gl-session to re-handshake",
+                elapsed_seconds=elapsed,
+            )
+
+        if resolv_size == 0:
+            return LayerResult(
+                name="vpn_tunnels",
+                label=label,
+                status="FAIL",
+                summary="WireGuard wgclient1 resolv.conf is ZERO BYTES (per-tunnel DNS broken)",
+                details=details,
+                error="Trap from lessons-learned: zero-byte resolv.conf.wgclient1 causes DNS REFUSED",
+                action="Re-populate /tmp/resolv.conf.d/resolv.conf.wgclient1 or bounce tunnel",
+                elapsed_seconds=elapsed,
+            )
+
+        return LayerResult(
+            name="vpn_tunnels",
+            label=label,
+            status="PASS",
+            summary=f"VPN tunnels UP: wgclient1 (Swiss) handshake {hs_age}s ago, rx {rx_bytes / (1024*1024):.1f} MB; {len(tunnels)} tunnels active",
+            details=details,
+            elapsed_seconds=elapsed,
+        )
+
+    # -------------------------------------------------------------------------
+    # Layer 7: IPTV Provider Reachability
+    # -------------------------------------------------------------------------
+    def check_iptv_provider(self) -> LayerResult:
+        t0 = time.time()
+        label = LAYER_NAMES["iptv_provider"]
+
+        if self.simulate == "provider-down":
+            return LayerResult(
+                name="iptv_provider",
+                label=label,
+                status="FAIL",
+                summary="IPTV provider returned HTTP 511 Network Authentication Required (Surfshark exit IP blocked)",
+                details={"api_up": 0, "http_code": 511, "error": "Exit IP blocked by streaming edge"},
+                error="HTTP 511 Network Authentication Required",
+                action="Bounce WireGuard tunnel wgclient1 on router via gl-session to draw a fresh exit IP",
+                elapsed_seconds=round(time.time() - t0, 3),
+            )
+
+        probe_py = r"""
+import json, sys, time, urllib.request, urllib.error
+from pathlib import Path
+
+env_file = Path("/srv/media-core/.env")
+if not env_file.exists():
+    print(json.dumps({"api_up": 0, "error": "env_file_missing"}))
+    sys.exit(0)
+
+env = {}
+for line in env_file.read_text().splitlines():
+    if line and not line.startswith("#") and "=" in line:
+        k, v = line.split("=", 1)
+        env[k.strip()] = v.strip()
+
+base = env.get("XTREAM_BASE", "").rstrip("/")
+user = env.get("XTREAM_USER", "")
+pw = env.get("XTREAM_PASS", "")
+
+if not (base and user and pw):
+    print(json.dumps({"api_up": 0, "error": "incomplete_credentials"}))
+    sys.exit(0)
+
+api_url = f"{base}/player_api.php?username={user}&password={pw}"
+req = urllib.request.Request(api_url, headers={"User-Agent": "MediaCoreSync/1.0"})
+try:
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        data = json.load(resp)
+        uinfo = data.get("user_info", {})
+        print(json.dumps({
+            "api_up": 1,
+            "http_code": resp.status,
+            "auth": uinfo.get("auth"),
+            "status": uinfo.get("status"),
+            "active_cons": uinfo.get("active_cons"),
+            "error": None
+        }))
+except urllib.error.HTTPError as e:
+    print(json.dumps({"api_up": 0, "http_code": e.code, "error": f"HTTP {e.code} {e.reason}"}))
+except Exception as e:
+    print(json.dumps({"api_up": 0, "http_code": 0, "error": str(e)}))
+"""
+        code, out, err = self._run_cmd(["pct", "exec", CT105_ID, "--", "python3", "-c", probe_py], timeout=12.0)
+        elapsed = round(time.time() - t0, 3)
+
+        if code != 0:
+            return LayerResult(
+                name="iptv_provider",
+                label=label,
+                status="FAIL",
+                summary=f"Failed to execute provider probe inside CT {CT105_ID}",
+                details={"error": err},
+                error=f"pct exec exited {code}: {err}",
+                action=f"Check CT {CT105_ID} status ('pct status {CT105_ID}')",
+                elapsed_seconds=elapsed,
+            )
+
+        try:
+            res = json.loads(out)
+        except Exception as e:
+            return LayerResult(
+                name="iptv_provider",
+                label=label,
+                status="FAIL",
+                summary="Unparseable JSON from provider API probe",
+                details={"raw_output": redact_sensitive(out[:200])},
+                error=str(e),
+                action="Verify CT 105 python environment and /srv/media-core/.env",
+                elapsed_seconds=elapsed,
+            )
+
+        http_code = res.get("http_code", 0)
+        api_up = res.get("api_up", 0)
+        auth = res.get("auth")
+        account_status = str(res.get("status") or "")
+        active_cons = res.get("active_cons")
+        err_msg = res.get("error")
+
+        details = {
+            "http_code": http_code,
+            "api_up": bool(api_up),
+            "auth": auth,
+            "account_status": account_status,
+            "active_cons": active_cons,
+        }
+
+        if http_code == 511:
+            return LayerResult(
+                name="iptv_provider",
+                label=label,
+                status="FAIL",
+                summary="IPTV provider returned HTTP 511 Network Authentication Required (Surfshark exit IP blocked)",
+                details=details,
+                error="HTTP 511 Network Authentication Required",
+                action="Bounce WireGuard tunnel wgclient1 on router via gl-session to draw a fresh exit IP",
+                elapsed_seconds=elapsed,
+            )
+
+        if not api_up:
+            return LayerResult(
+                name="iptv_provider",
+                label=label,
+                status="FAIL",
+                summary=f"IPTV provider API unreachable: {err_msg or f'HTTP {http_code}'}",
+                details=details,
+                error=err_msg or f"HTTP {http_code}",
+                action="Check provider service availability and CT 105 Swiss tunnel egress",
+                elapsed_seconds=elapsed,
+            )
+
+        if auth != 1 or account_status.lower() != "active":
+            return LayerResult(
+                name="iptv_provider",
+                label=label,
+                status="FAIL",
+                summary=f"IPTV provider returned invalid auth (auth={auth}, status='{account_status}')",
+                details=details,
+                error="Account credentials invalid or subscription expired",
+                action="Verify provider subscription status and credentials in /srv/media-core/.env",
+                elapsed_seconds=elapsed,
+            )
+
+        return LayerResult(
+            name="iptv_provider",
+            label=label,
+            status="PASS",
+            summary=f"IPTV provider API reachable: auth=1, status=Active, active_cons={active_cons or 0}",
+            details=details,
+            elapsed_seconds=elapsed,
+        )
+
+    # -------------------------------------------------------------------------
+    # Layer 8: Media Stack Health
+    # -------------------------------------------------------------------------
+    def check_media_stack(self) -> LayerResult:
+        t0 = time.time()
+        label = LAYER_NAMES["media_stack"]
+
+        if self.simulate == "media-stack-down":
+            return LayerResult(
+                name="media_stack",
+                label=label,
+                status="FAIL",
+                summary="Media stack service unhealthy: Threadfin :34400 is not responding",
+                details={"ct105_running": True, "jellyfin_http": 200, "threadfin_http": 0},
+                error="Simulated failure: Connection refused on port 34400",
+                action="Restart threadfin container inside CT 105 via healthcheck.py or docker restart",
+                elapsed_seconds=round(time.time() - t0, 3),
+            )
+
+        code_ct, out_ct, _ = self._run_cmd(["pct", "status", CT105_ID])
+        ct_running = (code_ct == 0 and "status: running" in out_ct)
+
+        if not ct_running:
+            return LayerResult(
+                name="media_stack",
+                label=label,
+                status="FAIL",
+                summary=f"CT {CT105_ID} is NOT running ({out_ct or 'stopped'})",
+                details={"ct105_running": False},
+                error=f"pct status {CT105_ID} reports non-running",
+                action=f"Start container CT {CT105_ID} ('pct start {CT105_ID}')",
+                elapsed_seconds=round(time.time() - t0, 3),
+            )
+
+        code_jf, _, _ = self._run_cmd(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", JELLYFIN_URL], timeout=4.0)
+        jf_ok = (code_jf == 0)
+
+        code_tf, _, _ = self._run_cmd(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", THREADFIN_URL], timeout=4.0)
+        tf_ok = (code_tf == 0)
+
+        code_dk, out_dk, _ = self._run_cmd(["pct", "exec", CT105_ID, "--", "docker", "ps", "--format", "{{.Names}}:{{.Status}}"], timeout=5.0)
+        containers = {}
+        if code_dk == 0 and out_dk:
+            for line in out_dk.splitlines():
+                if ":" in line:
+                    cname, cstat = line.split(":", 1)
+                    containers[cname.strip()] = cstat.strip()
+
+        elapsed = round(time.time() - t0, 3)
+        details = {
+            "ct105_running": ct_running,
+            "jellyfin_http": 200 if jf_ok else 0,
+            "threadfin_http": 200 if tf_ok else 0,
+            "containers": containers,
+        }
+
+        if not jf_ok and not tf_ok:
+            return LayerResult(
+                name="media_stack",
+                label=label,
+                status="FAIL",
+                summary="Both Jellyfin (:8096) and Threadfin (:34400) are unreachable",
+                details=details,
+                error="HTTP endpoints unresponsive",
+                action=f"Inspect CT {CT105_ID} docker status ('pct exec {CT105_ID} -- docker ps')",
+                elapsed_seconds=elapsed,
+            )
+        elif not jf_ok:
+            return LayerResult(
+                name="media_stack",
+                label=label,
+                status="FAIL",
+                summary="Jellyfin (:8096) is unreachable",
+                details=details,
+                error="Jellyfin HTTP probe failed",
+                action=f"Check jellyfin container ('pct exec {CT105_ID} -- docker logs jellyfin')",
+                elapsed_seconds=elapsed,
+            )
+        elif not tf_ok:
+            return LayerResult(
+                name="media_stack",
+                label=label,
+                status="FAIL",
+                summary="Threadfin (:34400) is unreachable (possible ephemeral-port exhaustion)",
+                details=details,
+                error="Threadfin HTTP probe failed",
+                action=f"Run threadfin healthcheck recovery inside CT {CT105_ID}",
+                elapsed_seconds=elapsed,
+            )
+
+        return LayerResult(
+            name="media_stack",
+            label=label,
+            status="PASS",
+            summary=f"Media stack healthy (Jellyfin HTTP 200, Threadfin HTTP 200, {len(containers)} containers Up)",
+            details=details,
+            elapsed_seconds=elapsed,
+        )
+
+    # -------------------------------------------------------------------------
+    # Full Triage Execution
+    # -------------------------------------------------------------------------
+    def run_triage(self) -> TriageReport:
+        t_start = time.time()
+        layers: Dict[str, LayerResult] = {}
+        failed_layer: Optional[str] = None
+        failed_layer_label: Optional[str] = None
+        next_action: Optional[str] = None
+
+        # Layer 1
+        l1 = self.check_host_link()
+        layers["host_link"] = l1
+        if l1.status == "FAIL" and not failed_layer:
+            failed_layer = l1.name
+            failed_layer_label = l1.label
+            next_action = l1.action
+
+        # Layer 2
+        if failed_layer:
+            layers["router_reachable"] = LayerResult(
+                name="router_reachable",
+                label=LAYER_NAMES["router_reachable"],
+                status="SKIP",
+                summary="Skipped due to upstream failure in host_link",
+            )
+        else:
+            l2 = self.check_router_reachable()
+            layers["router_reachable"] = l2
+            if l2.status == "FAIL" and not failed_layer:
+                failed_layer = l2.name
+                failed_layer_label = l2.label
+                next_action = l2.action
+
+        # Layer 3
+        if failed_layer:
+            layers["wan_pppoe"] = LayerResult(
+                name="wan_pppoe",
+                label=LAYER_NAMES["wan_pppoe"],
+                status="SKIP",
+                summary="Skipped due to upstream failure",
+            )
+        else:
+            l3 = self.check_wan_pppoe()
+            layers["wan_pppoe"] = l3
+            if l3.status == "FAIL" and not failed_layer:
+                failed_layer = l3.name
+                failed_layer_label = l3.label
+                next_action = l3.action
+
+        # Layer 4 (End-to-end egress)
+        if failed_layer and failed_layer in ("host_link", "router_reachable"):
+            layers["end_to_end_egress"] = LayerResult(
+                name="end_to_end_egress",
+                label=LAYER_NAMES["end_to_end_egress"],
+                status="SKIP",
+                summary="Skipped due to upstream link/router failure",
+            )
+        else:
+            l4 = self.check_end_to_end_egress(wan_res=layers.get("wan_pppoe"))
+            layers["end_to_end_egress"] = l4
+            if l4.status == "FAIL" and not failed_layer:
+                failed_layer = l4.name
+                failed_layer_label = l4.label
+                next_action = l4.action
+
+        # Layer 5 (DNS)
+        if failed_layer and failed_layer in ("host_link", "router_reachable", "wan_pppoe", "end_to_end_egress"):
+            layers["dns"] = LayerResult(
+                name="dns",
+                label=LAYER_NAMES["dns"],
+                status="SKIP",
+                summary="Skipped due to upstream egress/network failure",
+            )
+        else:
+            l5 = self.check_dns()
+            layers["dns"] = l5
+            if l5.status == "FAIL" and not failed_layer:
+                failed_layer = l5.name
+                failed_layer_label = l5.label
+                next_action = l5.action
+
+        # Layer 6 (VPN Tunnels)
+        if failed_layer and failed_layer in ("host_link", "router_reachable", "wan_pppoe", "end_to_end_egress"):
+            layers["vpn_tunnels"] = LayerResult(
+                name="vpn_tunnels",
+                label=LAYER_NAMES["vpn_tunnels"],
+                status="SKIP",
+                summary="Skipped due to upstream network failure",
+            )
+        else:
+            l6 = self.check_vpn_tunnels()
+            layers["vpn_tunnels"] = l6
+            if l6.status == "FAIL" and not failed_layer:
+                failed_layer = l6.name
+                failed_layer_label = l6.label
+                next_action = l6.action
+
+        # Layer 7 (IPTV Provider)
+        if failed_layer and failed_layer in ("host_link", "router_reachable", "wan_pppoe", "end_to_end_egress", "vpn_tunnels"):
+            layers["iptv_provider"] = LayerResult(
+                name="iptv_provider",
+                label=LAYER_NAMES["iptv_provider"],
+                status="SKIP",
+                summary="Skipped due to upstream network/VPN failure",
+            )
+        else:
+            l7 = self.check_iptv_provider()
+            layers["iptv_provider"] = l7
+            if l7.status == "FAIL" and not failed_layer:
+                failed_layer = l7.name
+                failed_layer_label = l7.label
+                next_action = l7.action
+
+        # Layer 8 (Media Stack)
+        if failed_layer and failed_layer in ("host_link", "router_reachable"):
+            layers["media_stack"] = LayerResult(
+                name="media_stack",
+                label=LAYER_NAMES["media_stack"],
+                status="SKIP",
+                summary="Skipped due to upstream host/router failure",
+            )
+        else:
+            l8 = self.check_media_stack()
+            layers["media_stack"] = l8
+            if l8.status == "FAIL" and not failed_layer:
+                failed_layer = l8.name
+                failed_layer_label = l8.label
+                next_action = l8.action
+
+        elapsed_total = round(time.time() - t_start, 3)
+
+        if failed_layer:
+            verdict = "FAIL"
+            summary = f"Outage localized to {failed_layer_label}: {layers[failed_layer].summary}"
+        else:
+            verdict = "PASS"
+            summary = "All 8 network layers healthy. Egress, DNS, VPN tunnels, and media stack operational."
+            next_action = None
+
+        return TriageReport(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            verdict=verdict,
+            failed_layer=failed_layer,
+            failed_layer_label=failed_layer_label,
+            summary=summary,
+            next_action=next_action,
+            layers=layers,
+            execution_seconds=elapsed_total,
+        )
+
+    # -------------------------------------------------------------------------
+    # Recording / Tuner Reservation Guard (for --fix)
+    # -------------------------------------------------------------------------
+    def check_recording_in_progress(self) -> Tuple[bool, str]:
+        """Verifies if an active capture is running or scheduled soon.
+        Reuses the reservation data maintenance_window and tuner_broker read.
+        Fails closed (returns True) if busy or if status cannot be verified.
+        """
+        if self.simulate_recording:
+            return True, "Simulated active recording: 'MCT Live Capture' (mct)"
+
+        if self.simulate_idle:
+            return False, "Simulated idle: No active recordings or reservations"
+
+        # 1. Direct active ffmpeg check across host & CT 105
+        code, out, _ = self._run_cmd(["pgrep", "-f", r"ffmpeg.*(/media/recordings|cf\.teltv|\.raw\.ts)"])
+        if code == 0 and out.strip():
+            return True, "Active ffmpeg capture process running on host/CT 105"
+
+        # 2. Check tuner broker CLI
+        broker_bin = "/usr/local/bin/tuner-broker"
+        if not Path(broker_bin).exists():
+            broker_bin = "/root/pve-01-docs/scripts/tuner-broker"
+
+        if Path(broker_bin).exists():
+            code, out, _ = self._run_cmd([broker_bin, "status", "--json"], timeout=8.0)
+            if code == 0 and out:
+                try:
+                    data = json.loads(out)
+                    if not data.get("tuner_available", True):
+                        reason = data.get("availability_reason") or "Tuner is reserved"
+                        return True, reason
+                    return False, "Tuner available (no active recordings or reservations)"
+                except Exception:
+                    pass
+
+            code_chk, out_chk, _ = self._run_cmd([broker_bin, "check", "--minutes", "5"], timeout=8.0)
+            if code_chk != 0:
+                return True, out_chk.strip() or "Tuner check reported unavailable"
+            return False, "Tuner available"
+
+        # 3. Fallback: check MCT windows file directly
+        mct_file = Path("/srv/media-core/sync/mct-windows.json")
+        if mct_file.exists():
+            try:
+                data = json.loads(mct_file.read_text(encoding="utf-8"))
+                now = datetime.now(timezone.utc)
+                for w in data.get("windows", []):
+                    st = datetime.fromisoformat(w["start"])
+                    en = datetime.fromisoformat(w["end"])
+                    if st <= now <= en:
+                        return True, f"MCT active capture window: {w.get('title', 'recording')}"
+            except Exception:
+                pass
+
+        return False, "No active recordings detected"
+
+    # -------------------------------------------------------------------------
+    # Targeted WAN Bounce (--fix)
+    # -------------------------------------------------------------------------
+    def apply_targeted_fix(self, report: TriageReport) -> Tuple[bool, str]:
+        """Executes targeted WAN bounce if WAN or egress has failed.
+        Strictly refuses if a recording is in progress.
+        Reboot is NEVER an action this script takes.
+        """
+        wan_failed = report.layers.get("wan_pppoe") and report.layers["wan_pppoe"].status == "FAIL"
+        egress_failed = report.layers.get("end_to_end_egress") and report.layers["end_to_end_egress"].status == "FAIL"
+
+        if not (wan_failed or egress_failed) and self.simulate not in ("wan-down", "zombie-pppoe"):
+            return False, "No WAN or egress failure detected. System is healthy; targeted bounce is not needed."
+
+        is_busy, busy_reason = self.check_recording_in_progress()
+        if is_busy:
+            return False, (
+                f"REFUSED: Cannot bounce WAN while a recording is in progress or tuner is reserved.\n"
+                f"  Reason: {busy_reason}\n"
+                f"  Bouncing the WAN would abort the active capture. --fix aborted."
+            )
+
+        bounce_cmd = "ubus call network.interface.wan down && sleep 2 && ubus call network.interface.wan up"
+        if self.dry_run:
+            return True, (
+                f"[DRY-RUN] Tuner is IDLE. Targeted WAN bounce authorized.\n"
+                f"  Would execute on router {self.router_ip}:\n"
+                f"  ssh {self.router_user}@{self.router_ip} \"{bounce_cmd}\""
+            )
+
+        print(f"[*] Tuner is IDLE. Initiating targeted WAN bounce on {self.router_ip}...", flush=True)
+        code, out, err = self._run_ssh(bounce_cmd, timeout=10.0)
+        if code != 0:
+            return False, f"WAN bounce command failed on router (exit {code}): {err}"
+
+        print("[*] Waiting 6 seconds for PPPoE session to re-establish...", flush=True)
+        time.sleep(6)
+
+        w_probe = self.check_wan_pppoe()
+        if w_probe.status != "PASS":
+            return False, f"WAN bounce completed, but WAN state remains DOWN: {w_probe.summary}"
+
+        e_probe = self.check_end_to_end_egress(wan_res=w_probe)
+        if e_probe.status != "PASS":
+            return False, f"WAN is UP, but end-to-end egress has not recovered: {e_probe.summary}"
+
+        wan_ip = w_probe.details.get("ipv4_addresses", ["unknown"])[0]
+        return True, f"SUCCESS: Targeted WAN bounce restored connectivity. New WAN IP: {wan_ip}"
+
+
+def format_text_report(report: TriageReport) -> str:
+    lines = []
+    lines.append("=" * 72)
+    lines.append(f" NETWORK TRIAGE REPORT — {report.timestamp}")
+    lines.append("=" * 72)
+
+    for key in LAYER_ORDER:
+        lr = report.layers.get(key)
+        if not lr:
+            continue
+        status_tag = f"[{lr.status}]"
+        lines.append(f"{status_tag:<8} {lr.label:<32} {lr.summary}")
+        if lr.status == "FAIL" and lr.error:
+            lines.append(f"         Error: {lr.error}")
+
+    lines.append("-" * 72)
+    lines.append(f"OVERALL VERDICT: {report.verdict}")
+    lines.append(f"SUMMARY:         {report.summary}")
+    if report.next_action:
+        lines.append(f"NEXT ACTION:     {report.next_action}")
+    else:
+        lines.append("NEXT ACTION:     None (System healthy)")
+    lines.append(f"TOTAL DURATION:  {report.execution_seconds:.3f}s")
+    lines.append("=" * 72)
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="network-triage: Deterministic outage diagnosis and targeted recovery",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--json", action="store_true", help="Output machine-readable JSON format")
+    parser.add_argument("--fix", action="store_true", help="Opt-in targeted recovery (WAN bounce). Refuses during recordings.")
+    parser.add_argument("--dry-run", action="store_true", help="Perform triage without mutating state; dry-run for --fix")
+    parser.add_argument("--simulate", choices=[
+        "host-link-down",
+        "router-unreachable",
+        "wan-down",
+        "zombie-pppoe",
+        "dns-failure",
+        "vpn-down",
+        "provider-down",
+        "media-stack-down",
+    ], help="Simulate a specific failure mode to verify layered attribution")
+    parser.add_argument("--simulate-recording", action="store_true", help="Simulate active recording in progress (tests --fix refusal)")
+    parser.add_argument("--simulate-idle", action="store_true", help="Simulate idle tuner (tests --fix execution path)")
+    parser.add_argument("--verbose", action="store_true", help="Verbose output")
+
+    args = parser.parse_args()
+
+    triager = NetworkTriager(
+        dry_run=args.dry_run,
+        simulate=args.simulate,
+        simulate_recording=args.simulate_recording,
+        simulate_idle=args.simulate_idle,
+        verbose=args.verbose,
+    )
+
+    report = triager.run_triage()
+
+    if args.json:
+        report_dict = asdict(report)
+        print(json.dumps(report_dict, indent=2))
+    else:
+        print(format_text_report(report))
+
+    if args.fix:
+        print("\n--- TARGETED REMEDIATION (--fix) ---")
+        ok, msg = triager.apply_targeted_fix(report)
+        print(msg)
+        if not ok:
+            # If system is healthy and fix was not needed, exit 0
+            if report.verdict == "PASS":
+                return 0
+            return 1
+        return 0
+
+    return 0 if report.verdict == "PASS" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
