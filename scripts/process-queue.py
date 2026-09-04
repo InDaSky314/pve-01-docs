@@ -440,6 +440,7 @@ def process_one(container_path):
     if not out_dur or abs(out_dur - expected) > DURATION_TOLERANCE:
         log(f"ERROR (sanity check failed: output {out_dur}, expected ~{expected:.0f}) "
             f"— output discarded, original untouched")
+        rescue_original(host_path, out_path, "output duration sanity check")
         shutil.rmtree(job_work, ignore_errors=True)
         return True
 

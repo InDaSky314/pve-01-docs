@@ -1139,7 +1139,9 @@ def epg_channel_options(team: str, start: datetime, end: datetime,
         con.close()
     except Exception:
         return []
+    used_fallback = False
     if len(rows) < 2:
+        used_fallback = True
         # Fall back to the programme actually airing in this slot. Team-token
         # matching only works when the EPG names the team: there is not a single
         # "Packers" title in the guide, while a Premier League slot spans 7
@@ -1164,6 +1166,26 @@ def epg_channel_options(team: str, start: datetime, end: datetime,
         except Exception:
             pass
 
+    if used_fallback and rows:
+        # A shared title is NOT proof of a shared broadcast. "Live: College
+        # Football" spans 17 channels in one slot that are 17 DIFFERENT regional
+        # games, with empty subtitles to tell them apart. Keep only channels from
+        # the same network family as the resolved one: the Sky Sport Bundesliga
+        # variants genuinely carry one match and share tokens, while Chicago CBS 2
+        # and CW 21 Birmingham share nothing and are correctly rejected.
+        anchor_name = ""
+        for num, name, _t in rows:
+            if str(num) == str(resolved_num):
+                anchor_name = name or ""
+                break
+        stop = {"hd", "the", "tv", "channel", "and", "sport", "sports", "live"}
+        toks = {w for w in re.findall(r"[A-Za-zÄÖÜäöüß]{4,}", anchor_name.lower()) if w not in stop}
+        if toks:
+            rows = [r for r in rows
+                    if toks & {w for w in re.findall(r"[A-Za-zÄÖÜäöüß]{4,}", (r[1] or "").lower())}]
+        else:
+            rows = [r for r in rows if str(r[0]) == str(resolved_num)]
+
     seen, out = set(), []
     for num, name, title in rows:
         if num in seen:
@@ -1183,7 +1205,13 @@ def recordings(now: datetime) -> tuple[list[dict], list[str]]:
         # another - every cancel failed with "not found". This project has been
         # bitten by reading timers.json before (the stall watchdog, which never
         # sees Status=InProgress there). One source of truth.
-        for t in (get_existing_timers() or json.loads(pct("cat", JELLYFIN_TIMERS))):
+        # Distinguish "Jellyfin has no timers" from "the API call failed". An
+        # earlier `get_existing_timers() or <disk>` fell through on [], so a
+        # healthy server with zero timers silently resurrected stale ghost timers
+        # from timers.json. Only fall back when the request itself fails.
+        _live = jf_request("/emby/LiveTv/Timers")
+        _timers = _live.get("Items", []) if isinstance(_live, dict) else None
+        for t in (_timers if _timers is not None else json.loads(pct("cat", JELLYFIN_TIMERS))):
             if t.get("Status") in JF_DONE:
                 continue
             start = datetime.fromisoformat(
@@ -1674,7 +1702,7 @@ function pills(g, past){let h='';
     if(sameGame && !past && !g.done && (g.bookingId || g.id)){
       const gid = esc(g.bookingId || g.id);
       const engVal = esc(g.engine || 'jellyfin');
-      h+=`<button class="pill btn-cancel" style="background:transparent;border:1px solid var(--live);color:var(--live);cursor:pointer;font-family:inherit;line-height:1.2;margin-left:4px" onclick="cancelBooking(this, '${g.timerId || gid}', '${engVal}')">Cancel</button>`;
+      h+=`<button class="pill btn-cancel" style="background:transparent;border:1px solid var(--live);color:var(--live);cursor:pointer;font-family:inherit;line-height:1.2;margin-left:4px" onclick="cancelBooking(this, '${esc(g.timerId || gid)}', '${engVal}')">Cancel</button>`;
     }
   }
   if(!past && !g.done && !sameGame && g.team && g.kind){
