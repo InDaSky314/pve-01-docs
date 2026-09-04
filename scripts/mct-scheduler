@@ -68,13 +68,28 @@ def reap_running(bookings: list[dict], changed: list[bool]) -> None:
     for b in bookings:
         if b.get("status") != "running":
             continue
-        pid = b.get("pid")
-        if is_pid_running(pid):
-            continue
+        unit = b.get("unit")
+        if unit:
+            act = subprocess.run(["systemctl", "is-active", unit],
+                                 capture_output=True, text=True).stdout.strip()
+            if act in ("active", "activating", "deactivating"):
+                continue
+        else:
+            # legacy bookings launched before transient units
+            if is_pid_running(b.get("pid")):
+                continue
 
         # Process is no longer running — determine exit status
         statusfile = b.get("statusfile")
         exit_code = None
+        if unit:
+            shown = subprocess.run(["systemctl", "show", unit, "-p", "ExecMainStatus", "--value"],
+                                   capture_output=True, text=True).stdout.strip()
+            if shown.isdigit():
+                exit_code = int(shown)
+            # release the transient unit name so a re-booking can reuse it
+            subprocess.run(["systemctl", "reset-failed", unit],
+                           capture_output=True, text=True)
         if statusfile and Path(statusfile).exists():
             try:
                 content = Path(statusfile).read_text().strip()
@@ -94,7 +109,11 @@ def reap_running(bookings: list[dict], changed: list[bool]) -> None:
             except Exception:
                 pass
 
-        if exit_code == 0 or (exit_code is None and log_success):
+        # Require the pipeline-complete marker, not just a zero exit. A capture
+        # killed mid-flight (systemctl stop, host power-down) reports
+        # ExecMainStatus=0 and would otherwise be recorded as a success - exactly
+        # the silent-failure mode that hid last night's loss until morning.
+        if log_success:
             b["status"] = "done"
             b["exit_code"] = 0
             b["completed_at"] = datetime.now(LOCAL_TZ).isoformat()
@@ -155,26 +174,31 @@ def trigger_upcoming(bookings: list[dict], now: datetime, changed: list[bool], d
                 log(f"[DRY-RUN] Would launch: {' '.join(cmd)} (lead={lead:.1f}s)")
                 continue
 
-            wrapper = f'"{MCT_BIN}" "$@" > "{logfile}" 2>&1; echo $? > "{statusfile}"'
+            # Each capture gets its own transient unit. KillMode=process on the
+            # scheduler kept children alive but logged "Unit process remains running
+            # after unit stopped" once per survivor per 60s tick - hundreds of lines
+            # into journald and Loki over a 4h capture (measured: 16 lines from 4
+            # ticks). A transient unit owns its own cgroup, so the oneshot tick exits
+            # clean, and systemd tracks status and exit code natively.
+            unit = f"mct-{slug}-{int(now.timestamp())}"
+            run_cmd = [
+                "systemd-run", f"--unit={unit}",
+                f"--description=MCT capture: {b.get('title') or b.get('name')}",
+                "--service-type=simple",
+                f"--property=StandardOutput=append:{logfile}",
+                f"--property=StandardError=append:{logfile}",
+                *cmd,
+            ]
             try:
-                # Unbuffered: last night's capture died with its startup line still in
-                # Python's block buffer, leaving a 0-byte log and no diagnostic at all.
-                child_env = dict(os.environ, PYTHONUNBUFFERED="1")
-                proc = subprocess.Popen(
-                    ["bash", "-c", wrapper, "mct-runner", *cmd[1:]],
-                    start_new_session=True,
-                    env=child_env,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                res = subprocess.run(run_cmd, capture_output=True, text=True)
+                if res.returncode != 0:
+                    raise RuntimeError(res.stderr.strip()[-200:] or f"systemd-run exit {res.returncode}")
+                b["unit"] = unit
                 b["status"] = "running"
-                b["pid"] = proc.pid
                 b["logfile"] = logfile
-                b["statusfile"] = statusfile
                 b["launched_at"] = now.isoformat()
                 changed[0] = True
-                log(f"Launched MCT capture for '{b.get('title') or b.get('name')}' (PID {proc.pid}, log={logfile}, lead={lead:.1f}s)")
+                log(f"Launched MCT capture for '{b.get('title') or b.get('name')}' (unit={unit}, log={logfile}, lead={lead:.1f}s)")
             except Exception as exc:
                 b["status"] = "failed"
                 b["error"] = f"Failed to spawn mct: {exc}"
