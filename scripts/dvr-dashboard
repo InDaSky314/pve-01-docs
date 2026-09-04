@@ -22,6 +22,7 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -1105,6 +1106,73 @@ def channel_names() -> dict[str, str]:
     return out
 
 
+EPG_DB = Path("/var/lib/dvr-dashboard/epg.db")
+
+
+def epg_channel_options(team: str, start: datetime, end: datetime,
+                        resolved_num: str = "") -> list[dict]:
+    """Every channel carrying this fixture, from the EPG index.
+
+    A game is often simulcast - regional affiliates, national feeds, alternates.
+    Offering the choice matters because a channel can be in a provider group that
+    is failing (DirecTV Stream has been returning 511s) while another carrying the
+    same fixture works, and because the auto-resolved channel is not always the one
+    with guide data: tonight the dashboard picked 1509 "MLB", which carries no
+    programmes at all, over 121 "Milwaukee Brewers HD", which carries the fixture.
+    """
+    if not team or not EPG_DB.exists():
+        return []
+    tok = team.split()[0]
+    if len(tok) < 4:
+        return []
+    lo = (start - timedelta(hours=1)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    hi = (end + timedelta(hours=1)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        con = sqlite3.connect(f"file:{EPG_DB}?mode=ro", uri=True, timeout=3)
+        rows = con.execute(
+            """SELECT DISTINCT ch.number, ch.name, p.title
+               FROM programmes p JOIN channels ch ON ch.id = p.channel_id
+               WHERE p.title LIKE ? AND p.start_utc BETWEEN ? AND ?
+                 AND ch.number IS NOT NULL AND ch.number != ''
+               ORDER BY CAST(ch.number AS INTEGER)""",
+            (f"%{tok}%", lo, hi)).fetchall()
+        con.close()
+    except Exception:
+        return []
+    if len(rows) < 2:
+        # Fall back to the programme actually airing in this slot. Team-token
+        # matching only works when the EPG names the team: there is not a single
+        # "Packers" title in the guide, while a Premier League slot spans 7
+        # channels and NFL Football 2. Take the title on any channel that does
+        # match the slot, then find every channel carrying that same title.
+        try:
+            con = sqlite3.connect(f"file:{EPG_DB}?mode=ro", uri=True, timeout=3)
+            anchor = con.execute(
+                """SELECT p.title FROM programmes p JOIN channels ch ON ch.id = p.channel_id
+                   WHERE p.start_utc BETWEEN ? AND ? AND ch.number = ?
+                   ORDER BY p.start_utc LIMIT 1""",
+                (lo, hi, str(resolved_num or ""))).fetchone()
+            if anchor and anchor[0]:
+                rows = con.execute(
+                    """SELECT DISTINCT ch.number, ch.name, p.title
+                       FROM programmes p JOIN channels ch ON ch.id = p.channel_id
+                       WHERE p.title = ? AND p.start_utc BETWEEN ? AND ?
+                         AND ch.number IS NOT NULL AND ch.number != ''
+                       ORDER BY CAST(ch.number AS INTEGER)""",
+                    (anchor[0], lo, hi)).fetchall() or rows
+            con.close()
+        except Exception:
+            pass
+
+    seen, out = set(), []
+    for num, name, title in rows:
+        if num in seen:
+            continue
+        seen.add(num)
+        out.append({"number": str(num), "name": name or "", "programme": title or ""})
+    return out
+
+
 def recordings(now: datetime) -> tuple[list[dict], list[str]]:
     items, problems = [], []
     chmap = channel_names()
@@ -1188,6 +1256,10 @@ def tag_recordings(games: list[dict], recs: list[dict]) -> None:
         hits = [r for r in recs
                 if datetime.fromisoformat(r["start"]) < ge
                 and datetime.fromisoformat(r["end"]) > gs]
+        if ge > datetime.now(LOCAL):
+            g["channelOptions"] = epg_channel_options(
+                g.get("team", ""), gs, ge,
+                "".join(c for c in str(g.get("channel") or "").split(" ")[0] if c.isdigit()))
         g["recording"] = hits[0]["name"] if hits else None
         g["recordingIsThisGame"] = False
         g["engine"] = hits[0].get("engine", hits[0].get("source", "jellyfin").lower()) if hits else None
@@ -1211,6 +1283,12 @@ def tag_recordings(games: list[dict], recs: list[dict]) -> None:
                     len(tok) >= 4 and (tok in rname.lower() or tok in rch.lower())):
                 g["recording"] = rname
                 g["recordingIsThisGame"] = True
+                # Show the channel actually being recorded, not the auto-resolved
+                # guess. Tonight the row read "1509 MLB" while the booking was on
+                # 121 - the same mismatch that sent the first booking to a channel
+                # with no guide data.
+                if rch:
+                    g["channel"] = rch
                 # Cancel used to send the GAME id (e.g. 401816802), which matches
                 # neither a Jellyfin timer's Id nor its ProgramId (often null), so
                 # every cancel failed with "Booking or timer not found". Hand the
@@ -1535,9 +1613,10 @@ async function toggleTeam(team, newState) {
   }
 }
 
-async function recordGame(btn, encodedGame, engine) {
+async function recordGame(btn, encodedGame, engine, channel) {
   const game = JSON.parse(decodeURIComponent(encodedGame));
   game.engine = engine || 'jellyfin';
+  if (channel) game.channel = channel;
   const origText = btn.textContent;
   btn.disabled = true;
   btn.textContent = 'Scheduling…';
@@ -1601,12 +1680,19 @@ function pills(g, past){let h='';
   if(!past && !g.done && !sameGame && g.team && g.kind){
     const enc = encodeURIComponent(JSON.stringify(g));
     const gid = 'g' + (g.id || Math.random().toString(36).substring(2, 8));
+    const chOpts = (g.channelOptions || []);
+    const chSel = chOpts.length > 1
+      ? `<select class="engine-select channel-select" aria-label="Channel for ${esc(g.name)}">`
+        + chOpts.map(c => `<option value="${esc(c.number)}">${esc(c.number)} ${esc(c.name)}</option>`).join('')
+        + `</select>`
+      : '';
     h+=`<div class="rec-control">
+      ${chSel}
       <select class="engine-select" id="eng-${gid}" aria-label="Recording engine for ${esc(g.name)}">
         <option value="jellyfin" selected>Jellyfin</option>
         <option value="mct">MCT</option>
       </select>
-      <button class="pill btn-rec" onclick="recordGame(this, '${enc}', this.parentElement.querySelector('.engine-select').value)">Record</button>
+      <button class="pill btn-rec" onclick="recordGame(this, '${enc}', this.parentElement.querySelector('.engine-select:not(.channel-select)').value, (this.parentElement.querySelector('.channel-select')||{}).value)">Record</button>
     </div>`;
   }
   if(g.needsPower&&!g.done)h+='<span class="pill warn">needs power</span>';
