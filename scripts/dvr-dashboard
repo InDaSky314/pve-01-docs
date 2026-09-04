@@ -1110,7 +1110,12 @@ def recordings(now: datetime) -> tuple[list[dict], list[str]]:
     chmap = channel_names()
 
     try:
-        for t in json.loads(pct("cat", JELLYFIN_TIMERS)):
+        # Live API, not the on-disk timers.json. The file carries different (stale)
+        # ids than the server, so the UI was handed one id and cancel looked up
+        # another - every cancel failed with "not found". This project has been
+        # bitten by reading timers.json before (the stall watchdog, which never
+        # sees Status=InProgress there). One source of truth.
+        for t in (get_existing_timers() or json.loads(pct("cat", JELLYFIN_TIMERS))):
             if t.get("Status") in JF_DONE:
                 continue
             start = datetime.fromisoformat(
@@ -1126,6 +1131,10 @@ def recordings(now: datetime) -> tuple[list[dict], list[str]]:
             c_name = t.get("ChannelName") or ""
             c_disp = chmap.get(raw_cid) or chmap.get(num) or chmap.get(c_name) or (f"ch {num}" if num else "")
             items.append({"source": "Jellyfin", "engine": "jellyfin",
+                          # Carried so the UI can cancel the right object. Without
+                          # it, Cancel sent the game id, which matches neither a
+                          # timer's Id nor its ProgramId, and every cancel failed.
+                          "id": str(t.get("Id") or ""),
                           "name": t.get("Name", "recording"),
                           "channel": c_disp,
                           "subtitle": t.get("EpisodeTitle") or "",
@@ -1202,6 +1211,11 @@ def tag_recordings(games: list[dict], recs: list[dict]) -> None:
                     len(tok) >= 4 and (tok in rname.lower() or tok in rch.lower())):
                 g["recording"] = rname
                 g["recordingIsThisGame"] = True
+                # Cancel used to send the GAME id (e.g. 401816802), which matches
+                # neither a Jellyfin timer's Id nor its ProgramId (often null), so
+                # every cancel failed with "Booking or timer not found". Hand the
+                # UI the id of the object actually holding the recording.
+                g["timerId"] = r.get("id") or r.get("Id") or r.get("timerId")
                 g["engine"] = r.get("engine", r.get("source", "jellyfin").lower())
                 g["bookingStatus"] = r.get("status")
                 g["bookingId"] = r.get("id")
@@ -1581,7 +1595,7 @@ function pills(g, past){let h='';
     if(sameGame && !past && !g.done && (g.bookingId || g.id)){
       const gid = esc(g.bookingId || g.id);
       const engVal = esc(g.engine || 'jellyfin');
-      h+=`<button class="pill btn-cancel" style="background:transparent;border:1px solid var(--live);color:var(--live);cursor:pointer;font-family:inherit;line-height:1.2;margin-left:4px" onclick="cancelBooking(this, '${gid}', '${engVal}')">Cancel</button>`;
+      h+=`<button class="pill btn-cancel" style="background:transparent;border:1px solid var(--live);color:var(--live);cursor:pointer;font-family:inherit;line-height:1.2;margin-left:4px" onclick="cancelBooking(this, '${g.timerId || gid}', '${engVal}')">Cancel</button>`;
     }
   }
   if(!past && !g.done && !sameGame && g.team && g.kind){
@@ -1592,7 +1606,7 @@ function pills(g, past){let h='';
         <option value="jellyfin" selected>Jellyfin</option>
         <option value="mct">MCT</option>
       </select>
-      <button class="pill btn-rec" onclick="recordGame(this, '${enc}', document.getElementById('eng-${gid}').value)">Record</button>
+      <button class="pill btn-rec" onclick="recordGame(this, '${enc}', this.parentElement.querySelector('.engine-select').value)">Record</button>
     </div>`;
   }
   if(g.needsPower&&!g.done)h+='<span class="pill warn">needs power</span>';
