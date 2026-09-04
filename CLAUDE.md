@@ -53,6 +53,19 @@ The media stack lives in `/srv/media-core/` inside CT 105; drive it with
   updates only the primary server-side**, so after a merge run
   `git -C /root/pve-01-docs checkout main && git pull && git push origin main`
   to propagate the merge to the mirror (PRs themselves don't mirror).
+- **Bidirectional review (owner's rule, 2026-09-04).** Whoever builds, the other
+  reviews: Claude Code builds -> agy inspects; agy builds -> Claude Code inspects.
+  Neither ships its own work unreviewed. **Where the two disagree, the decision
+  goes to the owner and Claude Code together** - the reviewer does not silently
+  defer, and the builder does not overrule. Reviews are read-only: the reviewer
+  changes nothing, so a live capture or timer can never be disturbed by a review.
+  This exists because both sides have shipped defects the other caught. On
+  2026-09-04 agy found a 64KB ffmpeg pipe deadlock and a `pidof ffmpeg` that would
+  have signalled Jellyfin's own recordings, both of which Claude Code missed; the
+  same day Claude Code found agy's end-to-end scheduler test had been run by hand
+  rather than through systemd, which is why every scheduled capture died at launch.
+  A reviewer that only confirms is worse than no reviewer: ask for proof in BOTH
+  directions and test the claim rather than re-reading the evidence you were handed.
 - **Supervised-sprint delegation to agy (added 2026-08-31).** `agy-task.sh`
   originally reserved CT 105's live media-core stack for Claude Code. The
   owner opened that up for supervised sprints: Claude Code writes the brief
