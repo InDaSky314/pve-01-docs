@@ -1093,3 +1093,206 @@ config**, so it broadcasts nothing and nothing can associate to it.
 2026-07-07. The router's own online check reports **"Firmware is up-to-date"**,
 so this is already the newest available on the beta channel — the MLD bridging
 bug is present in the latest build and is worth reporting upstream to GL.iNet.
+
+---
+
+## Session addendum (2026-08-30) — the DNS stack on 9.1, and how to change it safely
+
+Written while adding encrypted DNS + an IPTV kill-switch to the BE9300
+(`192.168.9.1`). Everything below was verified live, not read off a config.
+
+### The DNS architecture (this is the part that surprises people)
+
+DNS on the BE9300 is **not** one resolver. It is one dnsmasq instance per
+egress path, plus an nftables dispatcher that decides which one a client gets.
+
+| dnsmasq instance | Port | Upstream source | Egress |
+|---|---|---|---|
+| `cfg01411c` (main) | 53 | `resolv.conf.auto` | **bare WAN** |
+| `wgclient1` | 2153 | `resolv.conf.wgclient1` | Swiss tunnel |
+| `wgclient2` | 2253 | `resolv.conf.wgclient2` | German WG |
+| `wgclient3` | 2353 | `resolv.conf.wgclient3` | — |
+| `ovpnclient1` | 4153 | `resolv.conf.ovpnclient1` | US OpenVPN |
+
+Selection happens in `chain dns_dispatcher` (nat prerouting), keyed on the
+`route_policy` mark:
+
+```
+0x1000 -> :2153   0x2000 -> :2253   0x3000 -> :2353   0xa000 -> :4153
+default -> :53
+```
+
+`iifname { br-lan, br-iot, br-guest } {tcp,udp} dport 53 jump dns_dispatcher`
+force-captures **all** client DNS — this is `gl-dns-v2.@dns[0].force_dns='1'`.
+
+Two consequences worth internalising:
+
+1. **The 9.1 is the DNS chokepoint for the whole house.** The UDR's WAN is
+   `192.168.9.110`, i.e. on 9.1's `br-lan`, and the MT6000 sits behind the UDR.
+   So downstream DNS arrives on `br-lan` post-NAT and still hits the
+   dispatcher. **You do not need DNS rules on the MT6000 or the UDR.**
+2. **The leak was never the clients — it was the router.** Clients are captured
+   correctly; it was the *main instance's own upstream* that went to Telekom
+   (`217.237.148.22/.150.51`) in the clear.
+
+### `gl-dns-v2` and the `dns` ubus module
+
+The GUI writes `gl-dns-v2`, but the real entry point is the ubus API. Reading
+is free:
+
+```bash
+ubus call gl-session call '{"module":"dns", "func":"get_config"}'
+```
+
+Backend selection is decided in the init scripts, not the config:
+
+- `mode=secure` **and** `proto=odoh` → `dnscrypt-proxy` (`/etc/dnscrypt-proxy2/`)
+- `mode=secure` **and** `proto!=odoh` → `dnsproxy` (AdGuard's), `:5453`,
+  config `/etc/dnsproxy/dnsproxy.yaml`, takes `tls://` / `https://` upstreams
+- `mode=auto` → neither; dnsmasq uses `resolv.conf.auto`
+
+**GOTCHA — `set_config` rejects a round-tripped `get_config`.** Feeding the
+whole read-back object straight back returns `Invalid params (-32602)`.
+`server_auto` (and friends) are derived/read-only. Send **only** the fields you
+are changing:
+
+```bash
+# write payload to /tmp/dns_min.json first, then:
+ubus call gl-session call "{\"module\":\"dns\",\"func\":\"set_config\",\"params\":$(cat /tmp/dns_min.json)}"
+```
+
+```json
+{"mode":"secure","proto":"dot","provider":"manual",
+ "secure_manual_list":["tls://dns.quad9.net","tls://dns.mullvad.net"],
+ "override_vpn":false,"force_dns":true}
+```
+
+`override_vpn:false` is what leaves the per-tunnel instances alone — the VPN
+paths keep resolving at the provider's own DNS, which is correct, because the
+query then exits the same tunnel as the traffic (no resolver/exit mismatch, no
+CDN mis-steering).
+
+Note there is **no `scp`** on this box (`/usr/libexec/sftp-server: not found`)
+— use `scp -O` (legacy protocol) to push files.
+
+### Persistent nftables on GL firmware
+
+Two include paths, both survive `fw4 reload`:
+
+- `/etc/nftables.d/*.nft` — OpenWrt standard, included **inside** the
+  `inet fw4` table context, so you declare `set`/`chain` blocks directly.
+  Hook your own chains at `priority filter - N` to run before fw4's.
+- `/usr/share/nftables.d/ruleset-post/*.nft` — GL's own, uses full
+  `insert rule inet fw4 ...` statements. GL writes here itself (e.g.
+  `tcp_dns_leak_drop.nft`), and `/usr/share` is at risk on firmware upgrade.
+  **Prefer `/etc/nftables.d/`.**
+
+Always `fw4 check` before `/etc/init.d/firewall reload`. Pre-existing warnings
+about `gl_vpn_rules` / `dest_proto` are GL options fw4 doesn't know — harmless.
+
+### dnsmasq → nftables set population, and its trap
+
+`config ipset` in `/etc/config/dhcp` drives dnsmasq's `--nftset`, which adds
+every resolved address for a domain into a live nft set. This is the correct
+way to handle a **Cloudflare-fronted** destination whose IPs rotate — static
+IP rules would both leak and over-block.
+
+```
+config ipset
+	list name 'iptv_dst4'
+	list name 'iptv_dst6'
+	list domain 'teltv.xyz'
+```
+
+Three things the init script does that are not obvious (`/etc/init.d/dnsmasq`,
+`dnsmasq_ipset_add` ~line 893):
+
+1. **A section with no `instance` option applies to EVERY dnsmasq instance**
+   (`filter_dnsmasq`, line 239). One section covers all five — which is what
+   you want, or clients steered to a tunnel never populate the set.
+2. **`--ipset` and `--nftset` are emitted together, from the same `name`
+   list**, and the function bails unless *both* are non-empty. So legacy
+   ipsets of the same names must exist or dnsmasq logs an error per lookup:
+   ```bash
+   ipset create iptv_dst4 hash:ip timeout 86400
+   ipset create iptv_dst6 hash:ip family inet6 timeout 86400
+   ```
+   These are runtime-only — **they do not survive a reboot.** Recreate them
+   from `/etc/rc.local` if the log noise matters.
+3. **Address family is inferred from the set name** — a trailing `4`/`6` is
+   enough. Verify the generated directive:
+   ```
+   nftset=/teltv.xyz/4#inet#fw4#iptv_dst4,6#inet#fw4#iptv_dst6
+   ```
+
+### What is deployed as of 2026-08-30
+
+| Change | Where | Effect |
+|---|---|---|
+| DoT via `dnsproxy` → Quad9 + Mullvad | `gl-dns-v2` (ubus) | main instance now `no-resolv` + `server=127.0.0.1#5453`; Telekom no longer sees queries |
+| Client DoT block | `/etc/nftables.d/20-dns-hardening.nft` | `chain user_pre_forward`, drops fwd `:853` only. **The DoH-by-IP block was rolled back same day — see incident below.** |
+| IPTV kill-switch | `/etc/nftables.d/30-iptv-killswitch.nft` | `chain iptv_killswitch`, drops `@iptv_dst4/6` unless `oifname == wgclient1` |
+| Set population | `dhcp.@ipset[0]` | dnsmasq fills the sets from live DNS answers, 24h timeout |
+
+Verification actually run (do this, not "the config looks right"):
+
+```bash
+grep -hE '^server=|^no-resolv' /var/etc/dnsmasq.conf.cfg*   # -> 127.0.0.1#5453
+nslookup heise.de 127.0.0.1                                 # -> German IP: CDN steering intact
+nft list set inet fw4 iptv_dst4                             # -> Cloudflare IPs with 24h expiry
+nft list chain inet fw4 iptv_killswitch | grep counter      # -> 0 drops = legit traffic on wgclient1
+```
+
+**Rollback:** `uci set gl-dns-v2.@dns[0].mode='auto'; uci commit` then re-run
+`set_config`; `rm /etc/nftables.d/{20-dns-hardening,30-iptv-killswitch}.nft`
+and `/etc/init.d/firewall reload`. Full pre-change dumps are in
+`/root/router-backups/be9300-{uci,nft}-<timestamp>.txt`.
+
+### Residual gaps (not fixed)
+
+- `dnsproxy`'s **bootstrap is `8.8.8.8`** (US, plaintext) — used only to
+  resolve `dns.quad9.net` / `dns.mullvad.net` at startup, but it is a real
+  US touch on every restart. GL writes this file; changing it needs a
+  post-write hook or an IP-literal upstream.
+- **DoH is not blocked at all** (rolled back, see incident). It is also
+  inherently unblockable in the general case — indistinguishable from HTTPS.
+- The `config ipset` section lives in `/etc/config/dhcp`, which the **GL GUI
+  may rewrite**. Re-check after any GUI DNS/DHCP change.
+
+### Incident (2026-08-30): the DoH block took Open-Fields offline
+
+**Symptom:** "Open-Fields Wi-Fi is not working" — clients associated fine,
+but nothing loaded.
+
+**Cause:** the `block-client-DoH` rule (drop `:443` to a set of well-known
+public resolver IPs). The reasoning behind it was that clients blocked from
+DoH would fall back to plaintext `:53` and be captured by `dns_dispatcher`.
+**They do not.** A client with encrypted DNS pinned — macOS/iOS with an
+encrypted-DNS profile or iCloud Private Relay, Android Private DNS in strict
+mode, a browser with DoH enabled — **fails closed**. Blocking its resolver
+leaves it with no DNS at all, which presents exactly as "the Wi-Fi is broken".
+
+**Blast radius:** 6188 packets dropped in ~15 minutes before rollback.
+Culprits found afterwards in `/proc/net/nf_conntrack`:
+
+- `192.168.9.161` — a Mac (randomised MAC `da:da:4c:..`), the heaviest talker
+- `192.168.9.11` — **pve-01 itself**, also resolving via DoH to 1.1.1.1 / 8.8.8.8
+
+**Fix:** removed the DoH rule, kept the DoT rule (counter was 0 — clients that
+try DoT *do* fall back). `fw4 check` then `/etc/init.d/firewall reload`.
+
+**Lessons:**
+
+1. **DoT and DoH are not the same risk.** DoT (`:853`) fails soft in practice.
+   DoH-to-a-pinned-resolver fails hard. Do not treat them as one rule.
+2. **Enumerate who depends on a destination before blocking it.** One
+   `nf_conntrack` grep beforehand would have shown two live DoH clients,
+   including this box.
+3. A zero counter on a *related* rule is not evidence the *new* rule is safe.
+   Watch the counter of the rule you actually added, on real traffic, before
+   walking away from it.
+
+To pursue DoH blocking later, do it per-client and reconfigure the client
+first — turn off Private Relay / the encrypted-DNS profile on `.161`, and
+find what on pve-01 is using DoH — rather than blocking resolver IPs
+network-wide.
