@@ -234,7 +234,28 @@ def mct_blockers(now: datetime, until: datetime) -> tuple[list[str], list[str]]:
         end += timedelta(minutes=15)
         name = b.get("title") or b.get("name", "recording")
 
-        if status == "running" or (start <= now <= end):
+        is_live = False
+        if status == "running":
+            unit = b.get("unit")
+            pid = b.get("pid")
+            if unit:
+                act = subprocess.run(["systemctl", "is-active", unit],
+                                     capture_output=True, text=True).stdout.strip()
+                if act in ("active", "activating", "deactivating"):
+                    is_live = True
+            elif pid:
+                try:
+                    os.kill(pid, 0)
+                    is_live = True
+                except (ProcessLookupError, OSError):
+                    is_live = False
+            else:
+                if start <= now <= end:
+                    is_live = True
+        elif start <= now <= end:
+            is_live = True
+
+        if is_live:
             reasons.append(f"MCT: '{name}' is recording now")
         elif now < start < until:
             reasons.append(f"MCT: '{name}' starts {start:%H:%M}")

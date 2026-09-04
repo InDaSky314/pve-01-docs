@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""EPG Indexer — Builds and maintains host-side SQLite FTS5 search index for Media-Core EPG.
+
+Pulls /srv/media-core/epg/epg.xml and /srv/media-core/threadfin/conf/xepg.json
+from CT 105 only when mtime changes (or when forced), and writes the index to
+/var/lib/dvr-dashboard/epg.db.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+CT_ID = "105"
+EPG_XML_PATH = "/srv/media-core/epg/epg.xml"
+XEPG_JSON_PATH = "/srv/media-core/threadfin/conf/xepg.json"
+DB_DIR = Path("/var/lib/dvr-dashboard")
+DB_PATH = DB_DIR / "epg.db"
+LOCAL_TZ = ZoneInfo("Europe/Berlin")
+
+
+def log(msg: str) -> None:
+    now = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] [epg-indexer] {msg}", flush=True)
+
+
+def get_epg_xml_stat() -> tuple[int, int]:
+    """Retrieve mtime (epoch seconds) and size of epg.xml inside CT 105."""
+    try:
+        out = subprocess.check_output(
+            ["/usr/sbin/pct", "exec", CT_ID, "--", "stat", "-c", "%Y %s", EPG_XML_PATH],
+            text=True, timeout=10
+        ).strip()
+        parts = out.split()
+        return int(parts[0]), int(parts[1])
+    except Exception as exc:
+        raise RuntimeError(f"Failed to stat {EPG_XML_PATH} in CT {CT_ID}: {exc}") from exc
+
+
+def get_stored_meta(db_path: Path) -> dict[str, str]:
+    if not db_path.exists():
+        return {}
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5)
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='meta'")
+        if not cur.fetchone():
+            conn.close()
+            return {}
+        cur.execute("SELECT key, val FROM meta")
+        meta = dict(cur.fetchall())
+        conn.close()
+        return meta
+    except Exception:
+        return {}
+
+
+def parse_xmltv_dt(ts: str) -> datetime:
+    """Parse XMLTV timestamp format e.g. '20260902120000 +0200' into UTC/aware datetime."""
+    parts = ts.strip().split()
+    dt = datetime.strptime(parts[0], "%Y%m%d%H%M%S")
+    if len(parts) > 1:
+        tz_str = parts[1]
+        sign = 1 if tz_str[0] == "+" else -1
+        hours = int(tz_str[1:3])
+        minutes = int(tz_str[3:5])
+        tz = timezone(sign * timedelta(hours=hours, minutes=minutes))
+        dt = dt.replace(tzinfo=tz)
+    else:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def rebuild_index(epg_mtime: int, epg_size: int) -> tuple[int, int]:
+    t0 = time.time()
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_db_path = DB_DIR / "epg.db.tmp"
+    if tmp_db_path.exists():
+        tmp_db_path.unlink()
+
+    # 1. Fetch threadfin xepg.json for channel numbers and group titles
+    xepg_by_id: dict[str, dict] = {}
+    xepg_by_name: dict[str, dict] = {}
+    try:
+        raw_xepg = subprocess.check_output(
+            ["/usr/sbin/pct", "exec", CT_ID, "--", "cat", XEPG_JSON_PATH],
+            timeout=20
+        )
+        xepg_data = json.loads(raw_xepg)
+        for entry in xepg_data.values():
+            tid = entry.get("tvg-id")
+            if tid:
+                xepg_by_id[tid] = entry
+            nm = entry.get("name")
+            if nm:
+                xepg_by_name[nm.lower().strip()] = entry
+    except Exception as exc:
+        log(f"WARNING: Could not load xepg.json ({exc}), channel metadata may be partial")
+
+    # 2. Setup SQLite schema on temporary database
+    conn = sqlite3.connect(str(tmp_db_path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE channels (
+        id TEXT PRIMARY KEY,
+        number TEXT,
+        name TEXT,
+        group_title TEXT,
+        icon_url TEXT
+    )""")
+
+    cur.execute("""
+    CREATE TABLE programmes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id TEXT NOT NULL,
+        start_utc TEXT NOT NULL,
+        stop_utc TEXT NOT NULL,
+        start_local TEXT NOT NULL,
+        stop_local TEXT NOT NULL,
+        duration_sec INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        subtitle TEXT,
+        desc TEXT,
+        category TEXT
+    )""")
+
+    cur.execute("CREATE INDEX idx_progs_start ON programmes(start_utc)")
+    cur.execute("CREATE INDEX idx_progs_chan ON programmes(channel_id)")
+    cur.execute("CREATE INDEX idx_progs_stop ON programmes(stop_utc)")
+
+    cur.execute("""
+    CREATE VIRTUAL TABLE progs_fts USING fts5(
+        title,
+        subtitle,
+        desc,
+        category,
+        content=programmes,
+        content_rowid=id,
+        tokenize="unicode61 remove_diacritics 2"
+    )""")
+
+    cur.execute("""
+    CREATE TABLE meta (
+        key TEXT PRIMARY KEY,
+        val TEXT
+    )""")
+
+    # 3. Stream XMLTV epg.xml from CT 105
+    p = subprocess.Popen(
+        ["/usr/sbin/pct", "exec", CT_ID, "--", "cat", EPG_XML_PATH],
+        stdout=subprocess.PIPE
+    )
+
+    channels: list[tuple[str, str, str, str, str]] = []
+    programmes: list[tuple[str, str, str, str, str, int, str, str, str, str]] = []
+
+    for event, elem in ET.iterparse(p.stdout, events=("end",)):
+        if elem.tag == "channel":
+            cid = elem.get("id") or ""
+            dname = ""
+            icon = ""
+            for child in elem:
+                if child.tag == "display-name":
+                    dname = child.text or ""
+                elif child.tag == "icon":
+                    icon = child.get("src") or ""
+            xinfo = xepg_by_id.get(cid) or xepg_by_name.get(dname.lower().strip()) or {}
+            num = xinfo.get("tvg-chno") or ""
+            grp = xinfo.get("group-title") or ""
+            if not icon and xinfo.get("tvg-logo"):
+                icon = xinfo["tvg-logo"]
+            cname = dname or xinfo.get("name") or cid
+            channels.append((cid, str(num), cname, str(grp), str(icon)))
+            elem.clear()
+        elif elem.tag == "programme":
+            cid = elem.get("channel")
+            s_raw = elem.get("start")
+            e_raw = elem.get("stop")
+            if cid and s_raw and e_raw:
+                try:
+                    s_dt = parse_xmltv_dt(s_raw)
+                    e_dt = parse_xmltv_dt(e_raw)
+                    dur = int((e_dt - s_dt).total_seconds())
+                    s_utc = s_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    e_utc = e_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    s_loc = s_dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+                    e_loc = e_dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+                    title = ""
+                    subtitle = ""
+                    desc = ""
+                    cat = ""
+                    for child in elem:
+                        if child.tag == "title" and not title:
+                            title = child.text or ""
+                        elif child.tag == "sub-title" and not subtitle:
+                            subtitle = child.text or ""
+                        elif child.tag == "desc" and not desc:
+                            desc = child.text or ""
+                        elif child.tag == "category" and not cat:
+                            cat = child.text or ""
+                    programmes.append((cid, s_utc, e_utc, s_loc, e_loc, dur, title, subtitle, desc, cat))
+                except Exception:
+                    pass
+            elem.clear()
+
+    p.wait()
+    if p.returncode != 0:
+        tmp_db_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Error streaming {EPG_XML_PATH} from CT {CT_ID} (exit {p.returncode})")
+
+    # 4. Bulk insert into SQLite
+    cur.executemany("INSERT OR REPLACE INTO channels VALUES (?, ?, ?, ?, ?)", channels)
+    cur.executemany("""
+    INSERT INTO programmes(channel_id, start_utc, stop_utc, start_local, stop_local, duration_sec, title, subtitle, desc, category)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", programmes)
+
+    # 5. Populate FTS5 table in bulk
+    cur.execute("""
+    INSERT INTO progs_fts(rowid, title, subtitle, desc, category)
+    SELECT id, title, subtitle, desc, category FROM programmes
+    """)
+
+    # 6. Triggers for future sync if rows are modified
+    cur.execute("""
+    CREATE TRIGGER progs_ai AFTER INSERT ON programmes BEGIN
+      INSERT INTO progs_fts(rowid, title, subtitle, desc, category) VALUES (new.id, new.title, new.subtitle, new.desc, new.category);
+    END;""")
+    cur.execute("""
+    CREATE TRIGGER progs_ad AFTER DELETE ON programmes BEGIN
+      INSERT INTO progs_fts(progs_fts, rowid, title, subtitle, desc, category) VALUES('delete', old.id, old.title, old.subtitle, old.desc, old.category);
+    END;""")
+    cur.execute("""
+    CREATE TRIGGER progs_au AFTER UPDATE ON programmes BEGIN
+      INSERT INTO progs_fts(progs_fts, rowid, title, subtitle, desc, category) VALUES('delete', old.id, old.title, old.subtitle, old.desc, old.category);
+      INSERT INTO progs_fts(rowid, title, subtitle, desc, category) VALUES (new.id, new.title, new.subtitle, new.desc, new.category);
+    END;""")
+
+    # 7. Record metadata
+    meta_rows = [
+        ("epg_xml_mtime", str(epg_mtime)),
+        ("epg_xml_size", str(epg_size)),
+        ("channel_count", str(len(channels))),
+        ("programme_count", str(len(programmes))),
+        ("indexed_at", datetime.now(LOCAL_TZ).isoformat()),
+    ]
+    cur.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", meta_rows)
+
+    conn.commit()
+    conn.close()
+
+    # Atomic move
+    tmp_db_path.replace(DB_PATH)
+    elapsed = time.time() - t0
+    log(f"Indexed {len(channels)} channels, {len(programmes)} programmes in {elapsed:.2f}s -> {DB_PATH}")
+    return len(channels), len(programmes)
+
+
+def check_and_sync(force: bool = False) -> bool:
+    """Checks mtime and updates index if needed. Returns True if index was updated."""
+    mtime, size = get_epg_xml_stat()
+    meta = get_stored_meta(DB_PATH)
+    stored_mtime = meta.get("epg_xml_mtime")
+
+    if not force and stored_mtime and str(mtime) == str(stored_mtime) and DB_PATH.exists():
+        stored_progs = meta.get("programme_count", "?")
+        stored_chans = meta.get("channel_count", "?")
+        log(f"Index is up-to-date (mtime {mtime}, {stored_progs} programmes across {stored_chans} channels). Skipping rebuild.")
+        return False
+
+    reason = "forced" if force else ("database missing" if not DB_PATH.exists() else f"mtime changed {stored_mtime} -> {mtime}")
+    log(f"Rebuilding index ({reason})...")
+    rebuild_index(mtime, size)
+    return True
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="EPG Indexer for Media-Core DVR")
+    parser.add_argument("--force", action="store_true", help="Force rebuild regardless of mtime")
+    parser.add_argument("--check", action="store_true", help="Check mtime without rebuilding (exit 0 if up-to-date, 1 if stale)")
+    args = parser.parse_args()
+
+    try:
+        if args.check:
+            mtime, _ = get_epg_xml_stat()
+            meta = get_stored_meta(DB_PATH)
+            if meta.get("epg_xml_mtime") == str(mtime) and DB_PATH.exists():
+                print(f"UP_TO_DATE (mtime={mtime})")
+                return 0
+            else:
+                print(f"STALE (stored={meta.get('epg_xml_mtime')}, live={mtime})")
+                return 1
+
+        check_and_sync(force=args.force)
+        return 0
+    except Exception as exc:
+        log(f"ERROR: {exc}")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

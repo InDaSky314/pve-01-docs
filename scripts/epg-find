@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+"""epg-find — Universal EPG Guide Search & Booking CLI for Media-Core DVR.
+
+Searches /var/lib/dvr-dashboard/epg.db (FTS5 full text search), groups duplicate
+broadcasts across channels, checks tuner conflict status, and books programs
+through dvr-dashboard's central arbitration gateway.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+DB_PATH = Path("/var/lib/dvr-dashboard/epg.db")
+AUTH_FILE = Path("/etc/dvr-dashboard.auth")
+DASHBOARD_URL = "http://127.0.0.1:8099"
+INDEXER_BIN = "/usr/local/bin/epg-indexer"
+LOCAL_TZ = ZoneInfo("Europe/Berlin")
+CENTRAL_TZ = ZoneInfo("America/Chicago")
+
+# Preferred local market channels (Wisconsin)
+LOCAL_MARKET_PATTERNS = [
+    r"green\s*bay",
+    r"milwaukee",
+    r"madison",
+    r"wgba",
+    r"wbay",
+    r"wluk",
+    r"wfrv",
+    r"wpne",
+    r"wtmj",
+    r"wisn",
+    r"witi",
+    r"wdjt",
+    r"wkow",
+    r"wmtv",
+    r"wmsn",
+    r"wisc",
+    r"brewers",
+    r"bucks",
+    r"badgers",
+    r"packers",
+    r"big\s*ten",
+    r"bally.*wisconsin",
+    r"fanduel.*wisconsin",
+]
+LOCAL_MARKET_RE = re.compile("|".join(LOCAL_MARKET_PATTERNS), re.IGNORECASE)
+DEGRADED_GROUPS = {"directv stream", "directv"}
+
+
+def get_dashboard_auth() -> tuple[str, str] | None:
+    if not AUTH_FILE.exists():
+        return None
+    try:
+        content = AUTH_FILE.read_text().strip()
+        if ":" in content:
+            u, p = content.split(":", 1)
+            return u.strip(), p.strip()
+    except Exception:
+        return None
+    return None
+
+
+def call_dashboard_api(endpoint: str, method: str = "GET", payload: dict | None = None) -> tuple[int, dict]:
+    url = f"{DASHBOARD_URL}{endpoint}"
+    auth = get_dashboard_auth()
+    headers = {"Content-Type": "application/json"}
+    if auth:
+        token = base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode()
+        headers["Authorization"] = f"Basic {token}"
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            code = resp.getcode()
+            body = json.loads(resp.read().decode())
+            return code, body
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read().decode())
+        except Exception:
+            body = {"error": f"HTTP {exc.code} {exc.reason}"}
+        return exc.code, body
+    except Exception as exc:
+        return 500, {"error": f"Could not connect to dvr-dashboard at {DASHBOARD_URL}: {exc}"}
+
+
+def parse_duration_str(s: str | None) -> int:
+    if not s:
+        return 0
+    s = s.strip().lower()
+    if s.isdigit():
+        return int(s)
+    m = re.match(r"^((?P<h>\d+(\.\d+)?)h)?\s*((?P<m>\d+)m(in)?)?\s*((?P<s>\d+)s)?$", s)
+    if m:
+        secs = 0
+        if m.group("h"):
+            secs += int(float(m.group("h")) * 3600)
+        if m.group("m"):
+            secs += int(m.group("m")) * 60
+        if m.group("s"):
+            secs += int(m.group("s"))
+        return secs
+    raise ValueError(f"Invalid duration/pad format: {s}")
+
+
+def normalize_title(title: str) -> str:
+    t = title.lower().strip()
+    t = re.sub(r"^(live:\s*|new:\s*)", "", t)
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def channel_priority(number: str, name: str, group_title: str) -> tuple[int, int]:
+    """Return priority tuple (tier, channel_number) for sorting channels within a cluster.
+    Lower number = higher preference.
+    """
+    norm_name = f"{name} {group_title}".lower()
+    if LOCAL_MARKET_RE.search(norm_name):
+        tier = 1  # Local Wisconsin market
+    elif any(d in group_title.lower() for d in DEGRADED_GROUPS):
+        tier = 4  # Degraded provider feed
+    elif "hd" in norm_name or "sports" in norm_name or "locals" in group_title.lower():
+        tier = 2  # Standard curated HD / regional
+    else:
+        tier = 3  # Other / syndicated
+    try:
+        chno = int(number)
+    except (ValueError, TypeError):
+        chno = 9999
+    return tier, chno
+
+
+_STATUS_CACHE: dict[str, Any] | None = None
+
+def check_timers_conflict(start_utc_dt: datetime, end_utc_dt: datetime, pad_sec: int = 0) -> tuple[bool, str]:
+    """Query dvr-dashboard /api/status to detect any active overlapping Jellyfin timer or MCT booking."""
+    global _STATUS_CACHE
+    if _STATUS_CACHE is None:
+        code, status_data = call_dashboard_api("/api/status")
+        if code != 200 or not isinstance(status_data, dict):
+            return False, "Could not check tuner conflict status"
+        _STATUS_CACHE = status_data
+    else:
+        status_data = _STATUS_CACHE
+
+    t_start = start_utc_dt - timedelta(minutes=5)
+    t_end = end_utc_dt + timedelta(seconds=max(900, pad_sec))
+
+    # Check Jellyfin timers
+    for r in status_data.get("recordings", []):
+        try:
+            r_start = datetime.fromisoformat(r["start"].replace("Z", "+00:00")).astimezone(timezone.utc)
+            r_end = datetime.fromisoformat(r["end"].replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            continue
+        if r_start < t_end and r_end > t_start:
+            r_name = r.get("name") or "scheduled recording"
+            s_loc = r_start.astimezone(LOCAL_TZ).strftime("%H:%M")
+            e_loc = r_end.astimezone(LOCAL_TZ).strftime("%H:%M")
+            return True, f"Overlaps with timer '{r_name}' ({s_loc}–{e_loc} CEST)"
+
+    return False, ""
+
+
+def search_epg(
+    conn: sqlite3.Connection,
+    query: str | None = None,
+    category: str | None = None,
+    date_str: str | None = None,
+    channel_query: str | None = None,
+    upcoming_window: str | None = "7d",
+    include_desc: bool = False,
+    include_past: bool = False,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    cur = conn.cursor()
+    now_utc = datetime.now(timezone.utc)
+
+    # 1. Base time filtering
+    time_clauses = []
+    params: list[Any] = []
+
+    if not include_past and not date_str:
+        time_clauses.append("p.stop_utc >= ?")
+        params.append(now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+    if date_str:
+        # Parse date argument
+        d_lower = date_str.lower().strip()
+        ref_dt = datetime.now(LOCAL_TZ)
+        target_date = None
+        if d_lower == "today":
+            target_date = ref_dt.date()
+        elif d_lower == "tomorrow":
+            target_date = (ref_dt + timedelta(days=1)).date()
+        else:
+            days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+            if d_lower in days:
+                target_dow = days.index(d_lower)
+                cur_dow = ref_dt.weekday()
+                diff = (target_dow - cur_dow) % 7
+                if diff == 0 and not include_past:
+                    diff = 7
+                target_date = (ref_dt + timedelta(days=diff)).date()
+            else:
+                try:
+                    target_date = datetime.strptime(d_lower, "%Y-%m-%d").date()
+                except ValueError:
+                    pass
+        if target_date:
+            s_day = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=LOCAL_TZ)
+            e_day = s_day + timedelta(days=1)
+            time_clauses.append("p.stop_utc >= ? AND p.start_utc < ?")
+            params.append(s_day.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+            params.append(e_day.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+    if upcoming_window and upcoming_window != "all" and not date_str:
+        try:
+            up_sec = parse_duration_str(upcoming_window)
+            max_utc = now_utc + timedelta(seconds=up_sec)
+            time_clauses.append("p.start_utc <= ?")
+            params.append(max_utc.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        except ValueError:
+            pass
+
+    # 2. Category & Channel filters
+    cat_clause = ""
+    if category:
+        cat_clause = " AND p.category LIKE ?"
+        params.append(f"%{category}%")
+
+    chan_clause = ""
+    if channel_query:
+        chan_clause = " AND (c.number = ? OR c.name LIKE ?)"
+        params.append(channel_query.strip())
+        params.append(f"%{channel_query.strip()}%")
+
+    time_where = (" AND " + " AND ".join(time_clauses)) if time_clauses else ""
+
+    # 3. Construct Query
+    if query and query.strip():
+        # FTS5 search
+        q_tokens = [w.strip() for w in re.findall(r"\w+", query) if w.strip()]
+        if not q_tokens:
+            return []
+        
+        # Build FTS match expression
+        if include_desc:
+            # Search all columns
+            fts_expr = " ".join(f'"{tok}"' for tok in q_tokens)
+        else:
+            # Search title and subtitle
+            title_part = " ".join(f'"{tok}"' for tok in q_tokens)
+            fts_expr = f'title: ({title_part}) OR subtitle: ({title_part})'
+
+        sql = f"""
+        SELECT p.id, p.channel_id, c.number, c.name, c.group_title, c.icon_url,
+               p.start_utc, p.stop_utc, p.start_local, p.stop_local, p.duration_sec,
+               p.title, p.subtitle, p.desc, p.category,
+               bm25(progs_fts, 10.0, 5.0, 1.0, 2.0) as rank
+        FROM progs_fts f
+        JOIN programmes p ON f.rowid = p.id
+        JOIN channels c ON p.channel_id = c.id
+        WHERE progs_fts MATCH ? {time_where}{cat_clause}{chan_clause}
+        ORDER BY rank, p.start_utc
+        LIMIT {limit * 8}
+        """
+        all_params = [fts_expr] + params
+    else:
+        # Structured query without free text
+        where_conds = ["1=1"]
+        if time_clauses:
+            where_conds.extend(time_clauses)
+        if category:
+            where_conds.append("p.category LIKE ?")
+        if channel_query:
+            where_conds.append("(c.number = ? OR c.name LIKE ?)")
+
+        where_str = " AND ".join(where_conds)
+        sql = f"""
+        SELECT p.id, p.channel_id, c.number, c.name, c.group_title, c.icon_url,
+               p.start_utc, p.stop_utc, p.start_local, p.stop_local, p.duration_sec,
+               p.title, p.subtitle, p.desc, p.category,
+               0.0 as rank
+        FROM programmes p
+        JOIN channels c ON p.channel_id = c.id
+        WHERE {where_str}
+        ORDER BY p.start_utc, c.number
+        LIMIT {limit * 8}
+        """
+        all_params = params
+
+    cur.execute(sql, all_params)
+    rows = cur.fetchall()
+
+    # 4. Cluster simultaneous duplicate broadcasts across channels
+    clusters: dict[tuple[str, str, int], dict[str, Any]] = {}
+
+    for row in rows:
+        (pid, cid, cnum, cname, cgroup, cicon,
+         s_utc, e_utc, s_loc, e_loc, dur, title, subtitle, desc, cat, rank) = row
+
+        norm_t = normalize_title(title)
+        # Cluster key: title + rounded start time (15m window) + duration
+        try:
+            s_dt = datetime.fromisoformat(s_utc.replace("Z", "+00:00"))
+            round_epoch = int(s_dt.timestamp() // 900 * 900)
+        except Exception:
+            round_epoch = s_utc
+
+        cluster_key = (norm_t, str(round_epoch), dur // 900 * 900)
+
+        chan_item = {
+            "prog_id": pid,
+            "channel_id": cid,
+            "number": cnum,
+            "name": cname,
+            "group": cgroup,
+            "icon_url": cicon,
+            "tier": channel_priority(cnum, cname, cgroup)[0],
+            "degraded": any(d in cgroup.lower() for d in DEGRADED_GROUPS),
+        }
+
+        if cluster_key not in clusters:
+            clusters[cluster_key] = {
+                "id": pid,
+                "title": title,
+                "subtitle": subtitle,
+                "desc": desc,
+                "category": cat,
+                "start_utc": s_utc,
+                "stop_utc": e_utc,
+                "start_local": s_loc,
+                "stop_local": e_loc,
+                "duration_sec": dur,
+                "channels": [chan_item],
+                "rank": rank,
+            }
+        else:
+            # Check if this channel is already in cluster
+            existing_cids = {c["channel_id"] for c in clusters[cluster_key]["channels"]}
+            if cid not in existing_cids:
+                clusters[cluster_key]["channels"].append(chan_item)
+
+    # 5. Sort channels within each cluster (Local Market first, then HD, avoid degraded)
+    result_groups = list(clusters.values())
+    for grp in result_groups:
+        grp["channels"].sort(key=lambda c: (c["tier"], int(c["number"]) if c["number"].isdigit() else 9999))
+        for idx, c in enumerate(grp["channels"]):
+            c["recommended"] = (idx == 0 and c["tier"] == 1)
+
+    # Sort groups by start time
+    result_groups.sort(key=lambda g: (g["start_utc"], g["rank"]))
+    return result_groups[:limit]
+
+
+def format_central_time(utc_iso: str) -> str:
+    try:
+        dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00")).astimezone(CENTRAL_TZ)
+        return dt.strftime("%H:%M CT")
+    except Exception:
+        return ""
+
+
+def run_search_cli(args: argparse.Namespace) -> int:
+    if not DB_PATH.exists():
+        if os.path.exists(INDEXER_BIN):
+            subprocess.run([INDEXER_BIN], check=True)
+        else:
+            print(f"Error: EPG database not found at {DB_PATH}. Run epg-indexer first.", file=sys.stderr)
+            return 1
+
+    conn = sqlite3.connect(str(DB_PATH))
+    groups = search_epg(
+        conn,
+        query=args.query,
+        category=args.category,
+        date_str=args.date,
+        channel_query=args.channel,
+        upcoming_window=args.upcoming,
+        include_desc=args.desc,
+        include_past=args.past,
+        limit=args.limit,
+    )
+    conn.close()
+
+    if args.json:
+        print(json.dumps({"count": len(groups), "results": groups}, indent=2))
+        return 0
+
+    q_label = f" for '{args.query}'" if args.query else ""
+    if not groups:
+        print(f"[epg-find] No broadcasts found{q_label}.")
+        return 0
+
+    total_broadcasts = sum(len(g["channels"]) for g in groups)
+    print(f"[epg-find] Found {len(groups)} matching event groups ({total_broadcasts} broadcasts){q_label}:\n")
+
+    for i, g in enumerate(groups, 1):
+        dur_h = g["duration_sec"] // 3600
+        dur_m = (g["duration_sec"] % 3600) // 60
+        dur_str = f"{dur_h}h {dur_m:02d}m" if dur_h else f"{dur_m}m"
+
+        s_dt = datetime.fromisoformat(g["start_utc"].replace("Z", "+00:00"))
+        e_dt = datetime.fromisoformat(g["stop_utc"].replace("Z", "+00:00"))
+        s_ct = format_central_time(g["start_utc"])
+        e_ct = format_central_time(g["stop_utc"])
+        ct_window = f" ({s_ct} – {e_ct})" if s_ct else ""
+
+        print(f"{i}. {g['title']}{(' — ' + g['subtitle']) if g['subtitle'] else ''} ({dur_str})")
+        if g.get("category"):
+            print(f"   Category: {g['category']}")
+        print(f"   When:     {g['start_local']} – {g['stop_local'].split()[-1]} CEST{ct_window}")
+        
+        # Conflict status
+        conflict, reason = check_timers_conflict(s_dt, e_dt)
+        if conflict:
+            print(f"   Tuner:    \033[31mCONFLICT\033[0m: {reason}")
+        else:
+            print(f"   Tuner:    \033[32mCLEAR\033[0m (no overlapping timers)")
+
+        print("   Channels:")
+        for ch in g["channels"]:
+            rec_tag = " [Recommended: Local Market]" if ch.get("recommended") else ""
+            deg_tag = " [Warning: Degraded Feed]" if ch.get("degraded") else ""
+            ch_num = f"{ch['number']:<4}" if ch['number'] else "    "
+            print(f"     • {ch_num} {ch['name']}{rec_tag}{deg_tag} (id: {ch['prog_id']})")
+
+        rec_ch = g["channels"][0]["number"] or g["channels"][0]["name"]
+        print(f"   To book:  epg-find --book --id {g['channels'][0]['prog_id']} --channel \"{rec_ch}\" --engine mct\n")
+
+    return 0
+
+
+def run_booking_cli(args: argparse.Namespace) -> int:
+    if not DB_PATH.exists():
+        print(f"Error: EPG database not found at {DB_PATH}.", file=sys.stderr)
+        return 1
+
+    prog_id = args.id
+    target_channel = args.channel
+
+    conn = sqlite3.connect(str(DB_PATH))
+    cur = conn.cursor()
+
+    prog_row = None
+    if prog_id:
+        cur.execute("""
+        SELECT p.id, p.channel_id, c.number, c.name, p.title, p.subtitle,
+               p.start_utc, p.stop_utc, p.duration_sec, p.category
+        FROM programmes p
+        JOIN channels c ON p.channel_id = c.id
+        WHERE p.id = ?
+        """, (prog_id,))
+        prog_row = cur.fetchone()
+
+    if not prog_row and args.query:
+        groups = search_epg(conn, query=args.query, limit=1)
+        if groups:
+            g = groups[0]
+            ch = g["channels"][0]
+            prog_id = ch["prog_id"]
+            cur.execute("""
+            SELECT p.id, p.channel_id, c.number, c.name, p.title, p.subtitle,
+                   p.start_utc, p.stop_utc, p.duration_sec, p.category
+            FROM programmes p
+            JOIN channels c ON p.channel_id = c.id
+            WHERE p.id = ?
+            """, (prog_id,))
+            prog_row = cur.fetchone()
+
+    conn.close()
+
+    if not prog_row:
+        print(f"Error: Programme ID '{prog_id}' not found. Search first with 'epg-find <query>'.", file=sys.stderr)
+        return 1
+
+    (pid, cid, cnum, cname, title, subtitle, s_utc, e_utc, dur_sec, cat) = prog_row
+
+    final_channel = target_channel or cnum or cname
+    pad_sec = 0
+    if args.pad:
+        try:
+            pad_sec = parse_duration_str(args.pad)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
+    payload = {
+        "id": f"epg-{pid}",
+        "title": title,
+        "name": f"{title}{(' — ' + subtitle) if subtitle else ''}",
+        "channel": final_channel,
+        "start": s_utc,
+        "end": e_utc,
+        "duration_sec": dur_sec,
+        "pad_sec": pad_sec,
+        "category": cat or "Sports",
+        "genre": cat or "Sports",
+        "engine": args.engine or "mct",
+        "dryRun": args.dry_run,
+    }
+
+    engine_label = (args.engine or "mct").upper()
+    pad_label = f" +{pad_sec//60}m pad" if pad_sec else " (no pad)"
+    print(f"[epg-find] Booking '{payload['name']}' on {final_channel} via {engine_label}{pad_label}...")
+
+    code, resp = call_dashboard_api("/api/record-game", method="POST", payload=payload)
+
+    if code == 200 and resp.get("ok"):
+        print(f"\033[32mSUCCESS (HTTP 200)\033[0m: {resp.get('message')}")
+        if args.dry_run:
+            print("[DRY-RUN] Verified clear schedule. No timer was saved.")
+        return 0
+    elif code == 409:
+        err = resp.get("error") or "Overlapping timer exists"
+        print(f"\033[31mREFUSED (HTTP 409 Conflict)\033[0m: {err}", file=sys.stderr)
+        return 2
+    else:
+        err = resp.get("error") or f"HTTP {code}"
+        print(f"\033[31mFAILED (HTTP {code})\033[0m: {err}", file=sys.stderr)
+        return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Media-Core Universal EPG Search & Booking CLI")
+    parser.add_argument("query", nargs="?", help="Search term (title, event, keyword)")
+    parser.add_argument("-c", "--category", help="Filter by category (Sports, Movies, Series, Documentary, News)")
+    parser.add_argument("-d", "--date", help="Filter by date (YYYY-MM-DD, today, tomorrow, or day of week)")
+    parser.add_argument("--channel", "--ch", help="Filter by channel number or name (e.g. 121, NBC)")
+    parser.add_argument("-u", "--upcoming", default="7d", help="Upcoming window (e.g. 24h, 48h, 7d, all; default: 7d)")
+    parser.add_argument("--desc", action="store_true", help="Search description text in addition to titles")
+    parser.add_argument("--past", action="store_true", help="Include past broadcasts (default: false)")
+    parser.add_argument("-n", "--limit", type=int, default=25, help="Maximum results to return (default: 25)")
+    parser.add_argument("--json", action="store_true", help="Output results in JSON format")
+
+    # Index management
+    parser.add_argument("--sync", "--reindex", action="store_true", help="Rebuild index if CT 105 epg.xml has changed")
+    parser.add_argument("--force-reindex", action="store_true", help="Force rebuild index unconditionally")
+
+    # Booking arguments
+    parser.add_argument("--book", action="store_true", help="Book a programme via dvr-dashboard arbitration")
+    parser.add_argument("--id", help="Programme ID to book (from search results)")
+    parser.add_argument("--engine", choices=["mct", "jellyfin"], default="mct", help="Recording engine (default: mct)")
+    parser.add_argument("--pad", help="Explicit post-padding duration (e.g. 15m, 60m; default: 0m)")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate booking against conflict checks without saving")
+
+    args = parser.parse_args()
+
+    if args.force_reindex or args.sync:
+        cmd = [INDEXER_BIN]
+        if args.force_reindex:
+            cmd.append("--force")
+        subprocess.run(cmd, check=True)
+        if not args.query and not args.book:
+            return 0
+
+    if args.book:
+        return run_booking_cli(args)
+
+    return run_search_cli(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
