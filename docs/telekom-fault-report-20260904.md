@@ -55,7 +55,8 @@ pppd 2.4.9 started by root, uid 0
 >
 > Sehr geehrte Damen und Herren,
 >
-> an meinem Telekom-Anschluss (Kundennummer: __________) kommt es zu wiederholten
+> an meinem Telekom-Anschluss (Kundennummer: __________, Tarif **MagentaZuhause XL**,
+> VDSL 250) kommt es zu wiederholten
 > PPPoE-Verbindungsabbrüchen. Allein am 04.09.2026 wurde die Verbindung zwischen 03:47 und
 > 13:14 Uhr **siebenmal** getrennt und jeweils mit einer neuen IP-Adresse neu aufgebaut:
 >
@@ -87,6 +88,12 @@ pppd 2.4.9 started by root, uid 0
 > Sieben Trennungen innerhalb von neuneinhalb Stunden sind es nicht — sie unterbrechen laufende
 > Videoübertragungen und Aufnahmen.
 >
+> Laut Auftragsunterlagen sind für diesen Tarif eine minimale Download-Geschwindigkeit von
+> 175 MBit/s, eine normalerweise verfügbare von 200 MBit/s und eine maximale von 250 MBit/s
+> vereinbart. Während der oben genannten Ausfälle stand überhaupt keine Verbindung zur
+> Verfügung. Eine Rückfalloption (Hybrid LTE bzw. 5G Backup) wurde nicht beauftragt, sodass
+> jeder Sitzungsabbruch einen vollständigen Ausfall des Anschlusses bedeutet.
+>
 > Ich bitte daher um eine Prüfung der Leitung und des zugehörigen DSLAM-Ports auf
 > Instabilität sowie um Rückmeldung, ob auf Netzseite Sitzungsabbrüche protokolliert sind.
 >
@@ -107,6 +114,39 @@ whether network-side session drops are logged; **and explicitly asks for a writt
 because the account holder does not speak sufficient German.**
 
 ---
+
+## Contract facts that strengthen the case
+
+From the original order (Telekom Deutschland GmbH, sold via a reseller; the order states
+plainly that **the contract is between Telekom Deutschland GmbH and the customer** and that the
+reseller has no influence on activation, bandwidth or availability — so Telekom is the
+responsible party):
+
+* Product: **MagentaZuhause XL**, VDSL 250, 24-month initial term from 2024-04-05, now on
+  rolling renewal with one month's notice.
+* Contractually stated transmission rates for this tariff:
+
+  | | minimum | normally available | maximum |
+  |---|---|---|---|
+  | download | **175 Mbit/s** | 200 | 250 |
+  | upload | 20 Mbit/s | 35 | 40 |
+
+* **No fallback was contracted.** Sections 18.1 (Hybrid LTE Backup) and 18.2 (Hybrid 5G/LTE
+  Backup) are both unchecked, so every PPPoE termination is a total loss of service with no
+  mobile failover. This is why a session drop is not a minor event on this line.
+
+Why that matters: a service that terminates seven times in nine and a half hours, twice for
+more than six minutes, is not delivering the contracted product during those windows.
+Germany's TKG gives customers remedies where a provider persistently fails to deliver the
+agreed service, so it is worth stating the contracted figures explicitly rather than only
+describing the symptom.
+
+**Two practical points before sending:**
+1. The contract holder is not necessarily the person raising the fault. Telekom will normally
+   only discuss the line with the named contract holder, so the letter should go out in that
+   name or with written authorisation.
+2. The Kundennummer is **not** on the original order — it was a new connection, so the number
+   was assigned afterwards. Take it from an invoice or the Kundencenter.
 
 ## Where to find your Kundennummer
 
