@@ -9,3 +9,7 @@ __pycache__/
 # pre-change backups never belong in git
 *.pre-*
 *.bak
+
+# contracts/invoices carry personal data - this repo is public
+*.pdf
+telekom-docs/
