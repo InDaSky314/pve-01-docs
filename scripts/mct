@@ -742,6 +742,11 @@ def finalize_and_promote_capture(
 
     jf_api("/Library/Refresh", method="POST")
     log(f"Capture preserved and post-processing pipeline complete: {clean_path}")
+    # Stable, machine-readable success marker. The reaper used to grep for the
+    # prose line above; when that wording changed, every SUCCESSFUL capture was
+    # reported as failed. Prose is for humans, this line is the contract - do not
+    # reword it.
+    log("MCT-RESULT: success")
     return True
 
 
