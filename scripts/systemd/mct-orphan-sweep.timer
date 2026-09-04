@@ -1,0 +1,9 @@
+[Unit]
+Description=Run MCT DVR Orphan Sweep every 15 minutes and at boot
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

@@ -23,7 +23,6 @@ import importlib.util
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
 import time
@@ -518,228 +517,10 @@ def build_nfo_xml(title: str, start_dt: datetime, plot: str, genres: list[str], 
     return '\n'.join(xml_lines)
 
 
-def get_ct_file_size(path_in_ct: str) -> int:
-    """Return size in bytes of file inside CT 105, or -1 if missing."""
-    res = subprocess.run(
-        ["/usr/sbin/pct", "exec", CT_ID, "--", "stat", "-c", "%s", path_in_ct],
-        capture_output=True, text=True
-    )
-    if res.returncode == 0 and res.stdout.strip().isdigit():
-        return int(res.stdout.strip())
-    return -1
-
-
-def get_ct_file_mtime(path_in_ct: str) -> float:
-    """Return mtime epoch of file inside CT 105, or -1.0 if missing."""
-    res = subprocess.run(
-        ["/usr/sbin/pct", "exec", CT_ID, "--", "stat", "-c", "%Y", path_in_ct],
-        capture_output=True, text=True
-    )
-    if res.returncode == 0 and res.stdout.strip().isdigit():
-        return float(res.stdout.strip())
-    return -1.0
-
-
-def sweep_orphans(threshold_hours: float = 1.0, dry_run: bool = False) -> tuple[int, int]:
-    """Scan /srv/media-core/media/recordings/ for *.raw.ts orphans.
-
-    Rules:
-    1. Active capture (mtime within 10min and active booking/unit running): KEEP (do not touch).
-    2. Redundant raw file (clean .ts already exists and size > 0): SWEEP (remove .raw.ts).
-    3. Unusable stub (<1MB or 0 bytes) with terminal booking or age > threshold: SWEEP (remove .raw.ts).
-    4. Usable orphan (>=1MB) whose capture stopped/exited:
-       PROMOTE to clean .ts (via pre-remux or direct move), write sidecars/NFO if needed,
-       enqueue to comskip, and refresh Jellyfin.
-
-    Returns (swept_count, promoted_count).
-    """
-    res = subprocess.run(
-        ["/usr/sbin/pct", "exec", CT_ID, "--", "find", "/srv/media-core/media/recordings", "-name", "*.raw.ts"],
-        capture_output=True, text=True
-    )
-    if res.returncode != 0 or not res.stdout.strip():
-        return 0, 0
-
-    raw_files = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
-    if not raw_files:
-        return 0, 0
-
-    bookings = []
-    if MCT_BOOKINGS_FILE.exists():
-        try:
-            bookings = json.loads(MCT_BOOKINGS_FILE.read_text())
-        except Exception:
-            bookings = []
-
-    active_units = set()
-    try:
-        u_res = subprocess.run(["systemctl", "list-units", "mct-*", "--state=active", "--no-legend", "--plain"],
-                               capture_output=True, text=True)
-        for u_line in u_res.stdout.splitlines():
-            parts = u_line.strip().split()
-            if parts:
-                active_units.add(parts[0])
-    except Exception:
-        pass
-
-    now_epoch = time.time()
-    threshold_sec = max(600, int(threshold_hours * 3600))
-    swept_count = 0
-    promoted_count = 0
-
-    for raw_ct_path in raw_files:
-        raw_size = get_ct_file_size(raw_ct_path)
-        raw_mtime = get_ct_file_mtime(raw_ct_path)
-        age_sec = now_epoch - raw_mtime if raw_mtime > 0 else 999999
-
-        # Rule 1: Check if file belongs to an active capture currently recording
-        is_active = False
-        if age_sec < 600:
-            for b in bookings:
-                if b.get("status") == "running":
-                    unit = b.get("unit")
-                    if unit and unit in active_units:
-                        is_active = True
-                        break
-                    if not unit:
-                        is_active = True
-                        break
-        if is_active:
-            log(f"[Orphan-Guard] Keeping active recording raw capture: {raw_ct_path} (mtime {age_sec:.0f}s ago)")
-            continue
-
-        # Rule 2: Clean counterpart already exists
-        clean_ct_path = raw_ct_path[:-7] + ".ts"
-        clean_size = get_ct_file_size(clean_ct_path)
-        if clean_size > 0:
-            log(f"[Orphan-Sweep] Sweeping redundant raw file: {raw_ct_path} (clean file exists: {clean_size} bytes)")
-            if not dry_run:
-                subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "rm", "-f", raw_ct_path], check=False)
-            swept_count += 1
-            continue
-
-        # Rule 3: Unusable stub (<1MB)
-        MIN_USABLE = 1_000_000
-        if raw_size < MIN_USABLE:
-            log(f"[Orphan-Sweep] Sweeping unusable raw stub: {raw_ct_path} ({raw_size} bytes)")
-            if not dry_run:
-                subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "rm", "-f", raw_ct_path], check=False)
-            swept_count += 1
-            continue
-
-        # Rule 4: Usable capture (>=1MB) whose capture stopped/exited -> Promote
-        log(f"[Orphan-Sweep] Promoting usable orphan capture: {raw_ct_path} ({raw_size} bytes) -> {clean_ct_path}")
-        if not dry_run:
-            raw_container_path = raw_ct_path.replace("/srv/media-core", "")
-            clean_container_path = clean_ct_path.replace("/srv/media-core", "")
-            remux_cmd = [
-                "/usr/sbin/pct", "exec", CT_ID, "--",
-                "docker", "exec", "jellyfin",
-                "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-y", "-v", "error",
-                "-err_detect", "ignore_err",
-                "-fflags", "+genpts+discardcorrupt",
-                "-i", raw_container_path,
-                "-c", "copy",
-                "-avoid_negative_ts", "make_zero",
-                clean_container_path,
-            ]
-            res_remux = subprocess.run(remux_cmd, capture_output=True, text=True)
-            if res_remux.returncode == 0 and get_ct_file_size(clean_ct_path) > 0:
-                subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "rm", "-f", raw_ct_path], check=False)
-            else:
-                subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "mv", "-f", raw_ct_path, clean_ct_path], check=False)
-
-            nfo_ct_path = raw_ct_path[:-7] + ".nfo"
-            if get_ct_file_size(nfo_ct_path) <= 0:
-                base_name = Path(clean_ct_path).stem
-                nfo_xml = f'<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n<movie>\n  <title>{html.escape(base_name)}</title>\n  <lockdata>false</lockdata>\n</movie>\n'
-                subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '{nfo_ct_path}'"],
-                               input=nfo_xml, text=True, check=False)
-
-            subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
-                            f"echo '{clean_container_path}' >> /srv/media-core/media/recordings/.postprocess/queue"],
-                           check=False)
-            jf_api("/Library/Refresh", method="POST")
-
-        promoted_count += 1
-
-    return swept_count, promoted_count
-
-
-def finalize_and_promote_capture(
-    raw_path: str,
-    clean_path: str,
-    preremux_cmd: list[str],
-    nfo_path: str,
-    poster_path: str,
-    nfo_content: str,
-    meta: dict,
-    is_abnormal: bool = False,
-    failure_reason: str = ""
-) -> bool:
-    """Normalise/promote raw capture, create sidecars, enqueue, and remove raw file.
-
-    If abnormal exit occurred (ffmpeg non-zero, unit stopped, SIGTERM):
-    - Checks file size: if < 1MB (unusable stub), cleans it up and logs leak prevention.
-    - If usable (>= 1MB): attempts pre-remux. If pre-remux fails, moves raw file directly
-      to clean_path so the recording is never lost.
-    - Writes poster and NFO, refreshes Jellyfin, and removes raw capture.
-    """
-    raw_ct_path = f"/srv/media-core{raw_path}"
-    clean_ct_path = f"/srv/media-core{clean_path}"
-    raw_size = get_ct_file_size(raw_ct_path)
-
-    MIN_USABLE_SIZE = 1_000_000  # 1MB minimum for valid capture
-    if raw_size < MIN_USABLE_SIZE:
-        log(f"[Orphan-Guard] Raw capture {raw_path} is unusable ({raw_size} bytes, <1MB). Removing orphan stub to prevent disk leak.")
-        subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "rm", "-f", raw_ct_path], check=False)
-        return False
-
-    if is_abnormal:
-        log(f"[Orphan-Guard] Abnormal exit ({failure_reason}), but raw capture is usable ({raw_size} bytes). Promoting orphan to preserve game...")
-
-    log(f"Pre-remuxing to normalise DTS: {clean_path}")
-    res_remux = subprocess.run(preremux_cmd, capture_output=True, text=True)
-    remux_ok = (res_remux.returncode == 0 and get_ct_file_size(clean_ct_path) > 0)
-
-    if remux_ok:
-        subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "rm", "-f", raw_ct_path], check=False)
-    else:
-        err = res_remux.stderr.strip()[-200:] if res_remux.stderr else "unknown error"
-        log(f"WARNING: Pre-remux failed ({err}). Falling back to direct promotion of raw file to {clean_path} to preserve capture.")
-        subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "mv", "-f", raw_ct_path, clean_ct_path], check=False)
-
-    if meta.get("poster_bytes"):
-        try:
-            write_poster_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{poster_path}'"]
-            subprocess.run(write_poster_cmd, input=meta["poster_bytes"], check=True)
-            log(f"Wrote poster: {poster_path} ({len(meta['poster_bytes'])} bytes from {meta['poster_source']})")
-        except Exception as exc:
-            log(f"WARNING: Failed writing poster.jpg: {exc}")
-
-    try:
-        write_nfo_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{nfo_path}'"]
-        subprocess.run(write_nfo_cmd, input=nfo_content, text=True, check=True)
-        log(f"Wrote NFO: {nfo_path} (lockdata={meta['lockdata']}, genres={meta['genres']}, plot_len={len(meta['plot'])})")
-    except Exception as exc:
-        log(f"WARNING: Failed writing NFO: {exc}")
-
-    try:
-        enqueue_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"echo '{clean_path}' >> /srv/media-core/media/recordings/.postprocess/queue"]
-        subprocess.run(enqueue_cmd, check=True)
-        log(f"Enqueued for comskip: {clean_path}")
-    except Exception as exc:
-        log(f"WARNING: Failed enqueuing for comskip: {exc}")
-
-    jf_api("/Library/Refresh", method="POST")
-    log(f"Capture preserved and post-processing pipeline complete: {clean_path}")
-    return True
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Manual Capture Tool (MCT)")
-    parser.add_argument("-c", "--channel", help="Channel number or name (e.g. 121 or 'Milwaukee Brewers HD')")
-    parser.add_argument("-d", "--duration", help="Duration (e.g. 3h15m, 195m, 11700)")
+    parser.add_argument("-c", "--channel", required=True, help="Channel number or name (e.g. 121 or 'Milwaukee Brewers HD')")
+    parser.add_argument("-d", "--duration", required=True, help="Duration (e.g. 3h15m, 195m, 11700)")
     parser.add_argument("-t", "--title", help="Recording title (e.g. 'Milwaukee Brewers at Chicago Cubs')")
     parser.add_argument("--category", default="Sports", help="Category folder (default: Sports)")
     parser.add_argument("--genre", default="Sports", help="Genre for NFO (default: Sports)")
@@ -749,17 +530,7 @@ def main() -> int:
     parser.add_argument("--poll-interval", type=int, default=120, help="Supervisor ESPN polling interval in seconds (default: 120)")
     parser.add_argument("--booking-id", help="mct-bookings.json id of the booking this run fulfils, so it is not treated as a conflict")
     parser.add_argument("--dry-run", action="store_true", help="Show planned action without capturing or touching tuner")
-    parser.add_argument("--sweep-orphans", action="store_true", help="Sweep or promote orphaned .raw.ts recordings")
-    parser.add_argument("--threshold-hours", type=float, default=1.0, help="Age threshold in hours before sweeping terminal stubs (default: 1.0)")
     args = parser.parse_args()
-
-    if args.sweep_orphans:
-        swept, promoted = sweep_orphans(threshold_hours=args.threshold_hours, dry_run=args.dry_run)
-        log(f"Orphan sweep complete: {swept} swept, {promoted} promoted.")
-        return 0
-
-    if not args.channel or not args.duration:
-        parser.error("-c/--channel and -d/--duration are required for capture.")
 
     try:
         duration_sec = parse_duration(args.duration)
@@ -779,11 +550,6 @@ def main() -> int:
     except ValueError as exc:
         log(f"ERROR: Invalid fixed-pad: {exc}")
         return 1
-
-    try:
-        sweep_orphans(threshold_hours=args.threshold_hours, dry_run=args.dry_run)
-    except Exception as exc:
-        log(f"Warning: startup orphan sweep encountered error: {exc}")
 
     try:
         channels = parse_playlist()
@@ -932,22 +698,6 @@ def main() -> int:
     p = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
                          stdout=subprocess.DEVNULL, stderr=ffmpeg_err_f)
 
-    interrupted = [False]
-
-    def _sig_handler(signum, frame):
-        log(f"[Supervisor] Caught signal {signum}, initiating clean capture shutdown...")
-        interrupted[0] = True
-        try:
-            if p and p.stdin and not p.stdin.closed:
-                p.stdin.write(b"q\n")
-                p.stdin.flush()
-                p.stdin.close()
-        except Exception:
-            pass
-
-    prev_sigterm = signal.signal(signal.SIGTERM, _sig_handler)
-    prev_sigint = signal.signal(signal.SIGINT, _sig_handler)
-
     stopped_cleanly = False
     is_supervising = fixture is not None and not (fixture.get("completed") or fixture.get("state") == "post")
 
@@ -956,11 +706,11 @@ def main() -> int:
             poll_start = time.monotonic()
             while time.monotonic() - poll_start < args.poll_interval:
                 ret = p.poll()
-                if ret is not None or interrupted[0]:
+                if ret is not None:
                     break
                 time.sleep(2)
 
-            if p.poll() is not None or interrupted[0]:
+            if p.poll() is not None:
                 break
 
             elapsed = time.monotonic() - start_mono
@@ -1007,7 +757,7 @@ def main() -> int:
             return b""
 
     try:
-        p.wait(timeout=15 if (stopped_cleanly or interrupted[0]) else None)
+        p.wait(timeout=15 if stopped_cleanly else None)
     except subprocess.TimeoutExpired:
         log("[Supervisor] ffmpeg did not terminate within 15s of 'q'; sending SIGINT fallback...")
         # Target OUR ffmpeg by its unique output path. `pidof ffmpeg` signalled
@@ -1028,32 +778,44 @@ def main() -> int:
     except Exception:
         pass
 
-    try:
-        signal.signal(signal.SIGTERM, prev_sigterm)
-        signal.signal(signal.SIGINT, prev_sigint)
-    except Exception:
-        pass
-
-    is_abnormal = (p.returncode != 0 and not stopped_cleanly and not interrupted[0])
-    if is_abnormal:
+    if p.returncode != 0 and not stopped_cleanly:
         err_msg = stderr_data.decode("utf-8", errors="replace").strip()[-300:]
         log(f"ERROR: ffmpeg capture exited with code {p.returncode}: {err_msg}")
         push_loki_alert(f"level=alert source=mct msg='ffmpeg capture failed on {ch['name']}: {err_msg[-200:]}'")
-
-    promoted = finalize_and_promote_capture(
-        raw_path=raw_path,
-        clean_path=clean_path,
-        preremux_cmd=preremux_cmd,
-        nfo_path=nfo_path,
-        poster_path=poster_path,
-        nfo_content=nfo_content,
-        meta=meta,
-        is_abnormal=is_abnormal or interrupted[0],
-        failure_reason=f"ffmpeg exit {p.returncode}" if is_abnormal else ("interrupted" if interrupted[0] else "")
-    )
-
-    if is_abnormal and not promoted:
         return 4
+
+    log(f"Capture completed. Pre-remuxing to normalise DTS: {clean_path}")
+    res_remux = subprocess.run(preremux_cmd, capture_output=True, text=True)
+    if res_remux.returncode != 0:
+        log(f"ERROR: Pre-remux failed: {res_remux.stderr.strip()[-300:]}")
+        push_loki_alert(f"level=alert source=mct msg='Pre-remux failed on {clean_path}'")
+        return 5
+
+    # Remove raw file after successful pre-remux
+    subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "rm", "-f", f"/srv/media-core{raw_path}"], check=False)
+
+    # Write poster.jpg artwork if retrieved
+    if meta.get("poster_bytes"):
+        try:
+            write_poster_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{poster_path}'"]
+            subprocess.run(write_poster_cmd, input=meta["poster_bytes"], check=True)
+            log(f"Wrote poster: {poster_path} ({len(meta['poster_bytes'])} bytes from {meta['poster_source']})")
+        except Exception as exc:
+            log(f"WARNING: Failed writing poster.jpg: {exc}")
+
+    # Write NFO metadata
+    write_nfo_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{nfo_path}'"]
+    subprocess.run(write_nfo_cmd, input=nfo_content, text=True, check=True)
+    log(f"Wrote NFO: {nfo_path} (lockdata={meta['lockdata']}, genres={meta['genres']}, plot_len={len(meta['plot'])})")
+
+    # Enqueue for comskip postprocessing
+    enqueue_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"echo '{clean_path}' >> /srv/media-core/media/recordings/.postprocess/queue"]
+    subprocess.run(enqueue_cmd, check=True)
+    log(f"Enqueued for comskip: {clean_path}")
+
+    # Refresh Jellyfin library
+    jf_api("/Library/Refresh", method="POST")
+    log("Capture and post-processing pipeline complete.")
     return 0
 
 

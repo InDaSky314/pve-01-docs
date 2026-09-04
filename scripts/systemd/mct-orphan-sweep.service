@@ -1,0 +1,6 @@
+[Unit]
+Description=MCT DVR Orphan Sweep (promotes usable orphans, cleans stubs/duplicates)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mct --sweep-orphans

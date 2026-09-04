@@ -60,19 +60,6 @@ try:
 except ImportError:
     threadfin_ctl = None
 
-try:
-    import loki_alert
-except ImportError:
-    loki_alert = None
-
-
-def push_alert(msg, level="alert"):
-    if loki_alert:
-        try:
-            loki_alert.push("media-core-alerts", msg, level=level)
-        except Exception:
-            pass
-
 
 def log(msg):
     line = f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {msg}"
@@ -199,63 +186,28 @@ def rescue_original(host_path, out_path, reason):
     library now points ONLY at COMFREE_ROOT, so a comskip failure means the
     capture exists on disk and is invisible to the user forever, with no
     notification. A recording with adverts still in it beats a lost one.
-
-    If input remux itself failed, repeating the ffmpeg copy would fail identically.
-    The last-resort path falls back to a direct container file copy preserving the
-    original format (.ts) and metadata, ensuring the game is visible in Jellyfin.
-    If the file is truly unusable (0 bytes or missing), an alert is pushed to Loki
-    so the user is notified immediately rather than failing silently.
     """
+    if os.path.exists(out_path):
+        return
     rel_in = os.path.relpath(host_path, RECORDINGS)
-    if not os.path.isfile(host_path) or os.path.getsize(host_path) == 0:
-        size_str = f"{os.path.getsize(host_path)} bytes" if os.path.exists(host_path) else "missing"
-        log(f"ALERT: RESCUE IMPOSSIBLE ({reason}): source file {rel_in} is {size_str} -- user alerted via Loki")
-        push_alert(f"level=alert source=comskip-rescue msg='Recording {os.path.basename(host_path)} is {size_str} ({reason}) -- capture lost, rescue impossible'")
-        return
-
-    in_ext = os.path.splitext(host_path)[1]
-    container_out_path = os.path.splitext(out_path)[0] + in_ext
-    if os.path.exists(out_path) or os.path.exists(container_out_path):
-        return
-
     rel_out = os.path.relpath(out_path, RECORDINGS)
-    rel_container_out = os.path.relpath(container_out_path, RECORDINGS)
     try:
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        rescued_target = None
-        method = ""
-
-        # For "input remux failed", ffmpeg stream-copy to MKV has already failed.
-        # Bypass the failing ffmpeg remux and use the genuinely different direct copy.
-        if reason != "input remux failed":
-            r = run(["nice", "-n", "15", "docker", "run", "--rm", f"--cpus={CPUS}",
-                     "-v", f"{RECORDINGS}:/recordings", IMAGE,
-                     "ffmpeg", "-y", "-v", "error", "-err_detect", "ignore_err",
-                     "-fflags", "+genpts+discardcorrupt",
-                     "-i", f"/recordings/{rel_in}",
-                     "-c", "copy", "-avoid_negative_ts", "make_zero",
-                     f"/recordings/{rel_out}"],
-                    timeout=3600)
-            if r.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
-                rescued_target = out_path
-                method = "remux stream-copy"
-
-        if not rescued_target:
-            # Last-resort path: plain file copy preserving original container format
-            log(f"RESCUE: using direct container copy for {rel_in} -> {rel_container_out}")
-            shutil.copy2(host_path, container_out_path)
-            if not os.path.isfile(container_out_path) or os.path.getsize(container_out_path) == 0:
-                raise RuntimeError(f"Direct file copy failed to create non-empty file at {container_out_path}")
-            rescued_target = container_out_path
-            method = "direct container copy"
-
-        copy_sidecars(host_path, rescued_target)
+        r = run(["nice", "-n", "15", "docker", "run", "--rm", f"--cpus={CPUS}",
+                 "-v", f"{RECORDINGS}:/recordings", IMAGE,
+                 "ffmpeg", "-y", "-v", "error", "-fflags", "+genpts",
+                 "-i", f"/recordings/{rel_in}",
+                 "-c", "copy", "-avoid_negative_ts", "make_zero",
+                 f"/recordings/{rel_out}"],
+                timeout=3600)
+        if r.returncode != 0 or not os.path.isfile(out_path):
+            log(f"RESCUE FAILED ({reason}): could not copy original to {rel_out}: {r.stderr[-200:]}")
+            return
+        copy_sidecars(host_path, out_path)
         jellyfin_refresh()
-        rel_rescued = os.path.relpath(rescued_target, RECORDINGS)
-        log(f"RESCUED uncut via {method} ({reason}): {rel_rescued} -- adverts NOT removed, but the recording is visible")
+        log(f"RESCUED uncut ({reason}): {rel_out} -- adverts NOT removed, but the recording is visible")
     except Exception as e:
-        log(f"RESCUE FAILED ({reason}): could not copy original to {rel_out}: {e}")
-        push_alert(f"level=alert source=comskip-rescue msg='RESCUE FAILED ({reason}): could not rescue {os.path.basename(host_path)}: {e}'")
+        log(f"RESCUE FAILED ({reason}): {e}")
 
 
 def copy_sidecars(src_media, out_path):
