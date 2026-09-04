@@ -1231,11 +1231,7 @@ def recordings(now: datetime) -> tuple[list[dict], list[str]]:
                           # it, Cancel sent the game id, which matches neither a
                           # timer's Id nor its ProgramId, and every cancel failed.
                           "id": str(t.get("Id") or ""),
-                          "timerId": str(t.get("Id") or ""),
-                          "bookingId": str(t.get("Id") or ""),
                           "name": t.get("Name", "recording"),
-                          "recording": t.get("Name", "recording"),
-                          "recordingIsThisGame": True,
                           "channel": c_disp,
                           "subtitle": t.get("EpisodeTitle") or "",
                           "start": start.isoformat(), "end": end.isoformat(),
@@ -1261,12 +1257,7 @@ def recordings(now: datetime) -> tuple[list[dict], list[str]]:
             status = b.get("status", "booked")
             items.append({"source": "MCT", "engine": "mct",
                           "id": str(b.get("id", "")),
-                          "timerId": str(b.get("id", "")),
-                          "bookingId": str(b.get("id", "")),
                           "name": title,
-                          "recording": title,
-                          "recordingIsThisGame": True,
-                          "bookingStatus": status,
                           "channel": c_disp,
                           "subtitle": f"Status: {status}",
                           "start": b_start.isoformat(), "end": b_end.isoformat(),
@@ -1706,9 +1697,8 @@ function pills(g, past){let h='';
   if(g.recording){
     const eng = (g.engine || 'Jellyfin').toUpperCase();
     const st = g.bookingStatus ? ` (${g.bookingStatus})` : '';
-    const label=sameGame?(g.live ? `RECORDING (${eng})` : (g.engine === 'mct' ? `MCT${st}` : `recording (${eng})`)):`other recording overlaps (${eng})`;
-    const recClass = (sameGame && g.live) ? 'pill live' : 'pill rec';
-    h+=`<span class="${recClass}" title="${esc(g.recording)}">${esc(label)}</span>`;
+    const label=sameGame?(g.engine === 'mct' ? `MCT${st}` : `recording (${eng})`):`other recording overlaps (${eng})`;
+    h+=`<span class="pill rec" title="${esc(g.recording)}">${esc(label)}</span>`;
     if(sameGame && !past && !g.done && (g.bookingId || g.id)){
       const gid = esc(g.bookingId || g.id);
       const engVal = esc(g.engine || 'jellyfin');
@@ -1946,7 +1936,11 @@ async function load(){
       'Shuts down at '+d.shutdownAt+' unless a recording is due.'}
   document.getElementById('recs').innerHTML=
     (d.problems||[]).map(p=>`<div class="err">${esc(p)}</div>`).join('')+
-    (d.recordings.length?d.recordings.map(r=>row({...r,team:r.source},false)).join('')
+    (d.recordings.length?d.recordings.map(r=>{
+      const eng = (r.engine || r.source || 'Jellyfin').toUpperCase();
+      const livePill = r.live?`<span class="pill live">RECORDING (${esc(eng)})</span>`:`<span class="pill rec">${esc(eng)}</span>`;
+      return row({...r,team:r.source},false,livePill);
+    }).join('')
      :'<div class="empty">Nothing scheduled.</div>');
   document.getElementById('games').innerHTML=d.games.length
     ? d.games.map(g=>row(g,false)).join('')
