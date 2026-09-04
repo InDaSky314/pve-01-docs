@@ -157,9 +157,13 @@ def trigger_upcoming(bookings: list[dict], now: datetime, changed: list[bool], d
 
             wrapper = f'"{MCT_BIN}" "$@" > "{logfile}" 2>&1; echo $? > "{statusfile}"'
             try:
+                # Unbuffered: last night's capture died with its startup line still in
+                # Python's block buffer, leaving a 0-byte log and no diagnostic at all.
+                child_env = dict(os.environ, PYTHONUNBUFFERED="1")
                 proc = subprocess.Popen(
                     ["bash", "-c", wrapper, "mct-runner", *cmd[1:]],
                     start_new_session=True,
+                    env=child_env,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,

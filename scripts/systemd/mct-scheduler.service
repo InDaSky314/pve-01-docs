@@ -4,5 +4,12 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+# A capture is a long-lived child spawned by a short tick. systemd's default
+# KillMode=control-group kills every process in the unit's cgroup when ExecStart
+# exits, so on 2026-09-04 the tick launched mct at 01:10:06, finished in the same
+# second, and killed the capture 4m54s before it would have opened the tuner.
+# start_new_session=True escapes the session, NOT the cgroup. Verified: default
+# kills the child, KillMode=process keeps it, and it survives later ticks.
+KillMode=process
 ExecStart=/usr/local/bin/mct-scheduler --tick
 User=root
