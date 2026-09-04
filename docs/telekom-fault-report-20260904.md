@@ -6,12 +6,26 @@ number / Anschlusskennung, which the account holder should fill in.
 
 ## Observed events (all 2026-09-04, Europe/Berlin)
 
-| time | new WAN IP | session lifetime |
-|---|---|---|
-| early morning | 217.232.7.40 | — |
-| 10:36 | 217.232.13.64 | ~90 min |
-| 11:54 | 217.232.9.150 | ~78 min |
-| 13:14 | 217.232.6.212 | current |
+Exact timestamps recovered from Loki, which ingests the router's syslog — the router's own
+buffer had already rotated. **Seven** session terminations in nine and a half hours:
+
+| session terminated | reconnected | new WAN IP | previous session lasted | outage |
+|---|---|---|---|---|
+| 03:47:18 | 03:50:59 | 84.149.188.254 | — | **3m41s** |
+| 06:13:38 | 06:21:49 | 84.149.176.13 | 151 min | **8m11s** |
+| 08:19:36 | 08:19:55 | 217.232.8.166 | 118 min | 19s |
+| 08:30:44 | 08:37:16 | 217.232.7.40 | **17 min** | **6m32s** |
+| 10:36:16 | 10:36:35 | 217.232.13.64 | 119 min | 19s |
+| 11:53:55 | 11:54:11 | 217.232.9.150 | 78 min | 16s |
+| 13:14:15 | 13:14:34 | 217.232.6.212 | 80 min | 19s |
+
+Three points the table makes that a bare count does not:
+
+* **One session survived only 17 minutes** (08:19:55 to 08:30:44).
+* **Two outages exceeded six minutes** — 8m11s and 6m32s — far beyond a routine
+  re-establishment, which the same line does in 16–19 seconds when it is behaving.
+* **The address pool changed** mid-day, from `84.149.x.x` to `217.232.x.x`, suggesting
+  re-authentication against a different BRAS rather than a simple lease renewal.
 
 Router log at each event:
 ```
@@ -30,8 +44,8 @@ pppd 2.4.9 started by root, uid 0
   by the router.
 * Reconnection itself is healthy: PPPoE re-establishes in ~3 seconds and authenticates
   immediately, so the CPE and credentials are fine.
-* Telekom's normal behaviour is a single forced reconnect per 24 hours. Four in roughly six
-  hours is not that.
+* Telekom's normal behaviour is a single forced reconnect per 24 hours. Seven in nine and a
+  half hours is not that.
 
 ---
 
@@ -41,15 +55,23 @@ pppd 2.4.9 started by root, uid 0
 >
 > Sehr geehrte Damen und Herren,
 >
-> an meinem Telekom-Anschluss (Anschlusskennung / Kundennummer: __________) kommt es seit
-> mehreren Tagen zu wiederholten PPPoE-Verbindungsabbrüchen. Am 04.09.2026 wurde die
-> Verbindung innerhalb von etwa sechs Stunden viermal getrennt und jeweils mit einer neuen
-> IP-Adresse neu aufgebaut:
+> an meinem Telekom-Anschluss (Kundennummer: __________) kommt es zu wiederholten
+> PPPoE-Verbindungsabbrüchen. Allein am 04.09.2026 wurde die Verbindung zwischen 03:47 und
+> 13:14 Uhr **siebenmal** getrennt und jeweils mit einer neuen IP-Adresse neu aufgebaut:
 >
-> * ca. 08:00 Uhr — 217.232.7.40
-> * 10:36 Uhr — 217.232.13.64
-> * 11:54 Uhr — 217.232.9.150
-> * 13:14 Uhr — 217.232.6.212
+> | Trennung | Neuaufbau | neue IP | Ausfalldauer |
+> |---|---|---|---|
+> | 03:47:18 | 03:50:59 | 84.149.188.254 | 3 min 41 s |
+> | 06:13:38 | 06:21:49 | 84.149.176.13 | **8 min 11 s** |
+> | 08:19:36 | 08:19:55 | 217.232.8.166 | 19 s |
+> | 08:30:44 | 08:37:16 | 217.232.7.40 | **6 min 32 s** |
+> | 10:36:16 | 10:36:35 | 217.232.13.64 | 19 s |
+> | 11:53:55 | 11:54:11 | 217.232.9.150 | 16 s |
+> | 13:14:15 | 13:14:34 | 217.232.6.212 | 19 s |
+>
+> Eine Sitzung bestand dabei nur 17 Minuten. Zwei Ausfälle dauerten über sechs Minuten,
+> obwohl derselbe Anschluss im Normalfall innerhalb von 16 bis 19 Sekunden wieder aufgebaut
+> wird. Zudem wechselte der Adressbereich von 84.149.x.x auf 217.232.x.x.
 >
 > Im Router-Protokoll erscheint bei jedem Abbruch:
 >
@@ -62,7 +84,7 @@ pppd 2.4.9 started by root, uid 0
 > Die Zugangsdaten und das Endgerät funktionieren demnach einwandfrei.
 >
 > Eine einmalige Zwangstrennung pro 24 Stunden ist mir bekannt und wäre unproblematisch.
-> Vier Trennungen innerhalb von sechs Stunden sind es nicht — sie unterbrechen laufende
+> Sieben Trennungen innerhalb von neuneinhalb Stunden sind es nicht — sie unterbrechen laufende
 > Videoübertragungen und Aufnahmen.
 >
 > Ich bitte daher um eine Prüfung der Leitung und des zugehörigen DSLAM-Ports auf
@@ -83,3 +105,16 @@ fault is not customer-side; notes one forced reconnect per day is expected but f
 hours is not; asks them to check the line and DSLAM port for instability and to confirm
 whether network-side session drops are logged; **and explicitly asks for a written reply
 because the account holder does not speak sufficient German.**
+
+---
+
+## Where to find your Kundennummer
+
+Log in at **[meinkundencenter.telekom.de](https://meinkundencenter.telekom.de)** (or
+[telekom.de/mein-kundencenter](https://www.telekom.de/mein-kundencenter)) with your Telekom
+Login — usually your email address plus password. The customer number is under
+**Vertragspartner / contract partner**.
+
+It is also on **every invoice**, in the **MeinMagenta app** (user symbol -> Persönliche Daten
+-> Vertragspartner), and in the reference text of the Telekom direct debit on your bank
+statement. Telekom's own guide: [Wo finde ich meine Kundennummer?](https://www.telekom.de/hilfe/vertrag-rechnung/vertrag/meine-daten/kundennummer)
