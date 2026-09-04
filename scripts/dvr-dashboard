@@ -1708,8 +1708,17 @@ function pills(g, past){let h='';
   if(!past && !g.done && !sameGame && g.team && g.kind){
     const enc = encodeURIComponent(JSON.stringify(g));
     const gid = 'g' + (g.id || Math.random().toString(36).substring(2, 8));
-    const chOpts = (g.channelOptions || []);
-    const chSel = chOpts.length > 1
+    // Show the selector whenever the guide has an answer, not only when there are
+    // several. A single EPG option is still worth surfacing because it is often
+    // NOT the auto-resolved channel: tonight's game resolved to 1509 "MLB", which
+    // carries no programmes at all, while the guide put it on 121. The resolved
+    // channel is appended so the old behaviour stays reachable.
+    const chOpts = (g.channelOptions || []).slice();
+    const resolvedNum = String(g.channel || '').split(' ')[0].replace(/\D/g, '');
+    if (resolvedNum && !chOpts.some(c => String(c.number) === resolvedNum)) {
+      chOpts.push({number: resolvedNum, name: String(g.channel || '').split(' ').slice(1).join(' ')});
+    }
+    const chSel = chOpts.length >= 1
       ? `<select class="engine-select channel-select" aria-label="Channel for ${esc(g.name)}">`
         + chOpts.map(c => `<option value="${esc(c.number)}">${esc(c.number)} ${esc(c.name)}</option>`).join('')
         + `</select>`
