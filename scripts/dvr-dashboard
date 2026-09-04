@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 import unicodedata
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone, time as dtime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -600,8 +601,8 @@ def find_matching_program_id(channel_id: str, game_start: datetime) -> str | Non
     return best_id or containment_id
 
 
-def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str, dry_run: bool = False) -> tuple[bool, str, dict[str, Any]]:
-    """Create a Jellyfin LiveTv timer for a game."""
+def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str, dry_run: bool = False, pad_sec: int = 0) -> tuple[bool, str, dict[str, Any]]:
+    """Create a Jellyfin LiveTv timer for a game or EPG program."""
     start_dt = game["start"] if isinstance(game["start"], datetime) else datetime.fromisoformat(game["start"])
     end_dt = game["end"] if isinstance(game["end"], datetime) else datetime.fromisoformat(game["end"])
 
@@ -610,10 +611,13 @@ def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str
 
     start_iso = (start_utc - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
     end_iso = (end_utc + timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    name = f"{game['team']}: {game['name']}"
+    raw_name = game.get("name") or game.get("title") or "Recording"
+    team = game.get("team")
+    name = f"{team}: {raw_name}" if (team and not raw_name.startswith(team)) else raw_name
 
     program_id = find_matching_program_id(channel_id, start_utc)
 
+    post_padding = pad_sec if pad_sec > 0 else 1800
     payload = {
         "Type": "Timer",
         "ChannelId": channel_id,
@@ -624,7 +628,7 @@ def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str
         "StartDate": start_iso,
         "EndDate": end_iso,
         "PrePaddingSeconds": 300,
-        "PostPaddingSeconds": 1800,
+        "PostPaddingSeconds": post_padding,
     }
     if program_id:
         payload["ProgramId"] = program_id
@@ -1333,6 +1337,7 @@ border-radius:8px;padding:10px 12px;margin-top:10px;display:none}
   <button role="tab" aria-selected="false" onclick="tab('sched')" id="t-sched">Schedules</button>
   <button role="tab" aria-selected="false" onclick="tab('links')" id="t-links">Links</button>
   <button role="tab" aria-selected="false" onclick="tab('events')" id="t-events">Automation</button>
+  <button role="tab" aria-selected="false" onclick="tab('guide')" id="t-guide">Guide Search</button>
 </div>
 
 <div id="p-now">
@@ -1415,6 +1420,28 @@ border-radius:8px;padding:10px 12px;margin-top:10px;display:none}
         actually succeeded, independent of what triggered it.</span></div></div>
   </div>
   <div id="events-body"><div class="empty">loading…</div></div>
+</div>
+
+<div id="p-guide" hidden>
+  <div class="card">
+    <h2>Guide Search</h2>
+    <div class="sub">Search 1,200+ channels and 38,000+ programmes. Clustered by broadcast, Wisconsin local feeds preferred.</div>
+    <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+      <input type="text" id="guide-q" placeholder="Search programmes (e.g. boxing, premier league, tennis)..." 
+             style="flex:1;min-width:200px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);font:inherit"
+             onkeydown="if(event.key==='Enter')searchGuide()">
+      <button class="act primary" style="flex:0 0 auto;min-height:38px;padding:8px 16px" onclick="searchGuide()">Search</button>
+    </div>
+    <div class="filter" id="guide-cat-filter">
+      <button aria-pressed="true" onclick="setGuideCategory('', this)">All</button>
+      <button aria-pressed="false" onclick="setGuideCategory('Sports', this)">Sports</button>
+      <button aria-pressed="false" onclick="setGuideCategory('Movies', this)">Movies</button>
+      <button aria-pressed="false" onclick="setGuideCategory('News', this)">News</button>
+      <button aria-pressed="false" onclick="setGuideCategory('Series', this)">Series</button>
+      <button aria-pressed="false" onclick="setGuideCategory('Documentary', this)">Documentary</button>
+    </div>
+    <div id="guide-results"><div class="empty">Type a query above to search the guide.</div></div>
+  </div>
 </div>
 
 <script>
@@ -1582,18 +1609,129 @@ function row(g,past,extra){
   <div class="pills">${extra||''}${pills(g, past)}</div></div>`}
 
 function tab(w){
-  const n=w==='now', s=w==='sched', l=w==='links', e=w==='events';
+  const n=w==='now', s=w==='sched', l=w==='links', e=w==='events', g=w==='guide';
   document.getElementById('p-now').hidden=!n;
   document.getElementById('p-sched').hidden=!s;
   document.getElementById('p-links').hidden=!l;
   document.getElementById('p-events').hidden=!e;
+  document.getElementById('p-guide').hidden=!g;
   document.getElementById('t-now').setAttribute('aria-selected',n);
   document.getElementById('t-sched').setAttribute('aria-selected',s);
   document.getElementById('t-links').setAttribute('aria-selected',l);
   document.getElementById('t-events').setAttribute('aria-selected',e);
+  document.getElementById('t-guide').setAttribute('aria-selected',g);
   if(s&&!SCHED)loadSched();
   if(l)loadLinks();
   if(e)loadEvents();
+}
+
+let GUIDE_CAT = '';
+function setGuideCategory(cat, btn) {
+  GUIDE_CAT = cat;
+  document.querySelectorAll('#guide-cat-filter button').forEach(b => b.setAttribute('aria-pressed', 'false'));
+  btn.setAttribute('aria-pressed', 'true');
+  searchGuide();
+}
+
+async function searchGuide() {
+  const q = document.getElementById('guide-q').value.trim();
+  const el = document.getElementById('guide-results');
+  if (!q && !GUIDE_CAT) {
+    el.innerHTML = '<div class="empty">Type a query or select a category to search.</div>';
+    return;
+  }
+  el.innerHTML = '<div class="empty">Searching EPG…</div>';
+  try {
+    let url = `/api/epg/search?q=${encodeURIComponent(q)}&limit=25`;
+    if (GUIDE_CAT) url += `&category=${encodeURIComponent(GUIDE_CAT)}`;
+    const res = await fetch(url);
+    const j = await res.json();
+    if (!res.ok || !j.results) throw new Error(j.error || 'Failed to search');
+    renderGuideResults(j.results);
+  } catch (e) {
+    el.innerHTML = `<div class="err">Search failed: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderGuideResults(groups) {
+  const el = document.getElementById('guide-results');
+  if (!groups.length) {
+    el.innerHTML = '<div class="empty">No matching broadcasts found.</div>';
+    return;
+  }
+  el.innerHTML = groups.map(g => {
+    const durH = Math.floor(g.duration_sec / 3600);
+    const durM = Math.floor((g.duration_sec % 3600) / 60);
+    const durStr = durH ? `${durH}h ${durM.toString().padStart(2, '0')}m` : `${durM}m`;
+    const sub = g.subtitle ? ` — ${esc(g.subtitle)}` : '';
+    const cat = g.category ? `<span class="badge" style="margin-left:6px">${esc(g.category)}</span>` : '';
+    
+    const chOptions = g.channels.map(c => {
+      const rec = c.recommended ? ' [Recommended: Local Market]' : '';
+      const deg = c.degraded ? ' [Warning: Degraded Feed]' : '';
+      return `<option value="${esc(c.number || c.name)}" data-prog="${esc(c.prog_id)}">${esc(c.number ? c.number + ' ' : '')}${esc(c.name)}${rec}${deg}</option>`;
+    }).join('');
+
+    const gJson = encodeURIComponent(JSON.stringify({
+      id: 'epg-' + g.channels[0].prog_id,
+      title: g.title,
+      name: g.title + (g.subtitle ? ' — ' + g.subtitle : ''),
+      channel: g.channels[0].number || g.channels[0].name,
+      start: g.start_utc,
+      end: g.stop_utc,
+      duration_sec: g.duration_sec,
+      category: g.category || 'Sports',
+      genre: g.category || 'Sports'
+    }));
+
+    const cardId = 'gc-' + g.id;
+
+    return `<div class="card" style="margin-top:10px" id="${cardId}">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
+        <div><b style="font-size:1.02rem">${esc(g.title)}</b>${sub}${cat}</div>
+        <div style="font-size:.85rem;color:var(--dim)">${durStr}</div>
+      </div>
+      <div style="font-size:.85rem;color:var(--dim);margin-bottom:8px">
+        <span>${esc(g.start_local)} – ${esc(g.stop_local.split(' ')[1])} CEST</span>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <select id="ch-${cardId}" style="padding:4px 8px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--fg);font:inherit;font-size:.85rem">
+          ${chOptions}
+        </select>
+        <select id="eng-${cardId}" class="engine-select" style="height:28px">
+          <option value="mct">MCT</option>
+          <option value="jellyfin">Jellyfin</option>
+        </select>
+        <button class="pill btn-rec" style="padding:4px 12px;font-size:.82rem" onclick="bookGuideCard('${cardId}', '${gJson}')">Record</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function bookGuideCard(cardId, gJson) {
+  const data = JSON.parse(decodeURIComponent(gJson));
+  const chSel = document.getElementById('ch-' + cardId);
+  const engSel = document.getElementById('eng-' + cardId);
+  if (chSel) {
+    data.channel = chSel.value;
+    const opt = chSel.selectedOptions[0];
+    if (opt && opt.dataset.prog) data.id = 'epg-' + opt.dataset.prog;
+  }
+  if (engSel) data.engine = engSel.value;
+
+  try {
+    const res = await fetch('/api/record-game', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(data)
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok || !j.ok) throw new Error(j.error || 'Error creating timer');
+    alert(j.message || 'Recording booked successfully!');
+    if (typeof load === 'function') load();
+  } catch (e) {
+    alert('Booking refused: ' + e.message);
+  }
 }
 const EVENT_LABELS = {
   extend: 'Extended recording', trim: 'Trimmed recording (game ended)',
@@ -1832,10 +1970,36 @@ class Handler(BaseHTTPRequestHandler):
             self._json(links_status)
         elif self.path.startswith("/api/automation-events"):
             self._json(automation_events)
+        elif self.path.startswith("/api/epg/search"):
+            self._epg_search()
         elif self.path in ("/", "/index.html"):
             self._send(200, PAGE.encode(), "text/html; charset=utf-8")
         else:
             self._send(404, b"not found", "text/plain")
+
+    def _epg_search(self):
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            q = params.get("q", [""])[0].strip()
+            cat = params.get("category", [""])[0].strip()
+            limit = params.get("limit", ["25"])[0].strip()
+
+            cmd = ["/usr/local/bin/epg-find", "--json"]
+            if q:
+                cmd.append(q)
+            if cat:
+                cmd.extend(["--category", cat])
+            if limit and limit.isdigit():
+                cmd.extend(["-n", limit])
+
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if res.returncode != 0:
+                return self._send(500, json.dumps({"ok": False, "error": f"epg-find failed: {res.stderr.strip()}"}).encode(), "application/json")
+
+            self._send(200, res.stdout.encode("utf-8"), "application/json")
+        except Exception as exc:
+            self._send(500, json.dumps({"ok": False, "error": str(exc)}).encode(), "application/json")
 
     def _body(self) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
@@ -1899,6 +2063,11 @@ class Handler(BaseHTTPRequestHandler):
                 if b.get("status") in ("cancelled", "done", "failed"):
                     continue
                 if str(b.get("id")) == bid or str(b.get("name")) == bid or str(b.get("title")) == bid:
+                    if b.get("unit"):
+                        try:
+                            subprocess.run(["systemctl", "stop", b["unit"]], check=False)
+                        except Exception:
+                            pass
                     if b.get("status") == "running" and b.get("pid"):
                         try:
                             os.kill(b["pid"], signal.SIGTERM)
@@ -1935,14 +2104,16 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400, b'{"error":"invalid JSON"}', "application/json")
 
-        team = body.get("team")
+        title = body.get("title") or body.get("name") or body.get("team") or ""
+        team = body.get("team") or title
         event_id = body.get("id")
         start_str = body.get("start")
         engine = str(body.get("engine", "jellyfin")).lower()
         dry_run_req = bool(body.get("dryRun")) or bool(os.environ.get("DVR_DRY_RUN"))
+        pad_sec = int(body.get("pad_sec", 0))
 
-        if not team or (not event_id and not start_str):
-            return self._send(400, b'{"error":"missing game identity (team and id or start required)"}', "application/json")
+        if not title or (not event_id and not start_str):
+            return self._send(400, b'{"error":"missing programme identity (title/team and id or start required)"}', "application/json")
 
         if engine not in ("jellyfin", "mct"):
             return self._send(400, b'{"error":"engine must be jellyfin or mct"}', "application/json")
@@ -1952,7 +2123,7 @@ class Handler(BaseHTTPRequestHandler):
         target_game = None
 
         for g in games:
-            if g["team"] == team:
+            if g.get("team") == team or g.get("name") == title:
                 if event_id and str(g.get("id")) == str(event_id):
                     target_game = g
                     break
@@ -1961,14 +2132,20 @@ class Handler(BaseHTTPRequestHandler):
                     break
 
         if not target_game:
-            kind = body.get("kind") or "baseball"
+            kind = body.get("kind") or "sports"
             try:
-                s_dt = datetime.fromisoformat(start_str) if start_str else now
+                s_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00")).astimezone(LOCAL) if start_str else now
             except ValueError:
                 return self._send(400, b'{"error":"invalid start time format"}', "application/json")
             e_str = body.get("end")
+            dur_sec = body.get("duration_sec")
             try:
-                e_dt = datetime.fromisoformat(e_str) if e_str else s_dt + DURATION.get(kind, timedelta(hours=3))
+                if e_str:
+                    e_dt = datetime.fromisoformat(e_str.replace("Z", "+00:00")).astimezone(LOCAL)
+                elif dur_sec:
+                    e_dt = s_dt + timedelta(seconds=int(dur_sec))
+                else:
+                    e_dt = s_dt + DURATION.get(kind, timedelta(hours=3))
             except ValueError:
                 e_dt = s_dt + DURATION.get(kind, timedelta(hours=3))
 
@@ -1976,22 +2153,22 @@ class Handler(BaseHTTPRequestHandler):
                 "id": str(event_id or ""),
                 "team": team,
                 "kind": kind,
-                "name": body.get("name") or f"{team} Game",
+                "name": body.get("name") or title,
+                "title": title,
                 "start": s_dt.isoformat(),
                 "end": e_dt.isoformat(),
                 "broadcasts": body.get("broadcasts") or [],
+                "pad_sec": pad_sec,
             }
 
         jf_channels = get_jellyfin_channels()
         chmap = channel_names()
-        cid, cname = resolve_channel_id(target_game, jf_channels)
-        # resolve_channel_id can pick a channel carrying no guide data at all: for the
-        # 2026-09-04 Brewers game it chose 1509 "MLB" (zero programmes) over 121
-        # "Milwaukee Brewers HD", which carried the fixture. Let the caller name one.
+        cid = cname = None
+        if target_game.get("broadcasts"):
+            cid, cname = resolve_channel_id(target_game, jf_channels)
+
         ch_override = str(body.get("channel") or "").strip()
         if ch_override:
-            # jf_channels is name -> id, so a numeric override needs the LiveTv
-            # channel list, which carries Number alongside Name.
             _cid = _cname = None
             if ch_override.isdigit():
                 _r = jf_request("/emby/LiveTv/Channels?Limit=3000") or {}
@@ -2004,15 +2181,16 @@ class Handler(BaseHTTPRequestHandler):
                     if _n.lower() == ch_override.lower():
                         _cid, _cname = _i, _n
                         break
-            if not _cid:
-                return self._send(400, json.dumps(
-                    {"error": f"channel '{ch_override}' not found"}).encode(),
-                    "application/json")
-            cid, cname = _cid, _cname
-        if not cid:
+            if _cid:
+                cid, cname = _cid, _cname
+            else:
+                if not cname:
+                    cname = ch_override
+
+        if engine == "jellyfin" and not cid:
             return self._send(422, json.dumps({
                 "ok": False,
-                "error": f"Cannot resolve channel for {target_game['name']} ({cname})"
+                "error": f"Cannot resolve Jellyfin channel for {target_game['name']} ({cname or ch_override})"
             }).encode(), "application/json")
 
         try:
@@ -2022,18 +2200,30 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, b'{"error":"invalid game start/end datetimes"}', "application/json")
 
         t_start = start_dt - timedelta(minutes=5)
-        t_end = end_dt + timedelta(minutes=15)
-        c_disp = chmap.get(cid) or chmap.get(cname) or cname
+        t_end = end_dt + timedelta(seconds=max(900, pad_sec))
+        c_disp = chmap.get(cid) or chmap.get(cname) or (f"{ch_override} {cname}".strip() if ch_override else cname)
 
-        # 1. Check for overlapping Jellyfin timers
+        # 1. Single-tuner conflict check: Check for overlapping Jellyfin timers across ALL channels
         existing_timers = get_existing_timers()
-        if is_overlapping_timer(cid, t_start, t_end, existing_timers):
-            return self._send(409, json.dumps({
-                "ok": False,
-                "error": f"An overlapping Jellyfin timer already exists on {c_disp} for {target_game['name']}"
-            }).encode(), "application/json")
+        for t in existing_timers:
+            if t.get("Status") in ("Completed", "Cancelled", "Error"):
+                continue
+            try:
+                jt_start = datetime.fromisoformat(t["StartDate"].replace("Z", "+00:00")).astimezone(LOCAL) - timedelta(seconds=t.get("PrePaddingSeconds") or 0)
+                jt_end = datetime.fromisoformat(t["EndDate"].replace("Z", "+00:00")).astimezone(LOCAL) + timedelta(seconds=t.get("PostPaddingSeconds") or 0)
+            except Exception:
+                continue
+            if jt_start < t_end and jt_end > t_start:
+                t_name = t.get("Name", "scheduled recording")
+                t_cname = t.get("ChannelName") or t.get("ChannelId") or "channel"
+                s_str = jt_start.strftime("%H:%M")
+                e_str = jt_end.strftime("%H:%M")
+                return self._send(409, json.dumps({
+                    "ok": False,
+                    "error": f"Tuner conflict: overlapping Jellyfin timer '{t_name}' on {t_cname} ({s_str}–{e_str} CEST)"
+                }).encode(), "application/json")
 
-        # 2. Check for overlapping MCT bookings
+        # 2. Single-tuner conflict check: Check for overlapping MCT bookings across ALL channels
         mct_bookings = load_mct_bookings()
         for b in mct_bookings:
             if b.get("status") in ("cancelled", "done", "failed"):
@@ -2041,24 +2231,33 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 bs = datetime.fromisoformat(b["start"]).astimezone(LOCAL) - timedelta(minutes=5)
                 duration_sec = int(b.get("duration_sec", 0))
-                be = datetime.fromisoformat(b["start"]).astimezone(LOCAL) + timedelta(seconds=duration_sec) + timedelta(minutes=15)
+                b_pad = int(b.get("fixed_pad") or 900)
+                be = datetime.fromisoformat(b["start"]).astimezone(LOCAL) + timedelta(seconds=duration_sec) + timedelta(seconds=b_pad)
             except Exception:
                 continue
             if bs < t_end and be > t_start:
+                b_title = b.get("title") or b.get("name") or "MCT recording"
+                b_ch = b.get("channel_display") or b.get("channel") or "channel"
+                s_str = bs.strftime("%H:%M")
+                e_str = be.strftime("%H:%M")
                 return self._send(409, json.dumps({
                     "ok": False,
-                    "error": f"An overlapping MCT capture already exists for '{b.get('title') or b.get('name')}' ({bs.strftime('%H:%M')} to {be.strftime('%H:%M')})"
+                    "error": f"Tuner conflict: overlapping MCT capture '{b_title}' on {b_ch} ({s_str}–{e_str} CEST)"
                 }).encode(), "application/json")
 
+        rec_name = target_game.get("name") or title
+        if target_game.get("team") and not rec_name.startswith(target_game["team"]):
+            rec_name = f"{target_game['team']}: {rec_name}"
+
         if engine == "jellyfin":
-            ok, msg, payload = schedule_game_timer(target_game, cid, cname, dry_run=dry_run_req)
+            ok, msg, payload = schedule_game_timer(target_game, cid, cname, dry_run=dry_run_req, pad_sec=pad_sec)
             if ok:
                 with _lock:
                     _sched["at"] = None
                 return self._send(200, json.dumps({
                     "ok": True,
                     "engine": "jellyfin",
-                    "message": f"Jellyfin timer created for {target_game['name']} on {c_disp}",
+                    "message": f"Jellyfin timer created for {rec_name} on {c_disp}",
                     "channel": c_disp,
                     "dryRun": dry_run_req,
                     "payload": payload
@@ -2072,18 +2271,17 @@ class Handler(BaseHTTPRequestHandler):
         elif engine == "mct":
             duration_sec = int((end_dt - start_dt).total_seconds())
             if duration_sec <= 0:
-                duration_sec = int(DURATION.get(target_game.get("kind", "baseball"), timedelta(hours=3)).total_seconds())
+                duration_sec = int(DURATION.get(target_game.get("kind", "sports"), timedelta(hours=3)).total_seconds())
 
             c_num = "".join(ch for ch in c_disp.split()[0] if ch.isdigit()) if c_disp else ""
-            mct_ch_arg = c_num if c_num else cname
-            game_title = f"{target_game['team']}: {target_game['name']}"
+            mct_ch_arg = ch_override if ch_override else (c_num if c_num else cname)
             booking_id = str(target_game.get("id") or f"mct-{int(start_dt.timestamp())}")
 
             booking_entry = {
                 "id": booking_id,
                 "channel": mct_ch_arg,
-                "title": game_title,
-                "name": game_title,
+                "title": rec_name,
+                "name": rec_name,
                 "start": start_dt.isoformat(),
                 "end": end_dt.isoformat(),
                 "duration_sec": duration_sec,
@@ -2091,12 +2289,14 @@ class Handler(BaseHTTPRequestHandler):
                 "created_at": now.isoformat(),
                 "team": target_game.get("team"),
                 "channel_number": c_num,
-                "channel_name": cname,
+                "channel_name": cname or c_disp,
                 "channel_display": c_disp,
-                "category": "Sports",
-                "genre": "Sports",
+                "category": body.get("category") or "Sports",
+                "genre": body.get("genre") or "Sports",
                 "engine": "mct"
             }
+            if pad_sec > 0:
+                booking_entry["fixed_pad"] = pad_sec
 
             if not dry_run_req:
                 mct_bookings.append(booking_entry)
@@ -2108,7 +2308,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({
                 "ok": True,
                 "engine": "mct",
-                "message": f"MCT booking created for {game_title} on {c_disp} at {start_dt.strftime('%Y-%m-%d %H:%M')}",
+                "message": f"MCT booking created for {rec_name} on {c_disp} at {start_dt.strftime('%Y-%m-%d %H:%M')}",
                 "channel": c_disp,
                 "dryRun": dry_run_req,
                 "booking": booking_entry

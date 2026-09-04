@@ -169,6 +169,8 @@ def trigger_upcoming(bookings: list[dict], now: datetime, changed: list[bool], d
                 cmd.extend(["--category", str(b["category"])])
             if b.get("genre"):
                 cmd.extend(["--genre", str(b["genre"])])
+            if b.get("fixed_pad"):
+                cmd.extend(["--fixed-pad", str(b["fixed_pad"])])
 
             if dry_run:
                 log(f"[DRY-RUN] Would launch: {' '.join(cmd)} (lead={lead:.1f}s)")
@@ -224,15 +226,19 @@ def cancel_booking(booking_id: str) -> bool:
         print(f"Booking ID '{booking_id}' not found.")
         return False
 
-    if target.get("status") == "running" and target.get("pid"):
-        pid = target["pid"]
-        try:
-            os.kill(pid, signal.SIGTERM)
-            log(f"Sent SIGTERM to running process PID {pid}")
-        except ProcessLookupError:
-            pass
-        except Exception as exc:
-            log(f"Failed to kill PID {pid}: {exc}")
+    if target.get("status") == "running":
+        if target.get("unit"):
+            subprocess.run(["systemctl", "stop", target["unit"]], check=False)
+            log(f"Stopped systemd unit {target['unit']}")
+        if target.get("pid"):
+            pid = target["pid"]
+            try:
+                os.kill(pid, signal.SIGTERM)
+                log(f"Sent SIGTERM to running process PID {pid}")
+            except ProcessLookupError:
+                pass
+            except Exception as exc:
+                log(f"Failed to kill PID {pid}: {exc}")
 
     target["status"] = "cancelled"
     target["cancelled_at"] = datetime.now(LOCAL_TZ).isoformat()
