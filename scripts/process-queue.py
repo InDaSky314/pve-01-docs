@@ -178,6 +178,38 @@ def jellyfin_refresh():
         log(f"WARN (jellyfin refresh failed, file is on disk): {e}")
 
 
+def rescue_original(host_path, out_path, reason):
+    """Preserve the recording when commercial removal fails.
+
+    Every ERROR path below used to log and return, producing no output at all.
+    That was survivable while Jellyfin indexed the whole recordings tree, but the
+    library now points ONLY at COMFREE_ROOT, so a comskip failure means the
+    capture exists on disk and is invisible to the user forever, with no
+    notification. A recording with adverts still in it beats a lost one.
+    """
+    if os.path.exists(out_path):
+        return
+    rel_in = os.path.relpath(host_path, RECORDINGS)
+    rel_out = os.path.relpath(out_path, RECORDINGS)
+    try:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        r = run(["nice", "-n", "15", "docker", "run", "--rm", f"--cpus={CPUS}",
+                 "-v", f"{RECORDINGS}:/recordings", IMAGE,
+                 "ffmpeg", "-y", "-v", "error", "-fflags", "+genpts",
+                 "-i", f"/recordings/{rel_in}",
+                 "-c", "copy", "-avoid_negative_ts", "make_zero",
+                 f"/recordings/{rel_out}"],
+                timeout=3600)
+        if r.returncode != 0 or not os.path.isfile(out_path):
+            log(f"RESCUE FAILED ({reason}): could not copy original to {rel_out}: {r.stderr[-200:]}")
+            return
+        copy_sidecars(host_path, out_path)
+        jellyfin_refresh()
+        log(f"RESCUED uncut ({reason}): {rel_out} -- adverts NOT removed, but the recording is visible")
+    except Exception as e:
+        log(f"RESCUE FAILED ({reason}): {e}")
+
+
 def copy_sidecars(src_media, out_path):
     """Carry poster/NFO across into the commercial-free tree.
 
@@ -274,12 +306,14 @@ def process_one(container_path):
             timeout=1800)
     if r.returncode != 0 or not os.path.isfile(clean_input):
         log(f"ERROR (input remux failed): {r.stderr[-300:]}")
+        rescue_original(host_path, out_path, "input remux failed")
         shutil.rmtree(job_work, ignore_errors=True)
         return True
 
     orig_dur = ffprobe_duration(clean_input)
     if not orig_dur:
         log(f"ERROR (ffprobe failed on remuxed input, will not retry): {host_path}")
+        rescue_original(host_path, out_path, "ffprobe failed")
         shutil.rmtree(job_work, ignore_errors=True)
         return True
 
@@ -304,6 +338,7 @@ def process_one(container_path):
         log(f"ERROR (input duration sanity check failed: {orig_dur:.0f}s for "
             f"{file_bytes/1e6:.1f}MB, implied bitrate {bitrate_kbps:.0f} kbps): {rel}")
         shutil.rmtree(job_work, ignore_errors=True)
+        rescue_original(host_path, out_path, "input duration sanity check")
         return True
 
     log(f"COMSKIP start ({orig_dur:.0f}s): {rel}")
@@ -336,6 +371,7 @@ def process_one(container_path):
             sig = -r.returncode if r.returncode < 0 else r.returncode - 128
             crash_note = f" -- comskip crashed (signal {sig}, likely corrupted source video at the stall-cut point, not a pipeline bug)"
         log(f"ERROR (no EDL produced{crash_note}; comskip stderr tail: {r.stderr[-300:]})")
+        rescue_original(host_path, out_path, "no EDL produced")
         return True
 
     cuts = parse_edl(edl)
@@ -375,6 +411,7 @@ def process_one(container_path):
         if r.returncode != 0:
             log(f"ERROR (segment {i} cut failed): {r.stderr[-300:]}")
             shutil.rmtree(job_work, ignore_errors=True)
+            rescue_original(host_path, out_path, "segment cut failed")
             return True
         seg_files.append(seg)
 
@@ -395,6 +432,7 @@ def process_one(container_path):
     if r.returncode != 0 or not os.path.isfile(tmp_out):
         log(f"ERROR (concat failed): {r.stderr[-300:]}")
         shutil.rmtree(job_work, ignore_errors=True)
+        rescue_original(host_path, out_path, "concat failed")
         return True
 
     out_dur = ffprobe_duration(tmp_out)
