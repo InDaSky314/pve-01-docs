@@ -1349,3 +1349,29 @@ Bounce WireGuard tunnel 2430 (`wgclient1`) on the GL.iNet router (`192.168.9.1`)
 **A history rewrite on a stale clone will roll back the branch on force-push.** Running `git filter-repo` or author rewrites on an external workstation that has not pulled latest upstream will produce a rewritten branch terminating at the stale tip. Force-pushing that branch clobbers all intermediate production commits on the remote. **Always `git pull` immediately before running any history rewrite tool, and keep branch protection (`allow_force_pushes=false`) enabled on shared branches.**
 
 **Multi-pushurl remotes mask partial failures.** When `origin` has multiple push URLs, Git pushes sequentially. If one remote succeeds and another rejects, or if `gh pr merge` updates only the primary, the two remotes drift. Never trust a single "pushed" exit line; verify both remotes with `git ls-remote`.
+
+## Never use the failed mechanism as its own rescue path (2026-09-04)
+
+In post-processing queues, when a format remux or stream copy fails (e.g. ffmpeg failing to remux MPEG-TS into MKV), calling a rescue handler that runs essentially the same ffmpeg copy with the same output container guarantees double-failure and silent loss. The last resort MUST be fundamentally different: a plain byte-level container copy (`shutil.copy2`) that does not parse packets or timestamps, preserving the original container format (`.ts`) and metadata so the user still has a playable recording.
+
+If the file is genuinely unusable (0 bytes or missing), rescue cannot succeed. Swallowing the failure or logging only locally leaves the user unaware of lost recordings. Push an immediate high-priority alert to Loki (`job="media-core-alerts"`) so Grafana / alert responders notify the user immediately.
+
+## Raw capture leak prevention: promote usable orphans, sweep stubs (2026-09-04)
+
+Abnormal termination of direct capture tools (ffmpeg exit, power-down, SIGTERM) leaves raw captures on disk unindexed in `/media/recordings/`. Simply deleting on failure risks destroying the only copy of a game, while doing nothing leaks multi-gigabyte files.
+
+A dual-discipline approach handles both:
+1. **Promote wanted orphans:** If a capture has usable content (>=1MB), normalize or copy to `.ts`, write sidecar NFOs, enqueue to comskip, and refresh the library. The user never loses a game.
+2. **Sweep stubs and duplicates:** If a raw file is a 0-byte/sub-MB stub or its clean `.ts` already exists, sweep it once its booking enters a terminal state. Active captures (recent mtime and running unit) must always be kept untouched.
+
+## UI actions must bind to uniform data models across tabs (2026-09-04)
+
+When a single action (such as "Cancel") is available across different views (e.g. Tonight tab's scheduled recordings vs Schedules tab's games), all views must pass the expected fields (`recording`, `timerId`, `engine`). Omitting fields in one view silently suppresses action buttons, making controls appear broken or tab-dependent.
+
+## PPPoE zombie detection requires data-plane egress probes, not link status (2026-09-04)
+
+**A PPPoE session can report `up` with an assigned IP while routing is completely dead.** Provider BRAS responds to LCP echo requests even when downstream routing is broken. The router's control plane (`network.interface.wan up=true`) will assert health while the entire household is offline.
+- Egress tracking must test end-to-end data-plane packets (reusing the router's `kmwan` signal tracking 1.1.1.1, 8.8.8.8, and OpenDNS in `/proc/gl-kmwan/status`).
+- Never use `uci show network.wan` in scripts or diagnostics: it prints PPPoE credentials in plaintext. Prefer `ubus call network.interface.wan status`, which contains complete interface state and IPs with zero credentials.
+- Any automated recovery (`--fix` targeted WAN bounce) must gate on active recording reservations (`tuner-broker` / `mct-windows.json` / active ffmpeg) to avoid terminating live DVR captures.
+

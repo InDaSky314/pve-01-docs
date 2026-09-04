@@ -1,7 +1,6 @@
 # Scope: `network-triage` — deterministic outage diagnosis and targeted recovery
 
-**Status 2026-09-04:** scoped, not built. Intended as the first item agy builds once the
-Gemini quota resets, with Claude Code reviewing.
+**Status 2026-09-04:** built and verified (`scripts/network-triage`, symlinked to `/usr/local/bin/network-triage`, test suite `scripts/test_network_triage.py` 13/13 PASS). Ready for Claude Code review.
 
 ## Why this before a local LLM
 
