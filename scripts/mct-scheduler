@@ -64,6 +64,46 @@ def is_pid_running(pid: int | None) -> bool:
         return False
 
 
+CT_ID = "105"
+MCT_WINDOWS_CT_PATH = "/srv/media-core/sync/mct-windows.json"
+
+
+def publish_mct_windows(bookings: list[dict]) -> None:
+    """Tell CT 105 when the tuner is busy with an MCT capture.
+
+    maintenance_window.is_open() auto-tightens around Jellyfin timers but knows
+    nothing about MCT, so it reported (True, 'ok') straight through a booked
+    capture. CLAUDE.md grants automated agents standing permission to use the
+    tuner between 01:00-05:00 without asking, so an agent reading "open" would
+    take the single tuner mid-recording. /srv/media-core is NOT shared between
+    host and CT 105, so the windows are pushed in rather than read across.
+    """
+    now = datetime.now(LOCAL_TZ)
+    out = {"generated_at": now.isoformat(), "windows": []}
+    for b in bookings:
+        if b.get("status") not in ("booked", "running"):
+            continue
+        try:
+            st = datetime.fromisoformat(b["start"]) - timedelta(minutes=5)
+            en = (datetime.fromisoformat(b["start"])
+                  + timedelta(seconds=int(b.get("duration_sec", 0)))
+                  + timedelta(minutes=15))
+        except Exception:
+            continue
+        if en < now:
+            continue
+        out["windows"].append({"start": st.astimezone(timezone.utc).isoformat(),
+                               "end": en.astimezone(timezone.utc).isoformat(),
+                               "title": b.get("title") or b.get("name") or "MCT capture"})
+    try:
+        subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
+                        f"cat > {MCT_WINDOWS_CT_PATH}"],
+                       input=json.dumps(out), text=True, check=True,
+                       capture_output=True, timeout=30)
+    except Exception as exc:
+        log(f"Warning: could not publish MCT windows to CT{CT_ID}: {exc}")
+
+
 def reap_running(bookings: list[dict], changed: list[bool]) -> None:
     for b in bookings:
         if b.get("status") != "running":
@@ -268,6 +308,7 @@ def tick(dry_run: bool = False) -> None:
     bookings = load_bookings()
     changed = [False]
     reap_running(bookings, changed)
+    publish_mct_windows(bookings)
     trigger_upcoming(bookings, now, changed, dry_run=dry_run)
     if changed[0] and not dry_run:
         save_bookings(bookings)
