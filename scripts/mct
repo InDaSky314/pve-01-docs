@@ -592,13 +592,22 @@ def sweep_orphans(threshold_hours: float = 1.0, dry_run: bool = False) -> tuple[
         raw_mtime = get_ct_file_mtime(raw_ct_path)
         age_sec = now_epoch - raw_mtime if raw_mtime > 0 else 999999
 
-        # Rule 1: Check if file belongs to an active capture currently recording
-        is_active = False
-        if age_sec < 600:
+        # Rule 1: never touch a file that is still being written.
+        #
+        # A recent mtime is now a KEEP in its own right, not merely a
+        # precondition for the unit lookup below. On 2026-09-04 that lookup
+        # compared a booking's bare unit name against systemctl output that
+        # carries the ".service" suffix, so it never matched: the sweep promoted
+        # a capture that was 8 minutes into a 15-minute recording, pre-remuxed
+        # the raw file and unlinked it while ffmpeg still held it open. ffmpeg
+        # went on writing to a deleted inode and everything after that moment was
+        # lost. Tonight's 3h15m capture would have been hit 13 times.
+        is_active = age_sec < 600
+        if not is_active:
             for b in bookings:
                 if b.get("status") == "running":
-                    unit = b.get("unit")
-                    if unit and unit in active_units:
+                    unit = (b.get("unit") or "").removesuffix(".service")
+                    if unit and any(u.removesuffix(".service") == unit for u in active_units):
                         is_active = True
                         break
                     if not unit:
