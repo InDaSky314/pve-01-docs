@@ -873,8 +873,20 @@ def main() -> int:
         # twice a second, which filled the 64KB pipe buffer and blocked the capture
         # about 6 minutes in. stderr also goes to a file now, not a pipe.
         "-nostats", "-loglevel", "error",
+        # Reconnect budget, sized for a real ISP outage rather than a blip.
+        # ffmpeg 7.1.4 semantics: reconnect_delay_max is the backoff after which
+        # it GIVES UP, and the retry delay doubles. The previous value of 10 was
+        # a QUARTER of ffmpeg's own default of 120, so the backoff chain
+        # 1,2,4,8,16 exceeded it in about 15 seconds and the capture ended -
+        # far short of the multi-minute PPPoE outages this line actually sees.
+        # 60s backoff with a 900s total budget rides out a router reboot or a
+        # forced Telekom reconnect, while still giving up rather than holding the
+        # tuner to the hard cap against a genuinely dead stream.
+        "-reconnect_delay_max", "60",
+        "-reconnect_delay_total_max", "900",
+        "-reconnect_max_retries", "-1",
         "-reconnect", "1", "-reconnect_streamed", "1",
-        "-reconnect_on_network_error", "1", "-reconnect_delay_max", "10",
+        "-reconnect_on_network_error", "1",
         "-rw_timeout", "15000000",
         "-i", ch["url"],
         "-t", str(hard_cap_sec),
