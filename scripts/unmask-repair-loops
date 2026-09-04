@@ -1,0 +1,8 @@
+#!/bin/sh
+# Re-enable the DVR repair loops after the 2026-09-05 MCT capture window.
+# Disabled 2026-09-04 only to remove any doubt about tuner contention during the
+# first production MCT recording. Both are report-only - they run without
+# --apply, and acting requires BOTH that flag and an open maintenance window - so
+# this was belt-and-braces, not a fix for a real defect.
+systemctl enable --now epg-repair-loop.timer icon-repair-loop.timer
+logger -t unmask-repair-loops "DVR repair loop timers re-enabled after MCT capture window"
