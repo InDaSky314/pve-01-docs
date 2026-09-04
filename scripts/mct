@@ -621,6 +621,10 @@ def main() -> int:
         "/usr/sbin/pct", "exec", CT_ID, "--",
         "docker", "exec", "-i", "jellyfin",
         "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-y",
+        # -nostats is load-bearing: ffmpeg writes a progress line to stderr roughly
+        # twice a second, which filled the 64KB pipe buffer and blocked the capture
+        # about 6 minutes in. stderr also goes to a file now, not a pipe.
+        "-nostats", "-loglevel", "error",
         "-reconnect", "1", "-reconnect_streamed", "1",
         "-reconnect_on_network_error", "1", "-reconnect_delay_max", "10",
         "-rw_timeout", "15000000",
@@ -686,7 +690,13 @@ def main() -> int:
 
     # Launch ffmpeg inside container with interactive stdin
     start_mono = time.monotonic()
-    p = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # stdout/stderr must NOT be pipes: nothing reads them until after the
+    # supervising loop, which runs for hours. The 64KB kernel pipe buffer fills
+    # and ffmpeg blocks forever mid-capture.
+    ffmpeg_err_path = f"/var/log/mct/ffmpeg-{base_file}.err"
+    ffmpeg_err_f = open(ffmpeg_err_path, "wb")
+    p = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
+                         stdout=subprocess.DEVNULL, stderr=ffmpeg_err_f)
 
     stopped_cleanly = False
     is_supervising = fixture is not None and not (fixture.get("completed") or fixture.get("state") == "post")
@@ -738,17 +748,35 @@ def main() -> int:
     else:
         pass
 
+    def _read_ffmpeg_err() -> bytes:
+        try:
+            ffmpeg_err_f.flush()
+            with open(ffmpeg_err_path, "rb") as fh:
+                return fh.read()
+        except Exception:
+            return b""
+
     try:
-        stdout_data, stderr_data = p.communicate(timeout=15 if stopped_cleanly else None)
+        p.wait(timeout=15 if stopped_cleanly else None)
     except subprocess.TimeoutExpired:
         log("[Supervisor] ffmpeg did not terminate within 15s of 'q'; sending SIGINT fallback...")
-        subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "docker", "exec", "jellyfin", "sh", "-c", "kill -INT $(pidof ffmpeg)"], check=False)
+        # Target OUR ffmpeg by its unique output path. `pidof ffmpeg` signalled
+        # EVERY ffmpeg in the jellyfin container, which would have killed
+        # Jellyfin's own in-progress recordings - the exact cross-engine
+        # interference the whole engine-choice design exists to prevent.
+        subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "docker", "exec", "jellyfin",
+                        "pkill", "-INT", "-f", raw_path], check=False)
         try:
-            stdout_data, stderr_data = p.communicate(timeout=10)
+            p.wait(timeout=10)
         except subprocess.TimeoutExpired:
             log("[Supervisor] ffmpeg failed to respond to SIGINT; terminating...")
             p.kill()
-            stdout_data, stderr_data = p.communicate()
+            p.wait()
+    stderr_data = _read_ffmpeg_err()
+    try:
+        ffmpeg_err_f.close()
+    except Exception:
+        pass
 
     if p.returncode != 0 and not stopped_cleanly:
         err_msg = stderr_data.decode("utf-8", errors="replace").strip()[-300:]
