@@ -144,7 +144,12 @@ def reap_running(bookings: list[dict], changed: list[bool]) -> None:
         if logfile and Path(logfile).exists():
             try:
                 log_text = Path(logfile).read_text()
-                if "Capture and post-processing pipeline complete." in log_text:
+                # Match the stable marker first. Grepping the human-readable line
+                # coupled the reaper to prose: agy reworded it to "Capture
+                # preserved and post-processing pipeline complete" and every
+                # successful capture began reporting as failed.
+                if ("MCT-RESULT: success" in log_text
+                        or "post-processing pipeline complete" in log_text):
                     log_success = True
             except Exception:
                 pass
