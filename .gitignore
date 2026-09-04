@@ -5,3 +5,7 @@ __pycache__/
 *.pre-repair-*
 *.pre-bluf-*
 *.pre-oldb-*
+
+# pre-change backups never belong in git
+*.pre-*
+*.bak
