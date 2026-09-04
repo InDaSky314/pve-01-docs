@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Host CLI wrapper for Tuner Availability Broker inside CT 105.
+#
+# Usage:
+#   tuner-broker check [--minutes N] [--purpose "text"]
+#   tuner-broker acquire [--minutes N] [--purpose "text"] [--ttl S]
+#   tuner-broker heartbeat <lease_id>
+#   tuner-broker release <lease_id>
+#   tuner-broker reclaim
+#   tuner-broker status [--json]
+#
+# Design rule: Fail closed for maintenance if CT 105 is unreachable.
+
+CT_ID="105"
+SCRIPT_PATH="/srv/media-core/sync/tuner_broker.py"
+
+if ! /usr/sbin/pct status "$CT_ID" | grep -q "status: running"; then
+    echo "UNAVAILABLE: CT $CT_ID is not running (broker unavailable — maintenance denied)" >&2
+    exit 1
+fi
+
+exec /usr/sbin/pct exec "$CT_ID" -- python3 "$SCRIPT_PATH" "$@"
