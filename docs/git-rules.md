@@ -77,7 +77,7 @@ repository exists to keep out of public history.
 2. **Understand the asymmetric dual-remote setup.**
    - `origin` in `/root/pve-01-docs/.git/config` has two push URLs:
      - Primary: `https://github.com/InDaSky314/pve-01-docs.git` (HTTPS via `gh`, public)
-     - Mirror: `git@github-mirror:nk-sys-ops/pve-01-docs.git` (SSH deploy key, private backup)
+     - Mirror: `git@github-mirror:nk-sys-ops/pve-01-docs.git` (SSH deploy key; visibility unverified — treat as public, see §0)
    - **`gh pr merge` updates ONLY the primary server-side.** The mirror does NOT receive PR merges automatically.
    - After merging a PR on GitHub, you MUST synchronize the mirror:
      ```bash
