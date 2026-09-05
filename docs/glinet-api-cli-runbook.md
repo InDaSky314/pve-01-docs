@@ -1,5 +1,12 @@
 # GL.iNet router API/CLI runbook (2026-08-09)
 
+> **⚠️ Read first — corrections from the 2026-09-05/06 BE9300 rebuild.**
+> `gl-session` **does not exist on firmware 4.10.0** (`ash: gl-session: not
+> found`). Sections below that rely on it are stale for the BE9300/BE3600.
+> The verified 4.10.0 procedures are appended at the end of this file under
+> **"4.10.0 addendum"**, and the full incident write-up is in
+> `be9300-rebuild-20260905.md`.
+
 How to drive GL.iNet's SDK4 web admin (the "oui" UI, seen on both the GL-MT6000/9.1
 and GL-BE9300/3.1) programmatically, without the browser GUI — discovered live
 against 3.1 while building its VPN tunnels this session. Verified against the
@@ -1296,3 +1303,149 @@ To pursue DoH blocking later, do it per-client and reconfigure the client
 first — turn off Private Relay / the encrypted-DNS profile on `.161`, and
 find what on pve-01 is using DoH — rather than blocking resolver IPs
 network-wide.
+
+
+---
+
+# 4.10.0 addendum (verified 2026-09-05/06 on GL-BE9300 and GL-BE3600)
+
+Everything here was measured on live hardware during a full rebuild after a
+factory reset, not read from documentation.
+
+## A. Bringing up a VPN client from the CLI
+
+Setting `network.wgclientN.disabled='0'` and running `ifup` **appears to work
+and then silently reverts** — the flag flips back to `'1'` with nothing logged.
+Diffing `uci export` across one web-UI toggle shows what is missing: the UI also
+creates a firewall zone and two forwardings. Without them there is no NAT or
+forward path, so GL's service marks the instance invalid and disables it again.
+
+```sh
+# 1. zone
+z=$(uci add firewall zone)
+uci set firewall.$z.name='wgclient2';   uci set firewall.$z.network='wgclient2'
+uci set firewall.$z.input='DROP';       uci set firewall.$z.forward='ACCEPT'
+uci set firewall.$z.output='ACCEPT';    uci set firewall.$z.masq='1'
+uci set firewall.$z.masq6='1';          uci set firewall.$z.mtu_fix='1'
+uci set firewall.$z.enabled='1';        uci set firewall.$z.gl_vpn_rules='1'
+
+# 2. forwardings -- 'iot' is NOT created by the UI; add it if an IoT SSID rides this tunnel
+for src in lan guest iot; do
+  f=$(uci add firewall forwarding)
+  uci set firewall.$f.src="$src"; uci set firewall.$f.dest='wgclient2'
+  uci set firewall.$f.gl_vpn_rules='1'
+done
+
+# 3. enable + apply  (NEVER /etc/init.d/network reload)
+uci set network.wgclient2.disabled='0'
+uci set route_policy.@rule[1].enabled='1'
+uci commit; /etc/init.d/firewall reload; /usr/bin/rtp2.sh apply
+```
+
+Verified: `wgclient2` came up and `disabled` stayed `0`.
+
+## B. Scoping a rule — and the All-Clients trap
+
+A rule with no `from_type`/`from_mac` means **All Clients** and will hijack every
+unmatched device the instant it is enabled. Scope it in the *same* change.
+
+```sh
+uci set route_policy.@rule[N].from_type='ipset'
+uci set route_policy.@rule[N].from="src_mac<tunnel_id>"
+uci add_list route_policy.@rule[N].from_mac='AA:BB:CC:DD:EE:FF'
+```
+
+## C. Binding a whole VLAN/SSID (subnet, not MAC)
+
+`from_type='device'` is a silent no-op for user rules. The rule must still be
+*enabled* to instantiate the interface, so give it a placeholder MAC that matches
+nothing and do the real binding with a raw `ip rule`:
+
+```sh
+uci add_list route_policy.@rule[N].from_mac='02:00:00:00:00:01'   # matches nothing
+ip rule add from 192.168.91.0/24 lookup 1002 priority 5910        # the real binding
+```
+
+`ip rule` is runtime-only — persist it in `/etc/hotplug.d/iface/`.
+
+## D. OpenVPN: the registry lives in `/etc/config/ovpnclient`
+
+Not `ovpn-client`, not `ovpn_client`. It holds an `@groups[N]` section
+(`group_id`, `group_name`, `auth_type`, **`username`/`password`** = the provider's
+*service* credentials, `work_mode`) plus one `ovpnclient.<group>_<client_id>`
+section per server, mapping client_id to `name`, `path`, `remote`, `cipher`.
+
+The profile *index* is not derivable from disk — there is no manifest in
+`/etc/openvpn/profiles/<group>/`. To move a provider between routers, transplant
+the whole file:
+
+```sh
+ssh src 'cat /etc/config/ovpnclient' | ssh dst 'umask 077; cat > /etc/config/ovpnclient'
+```
+
+The UI picks it up immediately. `route_policy` then uses `via_type='openvpn'`,
+`via='ovpnclient1'`, `group_id=<group>`.
+
+## E. Kill Switch defaults ON for new tunnels
+
+The Add New Tunnel wizard writes `killswitch='1'`. Clear it before enabling, or a
+tunnel that fails to establish blackholes its clients rather than falling back:
+
+```sh
+uci set route_policy.@rule[N].killswitch='0'
+```
+
+Related: `ip rule` carries fail-closed entries at 9910/9920
+(`from all iif br-lan blackhole`). An unmarked LAN client is **blackholed, not
+sent to WAN**. After a factory reset the MAC ipsets are empty, so nothing has a
+mark and the LAN has no internet at all until a rule matches.
+
+## F. Meshing is a one-way door for remote access
+
+**Meshing a node moves it onto the head end's L2 segment and disables both SSH
+and Tailscale on it.** The head end keeps them; members do not.
+
+- Harvest config, VPN profiles and credentials **before** meshing a node.
+- A meshed member still answers on the head end's LAN with its **web UI on port
+  80** — that is the remaining management path. Find it by name in the head end's
+  `/tmp/dhcp.leases`.
+- Its old addresses (own LAN IP, WAN-side IP, tailnet IP) all stop answering.
+  That is expected, not a dead device.
+
+Separately: an **un-meshed** GL router sitting on another router's LAN also
+refuses SSH — from its side that subnet is *WAN*, and the `wan` zone is
+`input DROP`. ARP reads `REACHABLE` while ICMP and 22/80 all fail. Fix with
+"SSH Remote Access" in its own UI, or reach it over Tailscale first.
+
+## G. Deadman rollback — use before any risky change
+
+`/root/deadman.sh`, cron-driven every minute so it survives SSH loss, tunnel
+loss and full lockout.
+
+```sh
+/root/deadman.sh arm 300 /etc/config/route_policy /etc/config/network /etc/config/firewall
+# make the change, verify access
+/root/deadman.sh cancel     # ONLY after access is confirmed
+```
+
+If `cancel` is never reached, cron restores the snapshots and reapplies within
+60 s. **Test any rollback before trusting it** — the first implementation used a
+backgrounded `setsid` process and silently failed, because it did not survive
+the SSH session ending.
+
+## H. Web UI quirks that waste time
+
+- The VPN profile search box **does not filter** the list (neither display name
+  nor filename). Scroll, or locate by accessibility-tree reference.
+- "Selected Profile (0)" can read zero **even when a profile is selected** — the
+  wizard advances regardless.
+- The client picker refuses to advance with zero devices ("Please select at
+  least one device"); use **Add Device** to enter a placeholder MAC.
+
+## I. Backups
+
+- `uci export` is the **safe**, declarative reference — diff it, cherry-pick from it.
+- A `sysupgrade -b` archive carries device-specific state (host keys, board
+  config, package overlays, mesh/cloud registration). **Restoring one onto a
+  reset unit is how a router gets bricked** — it happened here on 2026-09-05.
+  Keep them for reference only.
