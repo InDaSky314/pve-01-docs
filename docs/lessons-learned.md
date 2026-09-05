@@ -1375,3 +1375,21 @@ When a single action (such as "Cancel") is available across different views (e.g
 - Never use `uci show network.wan` in scripts or diagnostics: it prints PPPoE credentials in plaintext. Prefer `ubus call network.interface.wan status`, which contains complete interface state and IPs with zero credentials.
 - Any automated recovery (`--fix` targeted WAN bounce) must gate on active recording reservations (`tuner-broker` / `mct-windows.json` / active ffmpeg) to avoid terminating live DVR captures.
 
+## MCT Restart-and-Stitch: Stream failure recovery & Matroska concat verification (2026-09-04)
+
+- **Remaining window clamping**: When ffmpeg terminates prematurely mid-capture due to upstream stream drop, the supervisor must restart into numbered segments (`.seg1.raw.ts`, `.seg2.raw.ts`) sized strictly for `remaining_time = hard_cap - elapsed`. Auto-extension or hard caps must not expand due to restarts.
+- **Tuner protection via restart limits**: A permanently dead upstream stream or HTTP 404 can easily trigger a rapid restart loop that thrashes hardware tuners. Capping restarts (`MAX_RESTARTS = 4`) and pacing with backoff (`RESTART_BACKOFF_BASE_SEC = 5.0`) halts capture cleanly and alerts Loki (`job="media-core-alerts"`).
+- **Silent Matroska concat truncation detection**: Concat demuxer (`ffmpeg -f concat -c copy`) into MKV can stop early on a corrupted packet without returning a non-zero exit code. Supervisors must probe the stitched file duration and compare it against the cumulative duration of input segments. If truncated, rescue the raw segments as standalone playable recordings rather than presenting a cut-off file.
+- **Single-segment parity**: When only one usable segment is captured (either no restart was needed or previous attempts were sub-MB stubs), bypass concat entirely and run single-shot promotion directly to `{title}.ts`. This maintains byte-for-byte and metadata equivalence with the proven legacy path.
+
+
+## Jellyfin premature timer completion recovery & single-tuner conflict guard (2026-09-05)
+
+- **Early "Completed" status masking stream deaths**: When upstream IPTV streams fail, Jellyfin retries ~10 times across 10 minutes and transitions the timer to `Status: "Completed"`. Watchdogs filtering strictly for `InProgress` miss the failure entirely once Jellyfin gives up. Timers reaching `Completed` while `now < scheduled_end` (including post-padding) must be evaluated for premature exit.
+- **Differentiating fixture completion from stream failure**: An early completion is not a defect if the fixture has genuinely concluded. Check external match status (ESPN `completed`/`state=post` or OpenLigaDB `matchIsFinished=true`) before creating continuation timers.
+- **Scheduled end must include post-padding**: Continuation timers must span from `now` to `EndDate + PostPaddingSeconds` (with `PostPaddingSeconds=0` on the continuation). If `PostPaddingSeconds` (e.g. 3600s) is omitted, the extra coverage window is permanently lost.
+- **Single-tuner exclusion**: Continuation timers must strictly verify neither another active/scheduled Jellyfin timer nor an MCT booking (`mct-bookings.json`) overlaps the proposed window. If overlapping, refuse creation to preserve tuner allocation.
+- **Pacing and bounds on dead streams**: Prevent restart thrashing on dead feeds with a minimum backoff floor (>=2 minutes) and a hard cap on continuation links (e.g. `MAX_EARLY_COMPLETE_ATTEMPTS = 4`).
+
+
+
