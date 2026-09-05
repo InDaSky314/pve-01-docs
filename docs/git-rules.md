@@ -9,13 +9,17 @@
 
 | Fact | Value |
 |---|---|
-| Primary | `https://github.com/InDaSky314/pve-01-docs.git` — **public** |
-| Mirror | `git@github-mirror:nk-sys-ops/pve-01-docs.git` — **public** |
-| `main` on both | `8edfd3b` — aligned, identical |
-| Commits on `main` | 356 |
-| Only identity in history | `root <169815609+InDaSky314@users.noreply.github.com>` |
-| Local `main` | tracks `origin/main` |
+| Primary | `https://github.com/InDaSky314/pve-01-docs.git` — **public** (`gh api` confirms `visibility=public`) |
+| Mirror | `git@github-mirror:nk-sys-ops/pve-01-docs.git` — **visibility not verifiable from this host**; `gh api repos/nk-sys-ops/pve-01-docs` returns 404 to our token. Treat it as public: never place anything there you would not publish. |
+| Post-replay baseline anchor | `8edfd3b` (356 commits) — the point both remotes were reconciled to on 2026-09-05. All later work fast-forwards from here. |
+| Local `main` | tracks `origin/main`; realign with the preflight, never assume |
 | Active work branch | `epg-find-and-mct-verification` |
+
+**This table does not track the current tip, deliberately.** Recording a live
+SHA here is self-invalidating: updating the table is itself a commit, so the
+number it states is wrong the moment it lands. The baseline anchor above is
+fixed and stays correct. For live values run the §0a preflight — that is the
+only trustworthy source.
 
 **How this state was reached.** On 2026-09-04 the primary was force-pushed
 backwards to an identity-scrubbed history, orphaning 59 commits of local work
@@ -38,13 +42,25 @@ VPN exit IPs are.**
 
 ## 0a. Preflight — run before any commit or push
 
+**Before committing** — identity must be right *before* the object is written;
+there is no fixing it afterwards without a rewrite:
+
+```bash
+cd /root/pve-01-docs
+git config user.name     # MUST print: root
+git config user.email    # MUST print: 169815609+InDaSky314@users.noreply.github.com
+```
+
+**Before pushing:**
+
 ```bash
 cd /root/pve-01-docs
 git fetch origin
-git config user.email                      # MUST print the noreply address
+git update-ref refs/heads/main "$(git rev-parse origin/main)"   # keep local main honest
 git rev-parse --short HEAD main origin/main
 git rev-list --left-right --count main...origin/main
-git log --format='%ae' origin/main..HEAD | sort -u   # MUST be only the noreply address
+git log --format='%an <%ae>' origin/main..HEAD | sort -u   # ONLY the noreply address
+git log -p origin/main..HEAD | grep -nE '^\+.*[0-9]{1,3}(\.[0-9]{1,3}){3}'  # review any IP you are about to publish
 ```
 
 If `git config user.email` prints nothing, **stop and set it** (§5.1). An unset
@@ -65,8 +81,11 @@ repository exists to keep out of public history.
    - **`gh pr merge` updates ONLY the primary server-side.** The mirror does NOT receive PR merges automatically.
    - After merging a PR on GitHub, you MUST synchronize the mirror:
      ```bash
-     git -C /root/pve-01-docs checkout main && git pull && git push origin main
+     git -C /root/pve-01-docs fetch origin
+     git -C /root/pve-01-docs update-ref refs/heads/main "$(git -C /root/pve-01-docs rev-parse origin/main)"
+     git -C /root/pve-01-docs push origin "$(git -C /root/pve-01-docs rev-parse origin/main)":main
      ```
+     The source is an explicit SHA, never a bare branch name — see §6.1.
    - Be aware: external clones (e.g. laptop/MacBook) often only have the primary remote configured. Pushes from external machines do not update the mirror.
 
 3. **Verify what a push actually did on BOTH remotes.**
@@ -167,8 +186,9 @@ was told, and put the mirror on a history that shared no ancestor with the
 primary. `--force-with-lease` did not help: the lease guards the *destination*,
 not the *source*.
 
-- Push an explicit, verified SHA: `git push <remote> <sha>:main`.
-- Or print the source first: `git rev-parse --short <src>` and read it.
+- Push an explicit, verified SHA: `git push <remote> <sha>:main`. No exceptions,
+  and no "I checked it first" — the check and the push must be the same value,
+  which only an explicit SHA guarantees.
 - Keep local `main` honest: `git branch -f main origin/main` after any replay
   or remote rewrite. A stale `main` is a loaded gun.
 
@@ -182,6 +202,13 @@ Force-pushing the mirror is sanctioned **only** when every one of these holds:
    `git diff --stat <mirror-tip> <new-tip>` must contain nothing you cannot
    account for.
 4. The source ref is an explicit SHA (§6.1).
+5. **The destination is the mirror's own URL, never `origin`.** `origin` carries
+   two push URLs, so `git push --force origin …` aims the force at the primary
+   as well. Push the mirror directly:
+   ```bash
+   git push --force-with-lease=main:<current-mirror-sha> \
+       github-mirror:nk-sys-ops/pve-01-docs.git <sha>:main
+   ```
 
 The primary is never force-pushed. If the primary needs history changed, replay
 onto its tip as in §0 and let it fast-forward.
