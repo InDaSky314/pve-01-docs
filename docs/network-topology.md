@@ -1,5 +1,10 @@
 # Network Topology & Router Inventory
 
+> **⚠️ Partially superseded 2026-09-05.** The BE9300 was factory reset after a
+> mesh meltdown and rebuilt. Guest/IoT subnets were re-addressed and the egress
+> bindings rebuilt. See **`be9300-rebuild-20260905.md`** for the current
+> BE9300 state, the web-UI-vs-CLI finding, and the deadman rollback procedure.
+
 **Rewritten 2026-08-28**, the morning after the cutover. The previous version
 (2026-08-09) described a *proposed* re-layout — making the BE9300 the DSL
 head-end and moving the Proxmox host behind it. That proposal is now reality, so
@@ -87,11 +92,14 @@ Tailscale entry before clearing it — never accept blindly.
 | `192.168.4.0/24` | UDR | VPN (VLAN 4) |
 | `192.168.5.0/24` | MT6000 | **TV corner** (LG TV, FireStick, Chromecast) |
 | `192.168.9.0/24` | BE9300 | **Main LAN** — pve-01 and all containers |
-| `192.168.10.0/24` | BE9300 | IoT — the WALDO SSID, bound to the German tunnel |
+| `192.168.91.0/24` | BE9300 | IoT — WALDO (was `192.168.10.0/24` before 2026-09-05) |
 | `192.168.15/16.0/24` | MT6000 | guest/iot, **disabled** — re-addressed so they can never collide |
 | `192.168.20.0/24` | UDR | IoT (VLAN 20) |
-| `192.168.30.0/24` | BE9300 | Guest — the GIOT SSID, bound to the US tunnel |
+| `192.168.90.0/24` | BE9300 | Guest — GIOT (was `192.168.30.0/24` before 2026-09-05) |
 | `192.168.40.0/24` | UDR | Lambeau (VLAN 40) |
+
+**Addressing convention (2026-09-05):** a router at `192.168.X.1` takes guest
+`192.168.X0.1` and IoT `192.168.X1.1` — 9.1 → 90/91, 5.1 → 50/51, 7.1 → 70/71.
 
 `192.168.2.0/24` and `192.168.3.0/24` are **gone**. `192.168.6.0/24` is
 advertised to the tailnet by the MT2500 but has no interface behind it — a stale
@@ -106,8 +114,8 @@ advertisement worth clearing in the Tailscale admin console.
 | CT 105 media-core, CT 111 jellyfin-vod, CT 112 jellyfin-npvr | `wgclient1` | **Zürich** — required for IPTV |
 | CT 107 log-server, CT 108 scraper | `wgclient3` | **Ashburn** |
 | pve-01 host | none | **native Telekom** (owner's choice) |
-| WALDO SSID (`br-iot`) | `wgclient2` | Frankfurt |
-| GIOT SSID (`br-guest`) | `ovpnclient1` | New York |
+| WALDO SSID (`br-iot`) | `wgclient2` | Frankfurt — **tunnel down, SSID not yet created** |
+| GIOT SSID (`br-guest`) | `ovpnclient1` | New York — **not rebuilt; profiles wiped by the reset** |
 | Open-Fields (`br-lan`) | none | native |
 
 Always verify by **exit IP**, never by config: every Surfshark peer is handed the
