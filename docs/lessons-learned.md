@@ -1422,7 +1422,18 @@ The booking was a flat 3h15m guess. The guide published the actual window *and* 
 "possible Extra Innings" block. Neither path uses that today: MCT takes `--duration` from the
 booking, Jellyfin takes the timer's scheduled end. Deriving the window from the EPG programme —
 including any adjacent extras block — would be more accurate than any fixed number, on both
-paths. **Not yet implemented.**
+paths. **Implemented in dvr-dashboard on 2026-09-05**:
+- `derive_booking_window()` scans `epg.db` for the programme airing at kickoff.
+- Window start is the programme's start (respecting pre-padding).
+- Window end absorbs immediately adjacent overrun blocks matching `OVERRUN_RE` ("Extra Innings",
+  "Verlängerung", "Overtime", "Extra Time", "Penalty Shootout") while strictly rejecting unrelated
+  following programmes (e.g. "Next game: ...").
+- Fallback guard: candidate programmes must match team/event tokens or be a full-length generic sports
+  slot (>=90m). Short filler programmes (e.g. 36m "Recap Rundown" on channel 1509 "MLB") are cleanly
+  rejected and fall back to the fixture duration, preventing accidental truncation.
+- Channel override trap: when `ch_override` is passed and does not match a Jellyfin channel ID, `cid`
+  must be explicitly set to `None` rather than keeping the prior auto-resolved `cid`; otherwise `chmap.get(cid)`
+  silently resolves to the auto-resolved channel instead of the override.
 
 ### Lesson 3 — "Delayed" is actionable intelligence, not a log line
 ESPN reported `Delayed, Top 1st` on **all 15 supervisor polls**. The supervisor logged it
