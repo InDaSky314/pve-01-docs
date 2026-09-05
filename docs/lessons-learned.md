@@ -1452,3 +1452,40 @@ report file's mtime** to watch progress. A stalled run shows as a status that st
 which is visible early; a truncated run only shows at the deadline, when the work is already
 lost. Smaller briefs help more than bigger timeouts.
 
+
+## 2026-09-05 — The two engines were not arbitrating for the shared tuner
+
+**What happened.** The user moved the Badgers/Notre Dame fixture off Jellyfin and
+onto MCT: they cancelled the Jellyfin timer at ~09:14 and created an MCT booking.
+Four minutes later `sports-dvr-auto` recreated the Jellyfin timer for the same
+game, on the same channel, in the same window. Both engines were then holding a
+single-tuner fixture, and cancelling by hand could never win — the scheduler
+runs every five minutes.
+
+**Root cause.** `check_single_tuner_conflict()` had been MCT-aware since it was
+written: it reads `mct-bookings.json` and treats a live booking as blocking. But
+it was only ever called from the *reactive* paths (auto-restore, repair). The
+*proactive* path, `run_auto_scheduler()`, gated solely on
+`is_overlapping_timer()`, which looks at Jellyfin timers and nothing else. So the
+scheduler could not see MCT bookings at the one moment it mattered — when
+deciding whether to create a timer in the first place.
+
+**Fix.** Factored the MCT half of `check_single_tuner_conflict()` out into
+`mct_booking_conflict(start, end)` and called it from `run_auto_scheduler()`
+before `schedule_game_timer()`, widening the probe by the timer's own 300s/1800s
+padding so the comparison is effective-window against effective-window.
+`check_single_tuner_conflict()` now delegates to the same helper, so the two
+paths cannot drift apart again.
+
+**Lessons.**
+1. A correct guard that is never called on the hot path is not a guard. When a
+   safety check exists, grep its callers before trusting it — presence in the
+   file is not coverage.
+2. Every piece of state the two pathways share needs arbitration in *both*
+   directions. MCT already refused to start when a Jellyfin timer overlapped
+   (`Exclusion: PASS/FAIL`); Jellyfin had no symmetric check. One-way
+   arbitration reads as working right up until the other side moves first.
+3. A user action that the automation silently undoes is worse than one that
+   fails loudly. The cancel *did* work — the log proved it — and the system
+   quietly reversed it. Any manual override needs a durable representation the
+   automation can see, not just an absence.

@@ -1184,6 +1184,19 @@ def run_auto_scheduler(dry_run: bool = True, games: list[dict[str, Any]] | None 
             logging.info("Skip %s (%s): Overlapping timer already exists on %s", game["name"], game["team"], cname)
             continue
 
+        # The single tuner is shared with the Manual Capture Tool. Without this
+        # the scheduler happily recreates a Jellyfin timer for a fixture the
+        # user has deliberately moved to MCT (observed 2026-09-05: the Badgers
+        # timer was recreated ~4 min after the user cancelled it).
+        mct_conflict, mct_reason = mct_booking_conflict(
+            game["start"] - timedelta(seconds=300),
+            game["end"] + timedelta(seconds=1800),
+        )
+        if mct_conflict:
+            logging.info("Skip %s (%s): %s owns this window on the shared tuner",
+                         game["name"], game["team"], mct_reason)
+            continue
+
         schedule_game_timer(game, cid, cname, dry_run=dry_run)
 
 
@@ -2074,6 +2087,49 @@ def is_fixture_final(timer: dict[str, Any], espn_games: list[dict[str, Any]] | N
     return False
 
 
+def mct_booking_conflict(start_dt: datetime, end_dt: datetime) -> tuple[bool, str]:
+    """Return (True, reason) when a live MCT booking overlaps [start_dt, end_dt].
+
+    The single tuner is shared between the two engines, so an MCT booking is
+    just as blocking as a Jellyfin timer. Guard band matches the window that
+    mct-scheduler publishes to CT 105 (-5 min lead, +15 min trail).
+    """
+    if not MCT_BOOKINGS_FILE.exists():
+        return False, ""
+    try:
+        bookings = json.loads(MCT_BOOKINGS_FILE.read_text())
+    except Exception as exc:
+        logging.debug("Could not read MCT bookings for conflict check: %s", exc)
+        return False, ""
+    if not isinstance(bookings, list):
+        return False, ""
+
+    for b in bookings:
+        if b.get("status") in ("cancelled", "canceled", "done", "error", "failed"):
+            continue
+        b_start_raw = b.get("start")
+        if not b_start_raw:
+            continue
+        try:
+            b_s = datetime.fromisoformat(b_start_raw).astimezone(timezone.utc) - timedelta(minutes=5)
+            dur = int(b.get("duration_sec") or 0)
+            if dur > 0:
+                b_e = (datetime.fromisoformat(b_start_raw).astimezone(timezone.utc)
+                       + timedelta(seconds=dur) + timedelta(minutes=15))
+            elif "end" in b:
+                b_e = datetime.fromisoformat(b["end"]).astimezone(timezone.utc) + timedelta(minutes=15)
+            else:
+                continue
+        except Exception:
+            continue
+
+        if b_s < end_dt and b_e > start_dt:
+            b_title = b.get("title") or b.get("name") or "MCT booking"
+            return True, (f"MCT booking '{b_title}' "
+                          f"({b_s.strftime('%Y-%m-%d %H:%M')} to {b_e.strftime('%H:%M')} UTC)")
+    return False, ""
+
+
 def check_single_tuner_conflict(
     start_dt: datetime,
     end_dt: datetime,
@@ -2109,36 +2165,8 @@ def check_single_tuner_conflict(
             t_name = t.get("Name", "unnamed")
             return True, f"Jellyfin timer '{t_name}' ({t_s.strftime('%Y-%m-%d %H:%M')} to {t_e.strftime('%H:%M')} UTC)"
 
-    # 2. MCT bookings
-    if MCT_BOOKINGS_FILE.exists():
-        try:
-            bookings = json.loads(MCT_BOOKINGS_FILE.read_text())
-            if isinstance(bookings, list):
-                for b in bookings:
-                    if b.get("status") in ("cancelled", "canceled", "done", "error", "failed"):
-                        continue
-                    b_start_raw = b.get("start")
-                    if not b_start_raw:
-                        continue
-                    try:
-                        b_s = datetime.fromisoformat(b_start_raw).astimezone(timezone.utc) - timedelta(minutes=5)
-                        dur = int(b.get("duration_sec") or 0)
-                        if dur > 0:
-                            b_e = datetime.fromisoformat(b_start_raw).astimezone(timezone.utc) + timedelta(seconds=dur) + timedelta(minutes=15)
-                        elif "end" in b:
-                            b_e = datetime.fromisoformat(b["end"]).astimezone(timezone.utc) + timedelta(minutes=15)
-                        else:
-                            continue
-                    except Exception:
-                        continue
-
-                    if b_s < end_dt and b_e > start_dt:
-                        b_title = b.get("title") or b.get("name") or "MCT booking"
-                        return True, f"MCT booking '{b_title}' ({b_s.strftime('%Y-%m-%d %H:%M')} to {b_e.strftime('%H:%M')} UTC)"
-        except Exception as exc:
-            logging.debug("Could not read MCT bookings for conflict check: %s", exc)
-
-    return False, ""
+    # 2. MCT bookings (shared single tuner)
+    return mct_booking_conflict(start_dt, end_dt)
 
 
 def trigger_auto_restore(timer: dict[str, Any], dry_run: bool = True) -> tuple[bool, str, str | None, bool]:
