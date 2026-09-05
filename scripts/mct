@@ -42,6 +42,11 @@ JF_KEY_FILE = Path("/srv/media-core/.jellyfin_api_key")
 CT_ID = "105"
 MCT_BOOKINGS_FILE = Path("/var/lib/dvr-dashboard/mct-bookings.json")
 SPORTS_DVR_AUTO_SCRIPT = Path("/usr/local/bin/sports-dvr-auto")
+# A delayed fixture shifts its content later, so the window that was correct at
+# launch is no longer correct. Bounded so a long rain delay cannot record forever,
+# and only ever applied when the hard cap was NOT already clamped by the next
+# reservation - the single tuner outranks a delayed game.
+MAX_DELAY_EXTENSION_SEC = 7200  # 2h
 MAX_RESTARTS = None  # None = unbounded by count; bounded only by the capture window / hard cap
 MIN_RESTART_REMAINING_SEC = 60
 RESTART_BACKOFF_BASE_SEC = 5.0
@@ -1276,6 +1281,7 @@ def main() -> int:
     start_mono = time.monotonic()
     interrupted = [False]
     stopped_cleanly = False
+    delay_extended = [False]  # list so it survives the segment loop
     current_p: list[subprocess.Popen | None] = [None]
     last_returncode = 0
     last_err_msg = ""
@@ -1379,6 +1385,28 @@ def main() -> int:
                         break
                     elif elapsed < duration_sec:
                         log(f"[Supervisor] Game status: {detail} (elapsed {int(elapsed)}s / nominal {duration_sec}s)")
+                        # On 2026-09-04 ESPN reported "Delayed, Top 1st" on all fifteen polls
+                        # and this branch logged it fifteen times and did nothing. A delayed
+                        # game has not started, so its content lands later than the window we
+                        # computed at launch. Push the deadline out, once, bounded, and never
+                        # past a clamp - `ran_to_hard_cap` below compares against this
+                        # variable, so extending it turns ffmpeg finishing its -t into a
+                        # premature exit that restart-and-stitch continues.
+                        if ("delay" in str(detail).lower() or "postpon" in str(detail).lower()) \
+                                and not delay_extended[0]:
+                            if is_clamped:
+                                log(f"[Supervisor] Fixture is delayed ({detail}) but the hard cap is "
+                                    f"clamped by a following reservation ({clamp_info}); not extending.")
+                                delay_extended[0] = True
+                            else:
+                                bump = min(MAX_DELAY_EXTENSION_SEC, int(duration_sec * 0.5))
+                                hard_cap_sec += bump
+                                delay_extended[0] = True
+                                log(f"[Supervisor] Fixture is DELAYED ({detail}). Extending the capture "
+                                    f"deadline by {bump}s to {hard_cap_sec}s so the delayed content is "
+                                    f"still inside the window.")
+                                push_loki_alert(
+                                    f"level=info source=mct msg='Delayed fixture: extended window by {bump}s for {title}'")
                     elif fixture_state == "in":
                         log(f"[Supervisor] Game is IN PROGRESS ({detail}). Auto-extending capture (elapsed {int(elapsed)}s / hard cap {hard_cap_sec}s)...")
             else:
