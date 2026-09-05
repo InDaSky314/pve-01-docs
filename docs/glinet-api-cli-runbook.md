@@ -1442,6 +1442,42 @@ the SSH session ending.
 - The client picker refuses to advance with zero devices ("Please select at
   least one device"); use **Add Device** to enter a placeholder MAC.
 
+## H2. Bridge-before-wifi ordering — an SSID that exists but carries nothing
+
+**If you bring a bridge up *after* the wifi is already configured, netifd never
+attaches the radios to it.** The SSID broadcasts, clients can associate, and
+they get no DHCP and no traffic. Observed 2026-09-06 on both GIOT and WALDO.
+
+Diagnosis — compare a working bridge against a broken one:
+
+```sh
+brctl show br-lan     # WORKS: eth1.1, mld0, wlan0, wlan1, wlan2
+brctl show br-guest   # BROKEN: eth1.4002, mld1  ... per-band radios missing
+brctl show br-iot     # BROKEN: eth1.4003 only   ... no wifi at all
+```
+
+Confirm with `ip link show <iface> | grep master` — an unbridged radio shows no
+master. `iwinfo <iface> info` will still report the ESSID, which is what makes
+this so confusing: the SSID is genuinely on the air, it just leads nowhere.
+Corroborate with `grep 192.168.90 /tmp/dhcp.leases` — zero leases ever issued.
+
+On this box **`wifi reload` does NOT fix it.** Use a full cycle:
+
+```sh
+wifi down; sleep 4; wifi up
+```
+
+After that `br-guest` carried `mld1 wlan01 wlan11 wlan21` and `br-iot` carried
+`wlan06 wlan16`, and DHCP started issuing immediately.
+
+Note the MLO subtlety: an SSID is broadcast by *both* the per-band interfaces
+(`wlan01/11/21`) and the MLO combo (`wlan03/13/23` → `mld1`). If only the MLO
+combo is bridged, clients that land on a per-band interface fail while others
+succeed — an intermittent fault that looks like a client problem.
+
+**Prefer bringing bridges up before configuring wifi.** If you cannot, cycle the
+radios afterwards and verify with `brctl show`.
+
 ## I. Backups
 
 - `uci export` is the **safe**, declarative reference — diff it, cherry-pick from it.
