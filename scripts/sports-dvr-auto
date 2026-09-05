@@ -1220,6 +1220,23 @@ def ensure_dynamic_ppv_fallback(game: dict[str, Any], jf_channels: dict[str, str
         if t.get("Name") == want and t.get("Status") not in ("Completed", "Cancelled", "Error"):
             return False
 
+    # The name check above cannot see the fallback this function booked on an
+    # earlier tick: Jellyfin names a timer from the EPG programme ("Live: BL")
+    # and ignores the name we ask for, so `want` never matches again -- the
+    # same rename that forced PPV_PROBE_DISABLED. It is equally blind to a
+    # timer the owner booked by hand on a different Sky channel carrying the
+    # same match. With a single tuner the question is not "does a timer wear
+    # my name" but "is anything already holding this window", so ask that.
+    conflict, reason = check_single_tuner_conflict(
+        game["start"] - timedelta(seconds=300),
+        game["end"] + timedelta(seconds=1800),
+        existing_timers=existing_timers,
+    )
+    if conflict:
+        logging.info("[FALLBACK] %s is already covered by %s -- not booking a "
+                     "second timer for the single tuner", game["name"], reason)
+        return False
+
     logging.info("[FALLBACK] Booking linear safety net for %s on %s", game["name"], ch_name)
     ok = schedule_game_timer(game, cid, ch_name, dry_run=dry_run, name_suffix=PPV_FALLBACK_MARKER)
     log_event("ppv_fallback_scheduled", None, want, {
