@@ -5,6 +5,52 @@
 
 ---
 
+## 0. Current State (verified 2026-09-05, update this section when it changes)
+
+| Fact | Value |
+|---|---|
+| Primary | `https://github.com/InDaSky314/pve-01-docs.git` — **public** |
+| Mirror | `git@github-mirror:nk-sys-ops/pve-01-docs.git` — **public** |
+| `main` on both | `8edfd3b` — aligned, identical |
+| Commits on `main` | 356 |
+| Only identity in history | `root <169815609+InDaSky314@users.noreply.github.com>` |
+| Local `main` | tracks `origin/main` |
+| Active work branch | `epg-find-and-mct-verification` |
+
+**How this state was reached.** On 2026-09-04 the primary was force-pushed
+backwards to an identity-scrubbed history, orphaning 59 commits of local work
+(see `docs/incident-force-push-20260904.md`). On 2026-09-05 those commits were
+**replayed**, not force-pushed: the primary tip and the local base commit had
+identical trees (`e54a66ff…`), so each commit was rebuilt with `git commit-tree`
+reusing the original tree object, re-parented onto the primary tip, and given
+sanitised authorship. Tree identity was asserted at every step and the final
+tree compared byte-for-byte against the preserved local work before anything
+was pushed. The result was a **fast-forward**. The mirror, which sat on the old
+lineage, was then realigned by force with the owner's explicit approval.
+
+One line was redacted during the replay: `docs/dvr-reporting-20260902.md`
+carried the owner's residential Telekom WAN IP. It had not yet reached either
+remote, so redacting it inside the replay kept it out of published history
+entirely. **Public IPs belonging to the household are not publishable. Shared
+VPN exit IPs are.**
+
+---
+
+## 0a. Preflight — run before any commit or push
+
+```bash
+cd /root/pve-01-docs
+git fetch origin
+git config user.email                      # MUST print the noreply address
+git rev-parse --short HEAD main origin/main
+git rev-list --left-right --count main...origin/main
+git log --format='%ae' origin/main..HEAD | sort -u   # MUST be only the noreply address
+```
+
+If `git config user.email` prints nothing, **stop and set it** (§5.1). An unset
+value silently falls back to `root@pve-01.jetta.tech` — the exact identity this
+repository exists to keep out of public history.
+
 ## 1. Golden Rules of Branch & Remote Discipline
 
 1. **Never force-push a shared branch (`main`).**
@@ -96,9 +142,65 @@ When remote divergence or a forced update is detected:
 
 1. **Use the privacy noreply email for all commits in this repository:**
    ```bash
-   git config user.name "InDaSky314"
+   git config user.name "root"
    git config user.email "169815609+InDaSky314@users.noreply.github.com"
    ```
+   The name is `root` because all 356 commits in the published history use it;
+   GitHub attributes by email, so the noreply address is the part that matters.
+   **These are repo-local settings and they were found UNSET on 2026-09-05** —
+   every commit made in that state carried `root@pve-01.jetta.tech`. Verify with
+   `git config user.email`; do not assume the rule is in force because it is
+   written here.
 2. **Never commit personal emails (`@outlook.com`) or internal domain names (`*.jetta.tech`).**
 3. **Never run history-rewriting tools (`git filter-repo`, `git filter-branch`) on a stale checkout:**
    - Always run `git pull` immediately before any history scrubbing operation to ensure you are rewriting the current tip, not clobbering recent days of work.
+
+---
+
+## 6. Rules earned on 2026-09-05
+
+### 6.1 Never push a bare branch name as the source ref
+
+A push of `main:main` was issued while local `main` was a **stale branch on a
+dead lineage** (`03dab7f`, pre-scrub). The push succeeded, did exactly what it
+was told, and put the mirror on a history that shared no ancestor with the
+primary. `--force-with-lease` did not help: the lease guards the *destination*,
+not the *source*.
+
+- Push an explicit, verified SHA: `git push <remote> <sha>:main`.
+- Or print the source first: `git rev-parse --short <src>` and read it.
+- Keep local `main` honest: `git branch -f main origin/main` after any replay
+  or remote rewrite. A stale `main` is a loaded gun.
+
+### 6.2 The mirror may be force-realigned only under all four conditions
+
+Force-pushing the mirror is sanctioned **only** when every one of these holds:
+
+1. The owner has explicitly approved that specific realignment.
+2. `--force-with-lease=main:<current-remote-sha>` pins the destination.
+3. The content being discarded is proven to be a subset — show it:
+   `git diff --stat <mirror-tip> <new-tip>` must contain nothing you cannot
+   account for.
+4. The source ref is an explicit SHA (§6.1).
+
+The primary is never force-pushed. If the primary needs history changed, replay
+onto its tip as in §0 and let it fast-forward.
+
+### 6.3 A rule written in this file is not a rule in force
+
+Three defects in one day shared a shape: a correct guard existed but was never
+reached. `check_single_tuner_conflict()` was MCT-aware but unreachable from the
+proactive scheduler; the PPV fallback's idempotency check keyed on a field
+Jellyfin rewrites; §5.1 mandated an identity that was never configured.
+
+Before relying on any control — in code or in this document — verify it is
+actually in effect. Grep the callers. Print the config value. A documented
+workaround is a marker for an unfixed root cause, not a fix.
+
+### 6.4 Both agents share this file
+
+Claude Code and `agy` both operate in this repository and neither can see the
+other's session. This document is the handoff. When either agent changes the
+remote state, branch layout, or identity configuration, it updates §0 in the
+same commit — otherwise the other agent is working from a stale map, which is
+how `main:main` happened.
