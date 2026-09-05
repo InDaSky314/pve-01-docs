@@ -1391,5 +1391,53 @@ When a single action (such as "Cancel") is available across different views (e.g
 - **Single-tuner exclusion**: Continuation timers must strictly verify neither another active/scheduled Jellyfin timer nor an MCT booking (`mct-bookings.json`) overlaps the proposed window. If overlapping, refuse creation to preserve tuner allocation.
 - **Pacing and bounds on dead streams**: Prevent restart thrashing on dead feeds with a minimum backoff floor (>=2 minutes) and a hard cap on continuation links (e.g. `MAX_EARLY_COMPLETE_ATTEMPTS = 4`).
 
+## The Brewers case, 2026-09-05: what a clean EOF actually means (both recording paths)
 
+The first production MCT capture of a real game got **41m54s of a 3h15m booking** — 21%. The
+game was played to a final score, the ISP was stable (zero PPPoE events), and ffmpeg exited
+**with code 0**: `Stream ends prematurely at 961287616`. The provider's stream ended cleanly, so
+ffmpeg treated it as a legitimate EOF and stopped. `-reconnect_on_network_error` covers errors;
+this was not one.
+
+**The EPG proves the broadcast was still running.** Channel 121 was scheduled as:
+
+```
+00:10 -> 03:10   Milwaukee Brewers at Cincinnati Reds
+03:10 -> 04:00   ...possible Extra Innings
+04:00 -> 09:00   Next game: filler
+```
+
+The stream died at 00:41:57 — **two and a half hours before the broadcast ended**. So this was
+never "the game finished"; it was the feed dropping while the channel carried on.
+
+### Lesson 1 — a clean EOF is not the end of the broadcast
+Applies to BOTH paths. On MCT, ffmpeg stopped and nothing restarted. On Jellyfin the same
+situation is reached differently: it retries ~10x at 60s, then marks the timer `Completed`, and
+`check_stalled_recordings()` skips completed timers — so the recording becomes invisible to the
+watchdog. Both are now fixed (restart-on-EOF for MCT, `check_early_completed_recordings()` for
+Jellyfin), and both use the fixture state to distinguish "event genuinely over" from "feed died".
+
+### Lesson 2 — the EPG knows the broadcast window better than a fixed duration
+The booking was a flat 3h15m guess. The guide published the actual window *and* an explicit
+"possible Extra Innings" block. Neither path uses that today: MCT takes `--duration` from the
+booking, Jellyfin takes the timer's scheduled end. Deriving the window from the EPG programme —
+including any adjacent extras block — would be more accurate than any fixed number, on both
+paths. **Not yet implemented.**
+
+### Lesson 3 — "Delayed" is actionable intelligence, not a log line
+ESPN reported `Delayed, Top 1st` on **all 15 supervisor polls**. The supervisor logged it
+fifteen times and did nothing. A delayed game means the content shifts later, so the window
+should extend toward the guide's extras block rather than expiring on schedule. Worse: because
+the game had not actually started, most of the 21% we captured was probably rain-delay coverage
+rather than baseball. **Not yet implemented.**
+
+### Lesson 4 — a kill timeout truncates work rather than bounding it
+`agy-task.sh` enforces `timeout "$timeout_val" "$AGY_BIN" ...` (line 287) — a hard kill that
+`--bg` does not change. Two of three builds on 2026-09-05 hit it at 45m; the code had landed
+but the builder's own testing had not finished, so the work arrived unverified by its author.
+The fix is not longer deadlines but a different shape: set the timeout high enough to be a
+backstop against a genuine hang, then **poll `/root/agy-reports/.state/<slug>.status` and the
+report file's mtime** to watch progress. A stalled run shows as a status that stops advancing,
+which is visible early; a truncated run only shows at the deadline, when the work is already
+lost. Smaller briefs help more than bigger timeouts.
 
