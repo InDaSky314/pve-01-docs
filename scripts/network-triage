@@ -1183,7 +1183,43 @@ except Exception as e:
                 return True, out_chk.strip() or "Tuner check reported unavailable"
             return False, "Tuner available"
 
-        # 3. Fallback: check MCT windows file directly
+        # 3a. Fallback: Jellyfin timers direct.
+        #
+        # Layers 1 and 2 already cover both engines - the pgrep pattern is
+        # engine-agnostic, and the broker queries Jellyfin timers, in-progress
+        # recordings and live sessions alongside MCT bookings. But if the broker
+        # is unavailable AND a Jellyfin recording has not started yet, pgrep sees
+        # nothing and the MCT-only fallback below would report the tuner idle -
+        # so --fix could bounce the WAN moments before a scheduled Jellyfin
+        # recording. Saturday's Bundesliga match is exactly that case.
+        try:
+            key_path = Path("/srv/media-core/.jellyfin_api_key")
+            if key_path.exists():
+                import urllib.request
+                tok = key_path.read_text(encoding="utf-8").strip()
+                req = urllib.request.Request(
+                    "http://192.168.9.50:8096/emby/LiveTv/Timers",
+                    headers={"X-Emby-Token": tok})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    items = json.load(r).get("Items", [])
+                now = datetime.now(timezone.utc)
+                for t in items:
+                    if t.get("Status") in ("Completed", "Cancelled", "Error"):
+                        continue
+                    st = datetime.fromisoformat(
+                        str(t["StartDate"]).replace("Z", "+00:00")[:26].replace("0000000", "000000"))
+                    st -= timedelta(seconds=t.get("PrePaddingSeconds") or 0)
+                    en = datetime.fromisoformat(
+                        str(t["EndDate"]).replace("Z", "+00:00")[:26].replace("0000000", "000000"))
+                    en += timedelta(seconds=t.get("PostPaddingSeconds") or 0)
+                    if st <= now <= en:
+                        return True, f"Jellyfin recording window active: {t.get('Name', 'recording')}"
+                    if now < st <= now + timedelta(minutes=10):
+                        return True, f"Jellyfin recording starts within 10min: {t.get('Name', 'recording')}"
+        except Exception:
+            pass
+
+        # 3b. Fallback: check MCT windows file directly
         mct_file = Path("/srv/media-core/sync/mct-windows.json")
         if mct_file.exists():
             try:

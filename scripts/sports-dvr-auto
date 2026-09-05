@@ -66,6 +66,13 @@ RESTORE_STATE_FILE = Path("/var/lib/dvr-dashboard/recording-restore-state.json")
 # This file is never pruned or rewritten, only appended to.
 EVENT_LOG_FILE = Path("/var/lib/dvr-dashboard/dvr-automation-events.jsonl")
 
+# Early completion recovery settings (2026-09-05)
+MCT_BOOKINGS_FILE = Path("/var/lib/dvr-dashboard/mct-bookings.json")
+OPENLIGADB_BASE = "https://api.openligadb.de/getmatchdata"
+MAX_EARLY_COMPLETE_ATTEMPTS = 4
+EARLY_COMPLETE_MIN_RETRY_INTERVAL = timedelta(minutes=2)
+EARLY_COMPLETE_MIN_REMAINING = timedelta(minutes=10)
+
 STALL_MIN_GROWTH_BYTES = 2_000_000
 # Paired with sports-dvr-auto.timer's 5-min OnUnitActiveSec (2026-08-09, was 10min/8min).
 # At a 10-min cadence this 8-min gap was inert -- elapsed-since-last-check was always
@@ -1974,8 +1981,168 @@ def recording_file_mtime(recording_path: str) -> int | None:
         return None
 
 
+def fetch_openligadb_matches(now: datetime | None = None) -> list[dict[str, Any]]:
+    """Fetch recent and upcoming Bundesliga/DFB matches from OpenLigaDB for the current season."""
+    global _openligadb_cache
+    if now is None:
+        now = datetime.now(timezone.utc)
+    cached_time = _openligadb_cache.get("time")
+    if cached_time and (now - cached_time).total_seconds() < 60 and "matches" in _openligadb_cache:
+        return _openligadb_cache["matches"]
+
+    season_year = now.year if now.month >= 7 else now.year - 1
+    leagues = ["bl1", "dfb"]
+    matches: list[dict[str, Any]] = []
+    for league in leagues:
+        url = f"{OPENLIGADB_BASE}/{league}/{season_year}"
+        req = urllib.request.Request(url, headers={"User-Agent": "SportsDVRAuto/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.load(resp)
+                if isinstance(data, list):
+                    matches.extend(data)
+        except Exception as exc:
+            logging.debug("OpenLigaDB %s fetch failed: %s", league, exc)
+
+    _openligadb_cache = {"time": now, "matches": matches}
+    return matches
+
+
+def is_fixture_final(timer: dict[str, Any], espn_games: list[dict[str, Any]] | None = None,
+                     openliga_matches: list[dict[str, Any]] | None = None) -> bool:
+    """Determine whether the fixture associated with this timer has legitimately finished.
+    Uses ESPN and OpenLigaDB states. Returns True if confirmed final, False if live or unknown."""
+    t_name = timer.get("Name", "")
+    t_ep = timer.get("EpisodeTitle", "")
+    t_overview = timer.get("Overview", "")
+    text = f"{t_name} {t_ep} {t_overview}".lower()
+
+    t_start_iso = timer.get("StartDate", "")
+    t_end_iso = timer.get("EndDate", "")
+    if not t_start_iso or not t_end_iso:
+        return False
+    try:
+        t_start = datetime.fromisoformat(t_start_iso.replace("Z", "+00:00"))
+        t_end = datetime.fromisoformat(t_end_iso.replace("Z", "+00:00"))
+    except Exception:
+        return False
+
+    # Check German Bundesliga / DFB / Bayern Munich via OpenLigaDB
+    german_indicators = ("bundesliga", "bayern", "schalke", "dortmund", "leipzig", "leverkusen",
+                         "stuttgart", "dfb", "fußball", "fussball", "hdhr_1011")
+    cid = str(timer.get("ChannelId", "")).lower()
+    cname = str(timer.get("ChannelName", "")).lower()
+    if any(ind in text or ind in cid or ind in cname for ind in german_indicators):
+        if openliga_matches is None:
+            openliga_matches = fetch_openligadb_matches()
+        for m in (openliga_matches or []):
+            dt_utc = m.get("matchDateTimeUTC")
+            if not dt_utc:
+                continue
+            try:
+                kickoff = datetime.fromisoformat(dt_utc.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            # Kickoff must be in or near the timer coverage window
+            if not (t_start - timedelta(hours=2) <= kickoff <= t_end + timedelta(hours=1)):
+                continue
+            t1 = (m.get("team1") or {}).get("teamName", "").lower()
+            t2 = (m.get("team2") or {}).get("teamName", "").lower()
+            stop = {"fc", "vfl", "vfb", "sv", "sc", "fsv", "tsg", "rb", "1", "04", "05", "07", "09", "spvgg"}
+            words1 = [w for w in re.findall(r"[a-z0-9äöüß]+", t1) if w not in stop and len(w) > 1]
+            words2 = [w for w in re.findall(r"[a-z0-9äöüß]+", t2) if w not in stop and len(w) > 1]
+            m1 = any(w in text for w in words1)
+            m2 = any(w in text for w in words2)
+            if m1 or m2:
+                is_finished = bool(m.get("matchIsFinished"))
+                logging.info("[FIXTURE-STATE] OpenLigaDB match %s (%s vs %s) matchIsFinished=%s",
+                             m.get("matchID"), m.get("team1", {}).get("teamName"), m.get("team2", {}).get("teamName"), is_finished)
+                return is_finished
+
+    # Check ESPN games
+    if espn_games is None:
+        espn_games = fetch_espn_schedule()
+    for g in (espn_games or []):
+        if not (t_start <= g["end"] and t_end >= g["start"] - timedelta(hours=1)):
+            continue
+        if _timer_matches_game_identity(timer, g):
+            is_final = bool(g.get("completed") or g.get("state") == "post")
+            logging.info("[FIXTURE-STATE] ESPN game '%s' state=%s completed=%s -> is_final=%s",
+                         g.get("name"), g.get("state"), g.get("completed"), is_final)
+            return is_final
+
+    return False
+
+
+def check_single_tuner_conflict(
+    start_dt: datetime,
+    end_dt: datetime,
+    exclude_timer_ids: set[str] | None = None,
+    existing_timers: list[dict[str, Any]] | None = None,
+) -> tuple[bool, str]:
+    """Respect single tuner: verify no other Jellyfin timer or MCT booking overlaps [start_dt, end_dt]."""
+    if existing_timers is None:
+        existing_timers = get_existing_timers() or read_live_timers() or []
+
+    exclude = set(exclude_timer_ids or set())
+
+    # 1. Jellyfin timers
+    for t in existing_timers:
+        tid = t.get("Id") or t.get("ExternalId")
+        if tid in exclude:
+            continue
+        if t.get("Status") in ("Completed", "Cancelled", "Error"):
+            continue
+        s_raw = t.get("StartDate")
+        e_raw = t.get("EndDate")
+        if not s_raw or not e_raw:
+            continue
+        try:
+            pre_pad = int(t.get("PrePaddingSeconds") or 0)
+            post_pad = int(t.get("PostPaddingSeconds") or 0)
+            t_s = datetime.fromisoformat(s_raw.replace("Z", "+00:00")) - timedelta(seconds=pre_pad)
+            t_e = datetime.fromisoformat(e_raw.replace("Z", "+00:00")) + timedelta(seconds=post_pad)
+        except Exception:
+            continue
+
+        if t_s < end_dt and t_e > start_dt:
+            t_name = t.get("Name", "unnamed")
+            return True, f"Jellyfin timer '{t_name}' ({t_s.strftime('%Y-%m-%d %H:%M')} to {t_e.strftime('%H:%M')} UTC)"
+
+    # 2. MCT bookings
+    if MCT_BOOKINGS_FILE.exists():
+        try:
+            bookings = json.loads(MCT_BOOKINGS_FILE.read_text())
+            if isinstance(bookings, list):
+                for b in bookings:
+                    if b.get("status") in ("cancelled", "canceled", "done", "error", "failed"):
+                        continue
+                    b_start_raw = b.get("start")
+                    if not b_start_raw:
+                        continue
+                    try:
+                        b_s = datetime.fromisoformat(b_start_raw).astimezone(timezone.utc) - timedelta(minutes=5)
+                        dur = int(b.get("duration_sec") or 0)
+                        if dur > 0:
+                            b_e = datetime.fromisoformat(b_start_raw).astimezone(timezone.utc) + timedelta(seconds=dur) + timedelta(minutes=15)
+                        elif "end" in b:
+                            b_e = datetime.fromisoformat(b["end"]).astimezone(timezone.utc) + timedelta(minutes=15)
+                        else:
+                            continue
+                    except Exception:
+                        continue
+
+                    if b_s < end_dt and b_e > start_dt:
+                        b_title = b.get("title") or b.get("name") or "MCT booking"
+                        return True, f"MCT booking '{b_title}' ({b_s.strftime('%Y-%m-%d %H:%M')} to {b_e.strftime('%H:%M')} UTC)"
+        except Exception as exc:
+            logging.debug("Could not read MCT bookings for conflict check: %s", exc)
+
+    return False, ""
+
+
 def trigger_auto_restore(timer: dict[str, Any], dry_run: bool = True) -> tuple[bool, str, str | None, bool]:
-    """Cancel original timer and create a new Jellyfin timer starting now through original EndDate as continuation."""
+    """Cancel original timer and create a new Jellyfin timer starting now through original EndDate (plus post-padding) as continuation."""
     orig_name = timer.get("Name", "recording")
     orig_tid = timer.get("Id")
     cid = timer.get("ChannelId")
@@ -1987,8 +2154,11 @@ def trigger_auto_restore(timer: dict[str, Any], dry_run: bool = True) -> tuple[b
         logging.error("Auto-restore failed for '%s': %s", orig_name, err)
         return False, f"channel unresolvable or missing EndDate ({err})", None, False
 
+    post_padding = int(timer.get("PostPaddingSeconds") or 0)
     try:
         end_dt = datetime.fromisoformat(end_iso_raw.replace("Z", "+00:00"))
+        if post_padding > 0:
+            end_dt += timedelta(seconds=post_padding)
         end_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     except Exception:
         end_iso = end_iso_raw
@@ -2000,17 +2170,42 @@ def trigger_auto_restore(timer: dict[str, Any], dry_run: bool = True) -> tuple[b
                 cname = name
                 break
 
-    # Stop-A: Cancel original timer first
+    # Stop-A: Cancel original timer first (if not already completed)
     cancel_ok = False
     cancel_msg = ""
     if orig_tid:
-        cancel_ok, cancel_msg = cancel_live_timer(orig_tid, dry_run=dry_run)
+        if timer.get("Status") == "Completed":
+            cancel_ok = True
+            cancel_msg = "Original timer already completed"
+        else:
+            cancel_ok, cancel_msg = cancel_live_timer(orig_tid, dry_run=dry_run)
     else:
         cancel_msg = "Original timer ID missing"
 
-    restore_name = f"{orig_name} (restored)"
+    if orig_name.endswith(" (restored)"):
+        restore_name = orig_name
+    else:
+        restore_name = f"{orig_name} (restored)"
     now = datetime.now(timezone.utc)
-    start_iso = (now + timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    start_dt = now + timedelta(seconds=5)
+    start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Tuner conflict guard: single tuner must never have overlapping recordings
+    try:
+        restore_end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+    except Exception:
+        restore_end_dt = None
+
+    if restore_end_dt:
+        conflict, conflict_reason = check_single_tuner_conflict(
+            start_dt=start_dt,
+            end_dt=restore_end_dt,
+            exclude_timer_ids={orig_tid} if orig_tid else set(),
+        )
+        if conflict:
+            err = f"Single-tuner conflict ({conflict_reason})"
+            logging.warning("[AUTO-RESTORE] Refusing continuation for '%s': %s", restore_name, err)
+            return False, err, None, cancel_ok
 
     logging.info("[AUTO-RESTORE] Creating continuation timer '%s' on %s (%s to %s)",
                  restore_name, cname or cid, start_iso, end_iso)
@@ -2250,7 +2445,216 @@ def resolve_active_recording_path(name: str) -> str | None:
     return "/media" + real_path[len(prefix):]
 
 
-def check_stalled_recordings(dry_run: bool = True) -> None:
+def check_early_completed_recordings(
+    dry_run: bool = True,
+    games: list[dict[str, Any]] | None = None,
+    api_timers: list[dict[str, Any]] | None = None,
+    disk_timers: list[dict[str, Any]] | None = None,
+) -> None:
+    """Detect timers that reached 'Completed' well short of their scheduled end
+    (including post-padding) while the fixture is still live, and create a continuation timer.
+    """
+    logging.info("=== Checking for early-completed recordings ===")
+    now = datetime.now(timezone.utc)
+    if api_timers is None:
+        api_timers = get_existing_timers()
+    if disk_timers is None:
+        disk_timers = read_live_timers()
+
+    disk_map: dict[str, dict[str, Any]] = {}
+    for dt in (disk_timers or []):
+        for key in ("Id", "ExternalId"):
+            if dt.get(key):
+                disk_map[dt[key]] = dt
+
+    all_timers: dict[str, dict[str, Any]] = {}
+    for dt in (disk_timers or []):
+        tid = dt.get("Id") or dt.get("ExternalId")
+        if tid:
+            all_timers[tid] = dt
+    for at in (api_timers or []):
+        tid = at.get("Id") or at.get("ExternalId")
+        if tid:
+            if tid in all_timers:
+                all_timers[tid] = {**all_timers[tid], **at}
+            else:
+                all_timers[tid] = at
+
+    restore_state = load_restore_state()
+    updated_restore_state = False
+
+    for tid, t in list(all_timers.items()):
+        if t.get("Status") != "Completed":
+            continue
+
+        name = t.get("Name", "recording")
+
+        try:
+            t_end = datetime.fromisoformat(t["EndDate"].replace("Z", "+00:00"))
+        except (KeyError, ValueError, TypeError):
+            continue
+
+        post_pad = int(t.get("PostPaddingSeconds") or 0)
+        scheduled_end = t_end + timedelta(seconds=post_pad)
+
+        try:
+            t_start = datetime.fromisoformat(t["StartDate"].replace("Z", "+00:00"))
+        except (KeyError, ValueError, TypeError):
+            continue
+
+        # Window checks:
+        if now < t_start or now >= scheduled_end:
+            continue
+
+        minutes_left = (scheduled_end - now).total_seconds() / 60
+        if minutes_left < (EARLY_COMPLETE_MIN_REMAINING.total_seconds() / 60):
+            continue
+
+        # Check if already restored or actively in restore chain
+        existing_restore = restore_state.get(tid)
+        if existing_restore:
+            status = existing_restore.get("status")
+            if status in ("restoring", "completed", "stitched") or existing_restore.get("restore_timer_id"):
+                continue
+
+            retries = int(existing_restore.get("retry_count", 1))
+            if retries >= MAX_EARLY_COMPLETE_ATTEMPTS:
+                logging.warning(
+                    "[EARLY-COMPLETE] Max continuation attempts (%d) reached for timer %s ('%s'); skipping.",
+                    MAX_EARLY_COMPLETE_ATTEMPTS, tid, name)
+                continue
+
+            restored_at_str = existing_restore.get("restored_at")
+            if restored_at_str:
+                try:
+                    restored_at = datetime.fromisoformat(restored_at_str.replace("Z", "+00:00"))
+                    if (now - restored_at) < EARLY_COMPLETE_MIN_RETRY_INTERVAL:
+                        logging.info(
+                            "[EARLY-COMPLETE] Backoff active for timer %s ('%s'): last attempt was %.0fs ago (< %ds floor); skipping.",
+                            tid, name, (now - restored_at).total_seconds(), EARLY_COMPLETE_MIN_RETRY_INTERVAL.total_seconds())
+                        continue
+                except Exception:
+                    pass
+
+        # Check if this timer was itself part of a chain and whether chain length reached max
+        parent = next((p_tid for p_tid, e in restore_state.items() if e.get("restore_timer_id") == tid), None)
+        if parent:
+            curr = parent
+            seen_p = {tid, curr}
+            while True:
+                p2 = next((p_tid for p_tid, e in restore_state.items() if e.get("restore_timer_id") == curr and p_tid not in seen_p), None)
+                if not p2:
+                    break
+                seen_p.add(p2)
+                curr = p2
+            root_tid = curr
+            chain = build_restore_chain(root_tid, restore_state)
+            if len(chain) >= MAX_EARLY_COMPLETE_ATTEMPTS:
+                logging.warning(
+                    "[EARLY-COMPLETE] Chain length %d reaches max (%d) for '%s' (root: %s); halting retries.",
+                    len(chain), MAX_EARLY_COMPLETE_ATTEMPTS, name, root_tid)
+                continue
+
+        # Check fixture state: if final, this early completion is NOT a failure
+        if is_fixture_final(t, espn_games=games):
+            logging.info(
+                "[EARLY-COMPLETE] Timer '%s' completed with %.1f min left, but fixture is final according to ESPN/OpenLigaDB. Skipping continuation.",
+                name, minutes_left)
+            continue
+
+        # Resolve recording path for segment stitching
+        path = t.get("RecordingPath")
+        if not path and tid in disk_map:
+            path = disk_map[tid].get("RecordingPath")
+        if not path and t.get("Name"):
+            path = resolve_active_recording_path(t["Name"])
+
+        # Check single tuner conflict before acting
+        conflict, conflict_reason = check_single_tuner_conflict(
+            start_dt=now + timedelta(seconds=5),
+            end_dt=scheduled_end,
+            exclude_timer_ids={tid},
+            existing_timers=list(all_timers.values()),
+        )
+        if conflict:
+            logging.warning(
+                "[EARLY-COMPLETE] Timer '%s' completed early (%.1f min left), but continuation refused due to single-tuner conflict: %s",
+                name, minutes_left, conflict_reason)
+            log_event("early_complete_blocked_conflict", tid, name, {
+                "minutes_left": round(minutes_left, 1),
+                "conflict": conflict_reason,
+                "scheduled_end": scheduled_end.isoformat(),
+            }, dry_run=dry_run)
+            continue
+
+        logging.warning(
+            "[EARLY-COMPLETE] Timer '%s' completed prematurely with %.1f min left before scheduled end (%s). Fixture is still live. Triggering continuation...",
+            name, minutes_left, scheduled_end.isoformat())
+
+        log_event("early_complete_detected", tid, name, {
+            "minutes_left_scheduled": round(minutes_left, 1),
+            "scheduled_end": scheduled_end.isoformat(),
+            "file_path": path,
+        }, dry_run=dry_run)
+
+        success, details, restore_tid, cancel_ok = trigger_auto_restore(t, dry_run=dry_run)
+        log_event("restore_triggered", tid, name, {
+            "success": success, "details": details,
+            "restore_timer_id": restore_tid, "cancel_original_success": cancel_ok,
+            "trigger_reason": "early_completed",
+        }, dry_run=dry_run)
+
+        current_retries = (existing_restore.get("retry_count", 0) + 1) if existing_restore else 1
+
+        if success:
+            if not dry_run:
+                restore_state[tid] = {
+                    "original_timer_id": tid,
+                    "original_file_path": path,
+                    "original_name": name,
+                    "original_end_date": scheduled_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "channel_id": t.get("ChannelId"),
+                    "cancel_original_success": cancel_ok,
+                    "restore_timer_id": restore_tid,
+                    "restore_file_path": None,
+                    "status": "restoring",
+                    "restored_at": now.isoformat(),
+                    "stitched_file_path": None,
+                    "error": None,
+                    "retry_count": current_retries,
+                    "trigger_reason": "early_completed",
+                }
+                updated_restore_state = True
+            msg = f"Continuation recording started for early-completed '{name}' (Timer ID: {restore_tid}, {minutes_left:.0f} min remaining)"
+            logging.info("  [SUCCESS] %s", msg)
+            if not dry_run:
+                notify(f"DVR: continuation recording started -- {name}", [msg])
+        else:
+            if not dry_run:
+                restore_state[tid] = {
+                    "original_timer_id": tid,
+                    "original_file_path": path,
+                    "original_name": name,
+                    "original_end_date": scheduled_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "channel_id": t.get("ChannelId"),
+                    "cancel_original_success": cancel_ok,
+                    "restore_timer_id": None,
+                    "restore_file_path": None,
+                    "status": "failed_restore_creation",
+                    "restored_at": now.isoformat(),
+                    "stitched_file_path": None,
+                    "error": details,
+                    "retry_count": current_retries,
+                    "trigger_reason": "early_completed",
+                }
+                updated_restore_state = True
+            logging.error("  [FAILED] Could not start continuation for early-completed '%s': %s", name, details)
+
+    if updated_restore_state:
+        save_restore_state(restore_state)
+
+
+def check_stalled_recordings(dry_run: bool = True, games: list[dict[str, Any]] | None = None) -> None:
     """Detect a recording whose file has stopped growing well before its scheduled end.
 
     Root-caused 2026-08-10 (agy diagnose+plan, verified against real timers.json
@@ -2472,6 +2876,9 @@ def check_stalled_recordings(dry_run: bool = True) -> None:
                 del state[tid]
 
     save_stall_state(state)
+
+    # Check for early-completed recordings that need continuation
+    check_early_completed_recordings(dry_run=dry_run, games=games, api_timers=api_timers, disk_timers=disk_timers)
 
 
 def file_exists_in_jellyfin_container(container_path: str) -> bool:
@@ -3278,6 +3685,8 @@ def main() -> None:
     parser.add_argument("--extend-only", action="store_true", help="Run live extender only")
     parser.add_argument("--stall-check-only", action="store_true",
                         help="Run the stalled-recording watchdog only")
+    parser.add_argument("--early-complete-only", action="store_true",
+                        help="Run the early-completed recording recovery check only")
     parser.add_argument("--stitch-only", action="store_true",
                         help="Run the restore stitching check only")
     parser.add_argument("--cleanup-only", action="store_true",
@@ -3307,6 +3716,8 @@ def main() -> None:
         run_live_extender(dry_run=dry_run)
     elif args.stall_check_only:
         check_stalled_recordings(dry_run=dry_run)
+    elif args.early_complete_only:
+        check_early_completed_recordings(dry_run=dry_run)
     elif args.stitch_only:
         check_restore_stitching(dry_run=dry_run)
     elif args.cleanup_only:
@@ -3327,7 +3738,7 @@ def main() -> None:
         # pregame decision, and once it commits, the fallback is already gone.
         run_ppv_probe_commit(dry_run=dry_run, games=games)
         check_ppv_fallback_cancellation(dry_run=dry_run)
-        check_stalled_recordings(dry_run=dry_run)
+        check_stalled_recordings(dry_run=dry_run, games=games)
         check_restore_stitching(dry_run=dry_run)
         check_archived_segment_cleanup(dry_run=dry_run)
         check_uncategorized_timers(dry_run=dry_run)
