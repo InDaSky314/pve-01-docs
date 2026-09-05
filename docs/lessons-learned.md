@@ -1489,3 +1489,39 @@ paths cannot drift apart again.
    fails loudly. The cancel *did* work — the log proved it — and the system
    quietly reversed it. Any manual override needs a durable representation the
    automation can see, not just an absence.
+
+## 2026-09-05 (second) — The PPV fallback could not recognise its own booking
+
+**What happened.** `ensure_dynamic_ppv_fallback()` tried to create the Bayern
+linear safety net on every five-minute tick, and Jellyfin refused each one with
+an unhandled `POST /LiveTv/Timers` exception. The errors had been recurring all
+morning. Meanwhile the same match was already booked twice — once by the owner
+on Sky Sport Bundesliga HD, once by this function on Sky Sport Bundesliga 1 HD —
+against a single tuner.
+
+**Root cause.** The idempotency guard compared `t["Name"] == want`, where `want`
+is `"<team>: <game> (German feed)"`. Jellyfin names a timer from the EPG
+programme and ignores the name we ask for, so the fallback it created came back
+as `"Live: BL"` and never matched `want` again. The function was therefore
+blind to its own prior booking *and* to the owner's timer on a different Sky
+channel carrying the same match. This is the identical rename that forced
+`PPV_PROBE_DISABLED = True`; it had been documented in a comment but never
+fixed at the site that also depended on it.
+
+**Fix.** After the name check, ask `check_single_tuner_conflict()` whether
+anything already holds the padded window — any Jellyfin timer on any channel,
+or any MCT booking. If so, skip. The fallback exists to guarantee the match is
+captured; when the match is already covered, a second timer can only contend
+for the tuner.
+
+**Lessons.**
+1. Never key an idempotency check on a field the remote system is free to
+   rewrite. Jellyfin owns the timer's name; we do not. Match on the invariant —
+   here, the time window and the tuner.
+2. A documented workaround is a marker for unfixed root cause. The rename was
+   known well enough to justify disabling the PPV probe, but the same defect sat
+   untouched in the fallback booker, quietly emitting an API error every five
+   minutes.
+3. Repeated failed writes are a signal, not noise. The `POST /LiveTv/Timers`
+   exceptions were the system saying "you already have this" in the only
+   language it had.
