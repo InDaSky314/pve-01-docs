@@ -1195,6 +1195,232 @@ def epg_channel_options(team: str, start: datetime, end: datetime,
     return out
 
 
+OVERRUN_RE = re.compile(
+    r"\b(?:possible\s+)?(?:extra\s+innings|verl[äa]ngerung|verlaengerung|overtime|extra\s+time|penalty\s+shootout|elfmeterschie[ßs]en)\b",
+    re.IGNORECASE
+)
+
+
+def is_overrun_programme(title: str) -> bool:
+    if not title:
+        return False
+    return bool(OVERRUN_RE.search(title))
+
+
+def find_epg_channel_id(con: sqlite3.Connection,
+                        c_num: str = "",
+                        c_name: str = "",
+                        cid: str = "",
+                        c_disp: str = "") -> str | None:
+    cur = con.cursor()
+    num = str(c_num or "").strip()
+    if not num and c_disp:
+        parts = c_disp.split()
+        if parts and parts[0].isdigit():
+            num = parts[0]
+    if not num and cid and cid.startswith("hdhr_"):
+        num = cid[5:]
+    if num:
+        row = cur.execute("SELECT id FROM channels WHERE number = ?", (num,)).fetchone()
+        if row and row[0]:
+            return str(row[0])
+
+    name = str(c_name or "").strip()
+    if not name and c_disp and num:
+        name = c_disp[len(num):].strip()
+    if name:
+        row = cur.execute("SELECT id FROM channels WHERE LOWER(name) = LOWER(?)", (name,)).fetchone()
+        if row and row[0]:
+            return str(row[0])
+        row = cur.execute("SELECT id FROM channels WHERE name LIKE ?", (f"%{name}%",)).fetchone()
+        if row and row[0]:
+            return str(row[0])
+
+    if cid:
+        row = cur.execute("SELECT id FROM channels WHERE id = ? OR number = ?", (cid, cid)).fetchone()
+        if row and row[0]:
+            return str(row[0])
+
+    return None
+
+
+STOP_WORDS = {"game", "live", "sports", "sport", "vs", "versus", "at", "the", "and", "next"}
+
+
+def matches_event(prog_title: str, team: str, event_name: str, prog_dur: int) -> bool:
+    if not prog_title:
+        return False
+    if prog_title.lower().startswith("next game:"):
+        return False
+    search_text = f"{team} {event_name}".lower()
+    tokens = {w for w in re.findall(r"[a-z0-9äöüß]{4,}", search_text) if w not in STOP_WORDS}
+    p_lower = prog_title.lower()
+    if tokens and any(t in p_lower for t in tokens):
+        return True
+    generic_words = {"football", "baseball", "basketball", "soccer", "bundesliga", "college", "nhl", "nba", "nfl", "mlb"}
+    if prog_dur >= 5400 and any(g in p_lower for g in generic_words):
+        return True
+    if not tokens and prog_dur >= 3600:
+        return True
+    return False
+
+
+def derive_booking_window(c_num: str,
+                          c_name: str,
+                          cid: str,
+                          c_disp: str,
+                          start_dt: datetime,
+                          fallback_end_dt: datetime,
+                          team: str = "",
+                          game_title: str = "") -> dict[str, Any]:
+    """Derive recording window from epg.db programmes actually airing.
+
+    Window start = programme start (respecting pre-padding).
+    Window end = programme stop + any immediately adjacent overrun continuation programmes
+                 (Extra Innings, Verlängerung, Overtime, etc.).
+    Falls back cleanly to fixture-derived (start_dt, fallback_end_dt) if no guide data.
+    """
+    fallback_result: dict[str, Any] = {
+        "start": start_dt,
+        "end": fallback_end_dt,
+        "duration_sec": int((fallback_end_dt - start_dt).total_seconds()),
+        "source": "fallback",
+        "primary_programme": None,
+        "absorbed_programmes": [],
+        "reason": "fallback to fixture duration"
+    }
+
+    if not EPG_DB.exists():
+        fallback_result["reason"] = "epg.db not found"
+        return fallback_result
+
+    try:
+        con = sqlite3.connect(f"file:{EPG_DB}?mode=ro", uri=True, timeout=5)
+    except Exception as exc:
+        fallback_result["reason"] = f"epg.db error: {exc}"
+        return fallback_result
+
+    try:
+        epg_cid = find_epg_channel_id(con, c_num=c_num, c_name=c_name, cid=cid, c_disp=c_disp)
+        if not epg_cid:
+            fallback_result["reason"] = f"channel not found in epg.db ({c_num or c_name or c_disp})"
+            con.close()
+            return fallback_result
+
+        target_utc = start_dt.astimezone(timezone.utc)
+        lo_str = (target_utc - timedelta(minutes=45)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        hi_str = (target_utc + timedelta(minutes=45)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        candidates = con.execute("""
+            SELECT id, start_utc, stop_utc, title
+            FROM programmes
+            WHERE channel_id = ?
+              AND stop_utc > ?
+              AND start_utc < ?
+            ORDER BY start_utc
+        """, (epg_cid, lo_str, hi_str)).fetchall()
+
+        if not candidates:
+            fallback_result["reason"] = f"no programmes on channel {epg_cid} near {start_dt.isoformat()}"
+            con.close()
+            return fallback_result
+
+        best_prog = None
+        best_diff = None
+        containment_prog = None
+
+        for prog in candidates:
+            pid, s_str, e_str, p_title = prog
+            try:
+                ps = datetime.fromisoformat(s_str.replace("Z", "+00:00"))
+                pe = datetime.fromisoformat(e_str.replace("Z", "+00:00"))
+                p_dur = int((pe - ps).total_seconds())
+            except Exception:
+                continue
+
+            # Validate that programme matches the event and is not unrelated short filler
+            if not matches_event(p_title, team, game_title, p_dur):
+                continue
+
+            if ps <= target_utc < pe:
+                containment_prog = prog
+            diff = abs((ps - target_utc).total_seconds())
+            if diff <= 1800:
+                if best_diff is None or diff < best_diff:
+                    best_prog = prog
+                    best_diff = diff
+
+        primary = best_prog or containment_prog
+        if not primary:
+            fallback_result["reason"] = "no matching programme within 30m or containing start time"
+            con.close()
+            return fallback_result
+
+        p_id, p_start_str, p_stop_str, p_title = primary
+        prog_start_utc = datetime.fromisoformat(p_start_str.replace("Z", "+00:00"))
+        cur_stop_utc = datetime.fromisoformat(p_stop_str.replace("Z", "+00:00"))
+        cur_id = p_id
+
+        absorbed = []
+
+        # Scan for immediately adjacent overrun continuation programmes
+        while True:
+            min_adj = (cur_stop_utc - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            max_adj = (cur_stop_utc + timedelta(minutes=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            adj_rows = con.execute("""
+                SELECT id, start_utc, stop_utc, title
+                FROM programmes
+                WHERE channel_id = ?
+                  AND id != ?
+                  AND start_utc >= ?
+                  AND start_utc <= ?
+                ORDER BY start_utc LIMIT 1
+            """, (epg_cid, cur_id, min_adj, max_adj)).fetchall()
+
+            if not adj_rows:
+                break
+
+            next_id, next_s, next_e, next_title = adj_rows[0]
+            try:
+                next_start_utc = datetime.fromisoformat(next_s.replace("Z", "+00:00"))
+                next_stop_utc = datetime.fromisoformat(next_e.replace("Z", "+00:00"))
+            except Exception:
+                break
+
+            if is_overrun_programme(next_title):
+                absorbed.append(next_title)
+                cur_stop_utc = next_stop_utc
+                cur_id = next_id
+            else:
+                break
+
+        con.close()
+
+        win_start = prog_start_utc.astimezone(LOCAL)
+        win_end = cur_stop_utc.astimezone(LOCAL)
+        duration_sec = int((win_end - win_start).total_seconds())
+
+        if duration_sec <= 0:
+            return fallback_result
+
+        return {
+            "start": win_start,
+            "end": win_end,
+            "duration_sec": duration_sec,
+            "source": "guide",
+            "primary_programme": p_title,
+            "absorbed_programmes": absorbed,
+            "reason": f"guide: '{p_title}'" + (f" + {len(absorbed)} overrun block(s)" if absorbed else "")
+        }
+    except Exception as exc:
+        try:
+            con.close()
+        except Exception:
+            pass
+        fallback_result["reason"] = f"exception querying epg.db: {exc}"
+        return fallback_result
+
+
 def recordings(now: datetime) -> tuple[list[dict], list[str]]:
     items, problems = [], []
     chmap = channel_names()
@@ -1259,6 +1485,10 @@ def recordings(now: datetime) -> tuple[list[dict], list[str]]:
             c_disp = b.get("channel_display") or f"{b.get('channel_number', '')} {b.get('channel_name', '')}".strip() or str(b.get("channel", ""))
             title = b.get("title") or b.get("name", "MCT recording")
             status = b.get("status", "booked")
+            win_src = b.get("window_source")
+            sub = f"Status: {status}"
+            if win_src:
+                sub += f" · {win_src} window"
             items.append({"source": "MCT", "engine": "mct",
                           "id": str(b.get("id", "")),
                           "timerId": str(b.get("id", "")),
@@ -1267,8 +1497,10 @@ def recordings(now: datetime) -> tuple[list[dict], list[str]]:
                           "recording": title,
                           "recordingIsThisGame": True,
                           "bookingStatus": status,
+                          "window_source": win_src,
+                          "windowSource": win_src,
                           "channel": c_disp,
-                          "subtitle": f"Status: {status}",
+                          "subtitle": sub,
                           "start": b_start.isoformat(), "end": b_end.isoformat(),
                           "status": status,
                           "live": status == "running" or (b_start <= now <= b_end),
@@ -1302,6 +1534,8 @@ def tag_recordings(games: list[dict], recs: list[dict]) -> None:
         g["engine"] = hits[0].get("engine", hits[0].get("source", "jellyfin").lower()) if hits else None
         g["bookingStatus"] = hits[0].get("status") if hits else None
         g["bookingId"] = hits[0].get("id") if hits else None
+        if hits and hits[0].get("window_source"):
+            g["windowSource"] = hits[0].get("window_source")
         team = g.get("team") or ""
         gch = g.get("channel") or ""
         # Third signal, for the ESPN-sourced US teams: those games carry no
@@ -1334,6 +1568,8 @@ def tag_recordings(games: list[dict], recs: list[dict]) -> None:
                 g["engine"] = r.get("engine", r.get("source", "jellyfin").lower())
                 g["bookingStatus"] = r.get("status")
                 g["bookingId"] = r.get("id")
+                if r.get("window_source"):
+                    g["windowSource"] = r.get("window_source")
                 break
 
 
@@ -1709,6 +1945,9 @@ function pills(g, past){let h='';
     const label=sameGame?(g.live ? `RECORDING (${eng})` : (g.engine === 'mct' ? `MCT${st}` : `recording (${eng})`)):`other recording overlaps (${eng})`;
     const recClass = (sameGame && g.live) ? 'pill live' : 'pill rec';
     h+=`<span class="${recClass}" title="${esc(g.recording)}">${esc(label)}</span>`;
+    if(g.windowSource){
+      h+=`<span class="pill season" title="Window source: ${esc(g.windowSource)}">${esc(g.windowSource)} window</span>`;
+    }
     if(sameGame && !past && !g.done && (g.bookingId || g.id)){
       const gid = esc(g.bookingId || g.id);
       const engVal = esc(g.engine || 'jellyfin');
@@ -2327,8 +2566,8 @@ class Handler(BaseHTTPRequestHandler):
             if _cid:
                 cid, cname = _cid, _cname
             else:
-                if not cname:
-                    cname = ch_override
+                cid = None
+                cname = ch_override
 
         if engine == "jellyfin" and not cid:
             return self._send(422, json.dumps({
@@ -2336,15 +2575,40 @@ class Handler(BaseHTTPRequestHandler):
                 "error": f"Cannot resolve Jellyfin channel for {target_game['name']} ({cname or ch_override})"
             }).encode(), "application/json")
 
+        target_game = dict(target_game)
         try:
             start_dt = datetime.fromisoformat(target_game["start"])
             end_dt = datetime.fromisoformat(target_game["end"])
         except ValueError:
             return self._send(400, b'{"error":"invalid game start/end datetimes"}', "application/json")
 
+        c_disp = chmap.get(cid) or chmap.get(cname) or (f"{ch_override} {cname}".strip() if ch_override else cname)
+        c_num = "".join(ch for ch in c_disp.split()[0] if ch.isdigit()) if c_disp else ""
+        if not c_num and ch_override.isdigit():
+            c_num = ch_override
+
+        # Derive recording window from EPG if available
+        win_info = derive_booking_window(
+            c_num=c_num,
+            c_name=cname or "",
+            cid=cid or "",
+            c_disp=c_disp or "",
+            start_dt=start_dt,
+            fallback_end_dt=end_dt,
+            team=target_game.get("team") or team or "",
+            game_title=target_game.get("name") or title
+        )
+        start_dt = win_info["start"]
+        end_dt = win_info["end"]
+        window_source = win_info["source"]
+        epg_prog = win_info.get("primary_programme")
+        epg_absorbed = win_info.get("absorbed_programmes", [])
+
+        target_game["start"] = start_dt.isoformat()
+        target_game["end"] = end_dt.isoformat()
+
         t_start = start_dt - timedelta(minutes=5)
         t_end = end_dt + timedelta(seconds=max(900, pad_sec))
-        c_disp = chmap.get(cid) or chmap.get(cname) or (f"{ch_override} {cname}".strip() if ch_override else cname)
 
         # 1. Single-tuner conflict check: Check for overlapping Jellyfin timers across ALL channels
         existing_timers = get_existing_timers()
@@ -2400,7 +2664,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({
                     "ok": True,
                     "engine": "jellyfin",
-                    "message": f"Jellyfin timer created for {rec_name} on {c_disp}",
+                    "message": f"Jellyfin timer created for {rec_name} on {c_disp} ({window_source} window: {start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')} CEST)",
                     "channel": c_disp,
                     "dryRun": dry_run_req,
                     "payload": payload
@@ -2416,7 +2680,6 @@ class Handler(BaseHTTPRequestHandler):
             if duration_sec <= 0:
                 duration_sec = int(DURATION.get(target_game.get("kind", "sports"), timedelta(hours=3)).total_seconds())
 
-            c_num = "".join(ch for ch in c_disp.split()[0] if ch.isdigit()) if c_disp else ""
             mct_ch_arg = ch_override if ch_override else (c_num if c_num else cname)
             booking_id = str(target_game.get("id") or f"mct-{int(start_dt.timestamp())}")
 
@@ -2436,8 +2699,13 @@ class Handler(BaseHTTPRequestHandler):
                 "channel_display": c_disp,
                 "category": body.get("category") or "Sports",
                 "genre": body.get("genre") or "Sports",
-                "engine": "mct"
+                "engine": "mct",
+                "window_source": window_source,
             }
+            if epg_prog:
+                booking_entry["epg_programme"] = epg_prog
+            if epg_absorbed:
+                booking_entry["epg_overrun"] = epg_absorbed
             if pad_sec > 0:
                 booking_entry["fixed_pad"] = pad_sec
 
@@ -2451,7 +2719,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({
                 "ok": True,
                 "engine": "mct",
-                "message": f"MCT booking created for {rec_name} on {c_disp} at {start_dt.strftime('%Y-%m-%d %H:%M')}",
+                "message": f"MCT booking created for {rec_name} on {c_disp} at {start_dt.strftime('%Y-%m-%d %H:%M')} ({window_source} window: {start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')} CEST)",
                 "channel": c_disp,
                 "dryRun": dry_run_req,
                 "booking": booking_entry
