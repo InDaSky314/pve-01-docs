@@ -166,7 +166,12 @@ def output_path_for(host_path):
     # rather than Commercial Free/In Progress/<Category>/...
     if parts and parts[0] == "In Progress":
         parts = parts[1:]
+    # Normalise EVERY component, not just the filename. Jellyfin's folder name
+    # carries the same doubled spaces and timestamp as the file, and a tidy file
+    # inside an untidy folder still reads badly on a tile (found 2026-09-06).
     parts[-1] = normalize_basename(os.path.splitext(parts[-1])[0]) + ".mkv"
+    for i in range(len(parts) - 1):
+        parts[i] = normalize_basename(parts[i])
     # 2026-09-06: mark commercial-free status at CATEGORY level rather than on
     # every filename. The owner asked for "Sports - CF" instead of a "- CF"
     # suffix repeated on each item -- inside this library every file is
@@ -305,12 +310,28 @@ def cleanup_source(host_path, out_path):
             return
         src_dur = ffprobe_duration(host_path)
         out_dur = ffprobe_duration(out_path)
-        if not src_dur or not out_dur:
-            log("cleanup: could not probe durations, keeping source")
+        if not out_dur:
+            log("cleanup: could not probe the output, keeping source")
             return
-        if out_dur < src_dur * 0.95:
-            log(f"cleanup: output {out_dur:.0f}s is short of source {src_dur:.0f}s "
-                f"({out_dur/src_dur*100:.1f}%), keeping source")
+
+        # A .ts source has no container duration field, so ffprobe's answer is
+        # frequently nonsense -- a 4h Jellyfin recording probed as 92839s
+        # (25.8h) on 2026-09-06, which made a duration ratio refuse every time.
+        # Bytes are the trustworthy comparison here: comskip stream-copies, so
+        # input and output share a bitrate, and ad removal takes maybe 15-35%.
+        src_bytes = os.path.getsize(host_path)
+        out_bytes = os.path.getsize(out_path)
+        ratio = out_bytes / src_bytes if src_bytes else 0
+        if ratio < 0.55:
+            log(f"cleanup: output is only {ratio*100:.0f}% of source bytes "
+                f"({out_bytes/1e9:.2f} vs {src_bytes/1e9:.2f} GB) -- too small to be "
+                f"ad removal alone, keeping source")
+            return
+        # Only apply the duration check when the source duration is credible,
+        # i.e. not wildly larger than the output.
+        if src_dur and out_dur and src_dur < out_dur * 1.5 and out_dur < src_dur * 0.60:
+            log(f"cleanup: output {out_dur:.0f}s vs credible source {src_dur:.0f}s "
+                f"({out_dur/src_dur*100:.0f}%), keeping source")
             return
         if is_being_watched(host_path):
             return
