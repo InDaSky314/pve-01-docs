@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -1238,6 +1238,110 @@ except Exception as e:
     # -------------------------------------------------------------------------
     # Targeted WAN Bounce (--fix)
     # -------------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # VPN exit-IP recovery (--fix-tunnel)
+    # ------------------------------------------------------------------
+    TUNNEL_STATE = "/var/lib/dvr-dashboard/tunnel-bounce-state.json"
+    # Exit ranges the provider has blocked before. 89.37.173.0/24 has now cost
+    # two outages: ~7h on 2026-09-03 and ~7min of a live game on 2026-09-06.
+    KNOWN_BAD_PREFIXES = ("89.37.173.",)
+    MAX_BOUNCES_PER_HOUR = 3
+
+    def _tunnel_state(self):
+        try:
+            with open(self.TUNNEL_STATE) as fh:
+                return json.load(fh)
+        except Exception:
+            return {"bounces": []}
+
+    def _record_bounce(self, old_ip, new_ip, reason):
+        st = self._tunnel_state()
+        st.setdefault("bounces", []).append({
+            "ts": time.time(), "old_ip": old_ip, "new_ip": new_ip, "reason": reason,
+        })
+        st["bounces"] = st["bounces"][-20:]
+        try:
+            Path(self.TUNNEL_STATE).parent.mkdir(parents=True, exist_ok=True)
+            with open(self.TUNNEL_STATE, "w") as fh:
+                json.dump(st, fh, indent=2)
+        except Exception:
+            pass
+        try:
+            ev = {
+                "ts": datetime.now().astimezone().isoformat(),
+                "event": "vpn_exit_ip_bounced",
+                "name": "wgclient1",
+                "detail": {"old_ip": old_ip, "new_ip": new_ip, "reason": reason},
+            }
+            with open("/var/lib/dvr-dashboard/dvr-automation-events.jsonl", "a") as fh:
+                fh.write(json.dumps(ev) + "\n")
+        except Exception:
+            pass
+
+    def _recent_bounces(self):
+        now = time.time()
+        return [b for b in self._tunnel_state().get("bounces", [])
+                if now - b.get("ts", 0) < 3600]
+
+    def _ct_egress_ip(self):
+        code, out, _ = self._run_cmd(
+            ["/usr/sbin/pct", "exec", "105", "--", "timeout", "12", "curl", "-s",
+             "https://ipinfo.io/ip"], timeout=20)
+        ip = (out or "").strip()
+        return ip if ip.count(".") == 3 else ""
+
+    def apply_tunnel_bounce(self, report) -> Tuple[bool, str]:
+        """Draw a fresh Surfshark exit IP when the provider has blocked the current one.
+
+        DELIBERATELY DIFFERENT POLICY TO THE WAN BOUNCE: this does NOT refuse
+        while a recording is running. MCT's restart-and-stitch reconnects into
+        the same file, so bouncing mid-capture costs seconds; refusing costs the
+        rest of the game. That is not theoretical -- on 2026-09-06 the exit IP
+        was blocked mid-game and ~7 minutes were lost before a human noticed.
+        """
+        iptv = report.layers.get("iptv_provider")
+        blocked = bool(iptv and iptv.status == "FAIL")
+        cur_ip = self._ct_egress_ip()
+        bad_range = any(cur_ip.startswith(pfx) for pfx in self.KNOWN_BAD_PREFIXES)
+
+        if not (blocked or bad_range) and self.simulate != "provider-down":
+            return False, (f"Provider reachable from CT 105 and exit {cur_ip or 'unknown'} is not in a "
+                           f"known-bad range. No bounce needed.")
+
+        recent = self._recent_bounces()
+        if len(recent) >= self.MAX_BOUNCES_PER_HOUR:
+            return False, (
+                f"REFUSED: {len(recent)} bounces already in the last hour "
+                f"(limit {self.MAX_BOUNCES_PER_HOUR}). A blocked provider and a dead tunnel look "
+                f"alike from here; thrashing the tunnel will not tell them apart. Investigate manually.")
+
+        why = "provider returned a block" if blocked else f"exit {cur_ip} is in a known-bad range"
+        if self.dry_run:
+            return True, (f"[DRY-RUN] Would bounce wgclient1 ({why}).\n"
+                          f"  current exit: {cur_ip or 'unknown'}\n"
+                          f"  ifdown wgclient1; sleep 4; ifup wgclient1")
+
+        code, _, err = self._run_cmd(
+            ["ssh", "-F", "/root/.ssh/config", "-o", "ConnectTimeout=15", "-o", "BatchMode=yes",
+             "glinet-9.1", "ifdown wgclient1; sleep 4; ifup wgclient1"], timeout=60)
+        time.sleep(15)
+        new_ip = self._ct_egress_ip()
+
+        if not new_ip:
+            return False, f"Bounced wgclient1 but CT 105 has no egress yet. Old exit was {cur_ip}. Re-check shortly."
+        if new_ip == cur_ip:
+            self._record_bounce(cur_ip, new_ip, why + " (unchanged)")
+            return False, (f"Bounced wgclient1 but the exit IP is unchanged ({new_ip}). "
+                           f"Surfshark handed back the same endpoint; a further bounce may help, "
+                           f"but the rate limit exists to stop that becoming a loop.")
+        self._record_bounce(cur_ip, new_ip, why)
+        still_bad = any(new_ip.startswith(pfx) for pfx in self.KNOWN_BAD_PREFIXES)
+        note = "  WARNING: new exit is ALSO in a known-bad range.\n" if still_bad else ""
+        return True, (f"Bounced wgclient1 ({why}).\n{note}"
+                      f"  exit IP {cur_ip} -> {new_ip}\n"
+                      f"  {len(recent)+1}/{self.MAX_BOUNCES_PER_HOUR} bounces used this hour")
+
     def apply_targeted_fix(self, report: TriageReport) -> Tuple[bool, str]:
         """Executes targeted WAN bounce if WAN or egress has failed.
         Strictly refuses if a recording is in progress.
@@ -1319,6 +1423,9 @@ def main() -> int:
     )
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON format")
     parser.add_argument("--fix", action="store_true", help="Opt-in targeted recovery (WAN bounce). Refuses during recordings.")
+    parser.add_argument("--fix-tunnel", action="store_true",
+                        help="Draw a fresh Surfshark exit IP when the provider has blocked the current one. "
+                             "Does NOT refuse during recordings -- restart-and-stitch makes a bounce cheap.")
     parser.add_argument("--dry-run", action="store_true", help="Perform triage without mutating state; dry-run for --fix")
     parser.add_argument("--simulate", choices=[
         "host-link-down",
@@ -1351,6 +1458,12 @@ def main() -> int:
         print(json.dumps(report_dict, indent=2))
     else:
         print(format_text_report(report))
+
+    if args.fix_tunnel:
+        print("\n--- VPN EXIT-IP RECOVERY (--fix-tunnel) ---")
+        ok, msg = triager.apply_tunnel_bounce(report)
+        print(msg)
+        return 0 if ok or report.verdict == "PASS" else 1
 
     if args.fix:
         print("\n--- TARGETED REMEDIATION (--fix) ---")
