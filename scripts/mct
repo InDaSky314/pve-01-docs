@@ -775,12 +775,46 @@ def probe_ct_duration(path_in_ct: str) -> float:
     return -1.0
 
 
+def dedupe_base_file(ct_dir: str, base: str) -> str:
+    """Keep same-day recordings distinct without uglifying the common case.
+
+    Dropping the clock from the filename (2026-09-06 rather than
+    2026_09_06_00_40_00) means two recordings of the same fixture on the same
+    day would collide -- a baseball doubleheader being the real case. Only then
+    do we suffix, and we suffix in game order: ' G1', ' G2', ... The single-game
+    case, which is nearly all of them, stays clean.
+    """
+    probe = subprocess.run(
+        ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
+         f"ls -1 '{ct_dir}' 2>/dev/null"],
+        capture_output=True, text=True,
+    )
+    existing = probe.stdout or ""
+    if f"{base}." not in existing and f"{base} G" not in existing:
+        return base
+    # A file for this fixture/day already exists -> this is game 2 (or later).
+    # Rename the incumbent to ' G1' the first time, so the pair reads G1/G2.
+    if f"{base} G1" not in existing:
+        subprocess.run(
+            ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
+             f"for f in '{ct_dir}/{base}'.*; do [ -e \"$f\" ] || continue; "
+             f"ext=\"${{f##*.}}\"; mv \"$f\" '{ct_dir}/{base} G1'.\"$ext\"; done"],
+            capture_output=True, text=True,
+        )
+        log(f"Same-day collision on '{base}': renamed the earlier recording to '{base} G1'")
+        return f"{base} G2"
+    n = 2
+    while f"{base} G{n}" in existing:
+        n += 1
+    return f"{base} G{n}"
+
+
 def derive_stitched_path_name(clean_path: str) -> str:
     mod = get_sports_dvr_auto_module()
     if mod and hasattr(mod, "derive_stitched_path"):
         return mod.derive_stitched_path(clean_path)
     p = Path(clean_path)
-    return str(p.with_name(f"{p.stem} (stitched).mkv"))
+    return str(p.with_name(f"{p.stem}.mkv"))
 
 
 def finalize_and_promote_capture(
@@ -1164,12 +1198,17 @@ def main() -> int:
     # 1. EPG & Artwork lookup
     meta = lookup_epg_and_artwork(ch, start_dt, custom_title=args.title, custom_genre=args.genre)
     title = meta["title"]
-    safe_title = re.sub(r'[/\\:*?"<>|]', "", title).strip()
-    ts_str = start_dt.strftime("%Y_%m_%d_%H_%M_%S")
+    # 2026-09-06: filenames are read by humans on a tile, so collapse the double
+    # spaces that EPG titles routinely carry ("Live  BL") and use an ISO date
+    # rather than a full underscore timestamp -- it sorts correctly and reads
+    # cleanly. Same-day collisions are handled by dedupe_base_file() below.
+    safe_title = re.sub(r'[/\\:*?"<>|]', "", title)
+    safe_title = re.sub(r"\s+", " ", safe_title).strip()
+    ts_str = start_dt.strftime("%Y-%m-%d")
 
     container_dir = f"/media/recordings/{args.category}/{safe_title}"
     ct105_dir = f"/srv/media-core{container_dir}"
-    base_file = f"{safe_title} {ts_str}"
+    base_file = dedupe_base_file(ct105_dir, f"{safe_title} {ts_str}")
     raw_path = f"{container_dir}/{base_file}.raw.ts"
     clean_path = f"{container_dir}/{base_file}.ts"
     nfo_path = f"{container_dir}/{base_file}.nfo"
