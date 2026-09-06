@@ -1761,8 +1761,12 @@ def derive_stitched_path(orig_path: str) -> str:
     +genpts-cleaned .ts still misreports. Only switching to .mkv (which
     carries a real EBML duration header) fixed it in testing -- confirmed
     empirically against real segments, +genpts alone was not enough."""
+    # 2026-09-06: the " (stitched)" marker was dropped at the owner's request --
+    # it is an implementation detail, not something a viewer should read on a
+    # tile. The .mkv extension is what actually matters here (see above); the
+    # suffix never carried meaning for anything downstream.
     p = Path(orig_path)
-    return str(p.with_name(f"{p.stem} (stitched).mkv"))
+    return str(p.with_name(f"{p.stem}.mkv"))
 
 
 # Added 2026-08-12 per owner request: after a chain stitches successfully,
