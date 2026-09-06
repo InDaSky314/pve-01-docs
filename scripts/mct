@@ -1206,7 +1206,13 @@ def main() -> int:
     safe_title = re.sub(r"\s+", " ", safe_title).strip()
     ts_str = start_dt.strftime("%Y-%m-%d")
 
-    container_dir = f"/media/recordings/{args.category}/{safe_title}"
+    # 2026-09-06: raw captures live under an "In Progress" root so the
+    # in-flight library and the processed library can each point at a parent
+    # containing category folders. Jellyfin never draws a tile for a library's
+    # own root, so pointing a library straight at "Sports" lost the owner's
+    # category artwork; nesting one level restores it and keeps the two
+    # libraries from overlapping.
+    container_dir = f"/media/recordings/In Progress/{args.category}/{safe_title}"
     ct105_dir = f"/srv/media-core{container_dir}"
     base_file = dedupe_base_file(ct105_dir, f"{safe_title} {ts_str}")
     raw_path = f"{container_dir}/{base_file}.raw.ts"
