@@ -161,6 +161,11 @@ def output_path_for(host_path):
     still pure stream copy, no re-encode."""
     rel = os.path.relpath(host_path, RECORDINGS)
     parts = rel.split(os.sep)
+    # Raw captures now sit under an "In Progress" root (2026-09-06). Drop that
+    # prefix so the processed copy lands at Commercial Free/<Category> - CF/...
+    # rather than Commercial Free/In Progress/<Category>/...
+    if parts and parts[0] == "In Progress":
+        parts = parts[1:]
     parts[-1] = normalize_basename(os.path.splitext(parts[-1])[0]) + ".mkv"
     # 2026-09-06: mark commercial-free status at CATEGORY level rather than on
     # every filename. The owner asked for "Sports - CF" instead of a "- CF"
@@ -168,7 +173,21 @@ def output_path_for(host_path):
     # commercial-free, so a per-file marker is noise, while the folder tile
     # carries the meaning exactly once.
     if len(parts) > 1 and not parts[0].endswith(" - CF"):
+        src_cat = parts[0]
         parts[0] = f"{parts[0]} - CF"
+        # Carry the owner's category artwork across. Renaming a folder orphans
+        # its folder.png/jpg, and these tiles are hand-made -- a "Sports - CF"
+        # shelf with no art next to a "Sports" one with art looks broken.
+        try:
+            dst_dir = os.path.join(RECORDINGS, COMFREE_ROOT, parts[0])
+            os.makedirs(dst_dir, exist_ok=True)
+            for ext in ("png", "jpg"):
+                src_art = os.path.join(RECORDINGS, src_cat, f"folder.{ext}")
+                dst_art = os.path.join(dst_dir, f"folder.{ext}")
+                if os.path.isfile(src_art) and not os.path.exists(dst_art):
+                    shutil.copy2(src_art, dst_art)
+        except Exception as e:
+            log(f"WARN (could not seed category artwork): {e}")
     return os.path.join(RECORDINGS, COMFREE_ROOT, *parts)
 
 
