@@ -228,6 +228,96 @@ def jellyfin_refresh():
         log(f"WARN (jellyfin refresh failed, file is on disk): {e}")
 
 
+
+def _container_path(host_path):
+    """CT105 path -> the path Jellyfin reports in NowPlayingItem."""
+    return "/media/recordings" + host_path[len(RECORDINGS):]
+
+
+def is_being_watched(host_path):
+    """True if any Jellyfin session is currently playing this file.
+
+    Fails CLOSED on every error: if we cannot establish that nobody is
+    watching, we keep the file. Deleting something out from under a viewer is
+    far worse than leaving a duplicate on disk until the next run.
+    """
+    want = _container_path(host_path)
+    try:
+        key = open("/srv/media-core/.jellyfin_api_key").read().strip()
+    except Exception:
+        return True
+    if not key:
+        return True
+    req = urllib.request.Request("http://127.0.0.1:8096/Sessions",
+                                 headers={"X-Emby-Token": key})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            sessions = json.load(r)
+    except Exception as e:
+        log(f"WARN (could not query sessions, keeping source): {e}")
+        return True
+    for sess in sessions:
+        npi = sess.get("NowPlayingItem") or {}
+        if npi.get("Path") == want:
+            log(f"source in use by '{sess.get('UserName','?')}' -- keeping it")
+            return True
+    return False
+
+
+def cleanup_source(host_path, out_path):
+    """Remove the raw capture once the commercial-free copy is proven good.
+
+    Added 2026-09-06. The raw tree is indexed as the "In Progress" library so a
+    game can be watched while it records; once the processed copy exists that
+    raw file is pure duplication, and these are 8-9 GB each.
+
+    Three guards, all of which must pass:
+      1. the output exists and is non-empty,
+      2. its duration is within 5% of the source (a truncated output must never
+         authorise deleting a complete input),
+      3. nobody is watching the source right now.
+
+    Segment archives under /media/segments-archive are deliberately NOT touched
+    -- the owner keeps those for post-mortems.
+    """
+    try:
+        if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+            log(f"cleanup: output missing or empty, keeping source: {out_path}")
+            return
+        src_dur = ffprobe_duration(host_path)
+        out_dur = ffprobe_duration(out_path)
+        if not src_dur or not out_dur:
+            log("cleanup: could not probe durations, keeping source")
+            return
+        if out_dur < src_dur * 0.95:
+            log(f"cleanup: output {out_dur:.0f}s is short of source {src_dur:.0f}s "
+                f"({out_dur/src_dur*100:.1f}%), keeping source")
+            return
+        if is_being_watched(host_path):
+            return
+
+        removed, freed = [], 0
+        stem = os.path.splitext(host_path)[0]
+        for cand in (host_path, stem + ".raw.ts", stem + ".nfo"):
+            if os.path.isfile(cand):
+                freed += os.path.getsize(cand)
+                os.remove(cand)
+                removed.append(os.path.basename(cand))
+        # drop the fixture folder if nothing but artwork is left
+        d = os.path.dirname(host_path)
+        try:
+            leftovers = [f for f in os.listdir(d) if f.lower() != "poster.jpg"]
+            if not leftovers:
+                shutil.rmtree(d, ignore_errors=True)
+                log(f"cleanup: removed empty folder {os.path.basename(d)}")
+        except Exception:
+            pass
+        log(f"cleanup: freed {freed/1e9:.2f} GB, removed {len(removed)} file(s): "
+            f"{', '.join(removed)}  (source verified against {os.path.basename(out_path)})")
+    except Exception as e:
+        log(f"WARN (cleanup failed, source kept): {e}")
+
+
 def rescue_original(host_path, out_path, reason):
     """Preserve the recording when commercial removal fails.
 
@@ -533,6 +623,7 @@ def process_one(container_path):
     shutil.move(tmp_out, out_path)
     copy_sidecars(host_path, out_path)
     jellyfin_refresh()
+    cleanup_source(host_path, out_path)
     # keep the EDL next to the log for future tuning
     shutil.copy(edl, os.path.join(LOG_DIR, os.path.basename(edl)))
     shutil.rmtree(job_work, ignore_errors=True)
