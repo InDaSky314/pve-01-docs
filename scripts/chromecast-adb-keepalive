@@ -1,5 +1,5 @@
 #!/bin/bash
-# Keep an adb connection to the Chromecast alive across reboots and
+# Keep an adb connection to the Google TV Streamer alive across reboots and
 # wireless-debugging toggles.
 #
 # Android 11+ rotates the wireless-debugging connect port every time it is
@@ -16,8 +16,8 @@ set -uo pipefail
 
 # Match the device by its mDNS service name (derived from the device serial, so
 # it is stable across DHCP changes). IP is the fallback if the name ever changes.
-DEVICE_NAME="${DEVICE_NAME:-adb-19171HFDD3PMZQ-N6YQJU}"
-DEVICE_IP="${DEVICE_IP:-192.168.9.203}"
+DEVICE_NAME="${DEVICE_NAME:-adb-65141HFAG1VH8E-4Moc0j}"
+DEVICE_IP="${DEVICE_IP:-192.168.9.122}"
 BROWSE_TIMEOUT=10
 
 log() { echo "$(date '+%F %T') $*"; }
@@ -42,7 +42,15 @@ if [ -z "$endpoint" ]; then
     # Not an error: the TV shares the household power timer, so it is simply
     # off for a large part of the day. Exiting non-zero here would mark the
     # unit failed every night and bury a real failure in the noise.
-    log "device not advertising _adb-tls-connect._tcp -- TV off, asleep, or wireless debugging disabled"
+    # 2026-09-06: the Google TV Streamer answers plain adb on 5555 when network
+    # debugging is enabled and advertises no mDNS at all, so mDNS discovery
+    # alone reported it "off" while it was reachable the whole time. Try the
+    # classic port before concluding the TV is away.
+    if adb connect "${DEVICE_IP}:5555" 2>&1 | grep -q '^connected to'; then
+        log "connected to ${DEVICE_IP}:5555 (direct, no mDNS)"
+        exit 0
+    fi
+    log "no mDNS advert and 5555 refused -- TV off, asleep, or debugging disabled"
     exit 0
 fi
 

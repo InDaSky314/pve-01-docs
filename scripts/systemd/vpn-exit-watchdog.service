@@ -1,0 +1,10 @@
+[Unit]
+Description=Bounce the Surfshark tunnel when the IPTV provider blocks its exit IP
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/network-triage --fix-tunnel
+# Deliberately NOT conditioned on recordings: restart-and-stitch reconnects
+# into the same file, so bouncing mid-capture costs seconds, while waiting
+# costs the rest of the game (proven 2026-09-06, ~7 min of a live game lost).
