@@ -1,0 +1,9 @@
+[Unit]
+Description=Snapshot BE9300 WireGuard tunnel handshake/transfer state every 2 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/2:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

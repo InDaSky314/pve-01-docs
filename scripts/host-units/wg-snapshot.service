@@ -1,0 +1,6 @@
+[Unit]
+Description=BE9300 WireGuard tunnel snapshot -> log-server Loki
+
+[Service]
+Type=oneshot
+ExecStart=/root/bin/wg-snapshot.sh
