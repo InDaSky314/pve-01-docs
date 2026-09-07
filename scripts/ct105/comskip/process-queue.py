@@ -41,6 +41,11 @@ from datetime import datetime, timezone
 RECORDINGS = "/srv/media-core/media/recordings"          # host side
 CONTAINER_PREFIX = "/media/recordings"                    # jellyfin side
 PP_DIR = os.path.join(RECORDINGS, ".postprocess")
+
+# Sidecar artwork Jellyfin/MCT may drop beside a capture. Filenames whose stem
+# is in here never keep a finished fixture folder alive.
+ARTWORK_STEMS = {"poster", "folder", "fanart", "thumb", "banner",
+                 "logo", "landscape", "clearart", "disc"}
 QUEUE = os.path.join(PP_DIR, "queue")
 LOCK = os.path.join(PP_DIR, ".runner.lock")
 WORK = os.path.join(PP_DIR, "work")
@@ -343,10 +348,15 @@ def cleanup_source(host_path, out_path):
                 freed += os.path.getsize(cand)
                 os.remove(cand)
                 removed.append(os.path.basename(cand))
-        # drop the fixture folder if nothing but artwork is left
+        # drop the fixture folder if nothing but artwork is left. Matched on the
+        # stem rather than the full filename: this whitelisted only "poster.jpg"
+        # until 2026-09-07, but MCT writes poster.jpg while Jellyfin writes
+        # poster.png, so every Jellyfin capture left its folder behind as an
+        # empty ghost entry in the In Progress library.
         d = os.path.dirname(host_path)
         try:
-            leftovers = [f for f in os.listdir(d) if f.lower() != "poster.jpg"]
+            leftovers = [f for f in os.listdir(d)
+                         if os.path.splitext(f)[0].lower() not in ARTWORK_STEMS]
             if not leftovers:
                 shutil.rmtree(d, ignore_errors=True)
                 log(f"cleanup: removed empty folder {os.path.basename(d)}")
@@ -512,13 +522,49 @@ def process_one(container_path):
     # downstream step now operate on this cleaned file, not the raw one.
     clean_input = os.path.join(job_work, "clean_input.mkv")
     rel_clean = os.path.relpath(clean_input, RECORDINGS)
-    r = run(["nice", "-n", "15", "docker", "run", "--rm", f"--cpus={CPUS}",
-             "-v", f"{RECORDINGS}:/recordings", IMAGE,
-             "ffmpeg", "-y", "-v", "error", "-fflags", "+genpts",
-             "-i", f"/recordings/{rel}",
-             "-c", "copy", "-avoid_negative_ts", "make_zero",
-             f"/recordings/{rel_clean}"],
+    remux_head = ["nice", "-n", "15", "docker", "run", "--rm", f"--cpus={CPUS}",
+                  "-v", f"{RECORDINGS}:/recordings", IMAGE,
+                  "ffmpeg", "-y", "-v", "error"]
+    remux_tail = ["-avoid_negative_ts", "make_zero", f"/recordings/{rel_clean}"]
+
+    r = run(remux_head + ["-fflags", "+genpts",
+                          "-i", f"/recordings/{rel}",
+                          "-c", "copy"] + remux_tail,
             timeout=1800)
+
+    # Audio re-encode fallback. Root-caused 2026-09-07 against the Jellyfin
+    # Brewers/Reds capture of 2026-09-06: the provider rebased its PTS clock
+    # mid-game (+21.9h at ~82.8% through the file, then -345.9s six minutes
+    # later) and left one malformed ADTS audio frame behind. Matroska cannot
+    # carry ADTS, so ffmpeg auto-inserts the aac_adtstoasc bitstream filter on
+    # every .ts -> .mkv audio stream copy; that filter treats an unparseable
+    # frame header as fatal ("Error parsing ADTS frame header!"), the muxer
+    # rejects the packet, and the whole remux aborts with AVERROR_INVALIDDATA
+    # having written only 82% of the recording. Verified on the real file that
+    # -err_detect ignore_err + discardcorrupt do NOT help: the frame is not
+    # flagged corrupt by the TS demuxer, only by the bitstream filter. Decoding
+    # the audio instead bypasses aac_adtstoasc entirely -- a decode error on a
+    # single frame is non-fatal, so ffmpeg logs it and carries on. Verified
+    # end-to-end on that same capture: exit 0, 685975 video packets in and
+    # 685975 out (video is still a pure stream copy, so zero video loss), full
+    # 5.86 GB against the 4.94 GB truncated stream-copy attempt. Only the audio
+    # is re-encoded, and only on a file that would otherwise have gone to
+    # rescue_original() uncut -- so this trades one generation of AAC for
+    # keeping commercial detection on the recording.
+    if r.returncode != 0 or not os.path.isfile(clean_input):
+        log(f"WARNING (input remux stream-copy failed, retrying with audio re-encode): {r.stderr[-300:]}")
+        try:
+            os.remove(clean_input)
+        except OSError:
+            pass
+        r = run(remux_head + ["-err_detect", "ignore_err",
+                              "-fflags", "+genpts+discardcorrupt",
+                              "-i", f"/recordings/{rel}",
+                              "-c:v", "copy", "-c:a", "aac", "-b:a", "192k"] + remux_tail,
+                timeout=5400)
+        if r.returncode == 0 and os.path.isfile(clean_input):
+            log(f"input remux recovered via audio re-encode (video stream-copied, no video loss): {rel_clean}")
+
     if r.returncode != 0 or not os.path.isfile(clean_input):
         log(f"ERROR (input remux failed): {r.stderr[-300:]}")
         rescue_original(host_path, out_path, "input remux failed")
