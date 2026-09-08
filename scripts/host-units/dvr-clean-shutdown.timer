@@ -1,0 +1,19 @@
+[Unit]
+Description=Nightly clean-shutdown check before the mains cut
+
+[Timer]
+# Two triggers, matching the real physical timer schedule (confirmed against
+# the owner's actual timer 2026-08-08):
+#   Sun/Mon/Tue/Wed/Thu nights: mains cuts ~22:25 same day -> check at 22:10
+#   Fri/Sat nights: mains stays on until ~01:00 the FOLLOWING calendar day
+#   (i.e. the cutoff timestamp itself falls on Sat/Sun respectively) -> check
+#   at 00:45 that following day, not 22:10 the night before.
+OnCalendar=Sun,Mon,Tue,Wed,Thu *-*-* 22:10
+OnCalendar=Sat,Sun *-*-* 00:45
+# Deliberately NOT Persistent: a missed run must never fire a shutdown at
+# some arbitrary later time, e.g. just after a morning boot.
+Persistent=false
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

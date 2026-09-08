@@ -126,14 +126,46 @@ def next_shutdown_cutoff(now: datetime) -> tuple[datetime, bool]:
     return now + timedelta(hours=12), False  # unreachable in practice
 
 
-def keep_awake_cutoff(now: datetime) -> datetime:
-    """What "Keep awake tonight" should actually protect through."""
-    cutoff, late = next_shutdown_cutoff(now)
-    for _ in range(3):  # Fri+Sat is the longest possible late-night run
-        if not late:
-            return cutoff
-        cutoff, late = next_shutdown_cutoff(cutoff)
-    return cutoff
+# The nightly shutdown check times, mirroring dvr-clean-shutdown.timer exactly.
+# Keep these two in step: if the timer's OnCalendar lines change, change these.
+CHECK_NORMAL = dtime(22, 10)          # Sun-Thu nights
+CHECK_NORMAL_DAYS = (6, 0, 1, 2, 3)   # Sun,Mon,Tue,Wed,Thu
+CHECK_LATE = dtime(0, 45)             # the Fri/Sat late-night runs, next calendar day
+CHECK_LATE_DAYS = (5, 6)              # Sat,Sun
+
+
+def shutdown_checks_after(now: datetime, count: int) -> list[datetime]:
+    """The next `count` nightly shutdown checks strictly after `now`."""
+    found = []
+    for offset in range(0, 21):
+        day = (now + timedelta(days=offset)).date()
+        for t, days in ((CHECK_NORMAL, CHECK_NORMAL_DAYS),
+                        (CHECK_LATE, CHECK_LATE_DAYS)):
+            if day.weekday() in days:
+                c = datetime.combine(day, t, tzinfo=LOCAL)
+                if c > now:
+                    found.append(c)
+    return sorted(found)[:count]
+
+
+def keep_awake_cutoff(now: datetime, nights: int = 1) -> datetime:
+    """How long a keep-awake for `nights` nights must run.
+
+    Defined as "suppress the next N shutdown checks and no more", which is the
+    only definition that stays honest as the schedule changes. Returns a moment
+    just past the Nth check -- SHUTDOWN_BUFFER lands it exactly on that night's
+    mains cut, so the time shown in the UI is one the owner recognises.
+
+    Rewritten 2026-09-08. The previous version chained *cutoffs* while the day
+    was a late night, which quietly turned "tonight" into a weekend: a Friday
+    click ran to Sunday 22:25 and suppressed three checks (Sat 00:45, Sun 00:45,
+    Sun 22:10), and a Saturday click suppressed two. Counting checks instead of
+    chaining days makes one night mean one night on every day of the week.
+    """
+    checks = shutdown_checks_after(now, max(1, nights))
+    if not checks:
+        return now + timedelta(hours=12)  # unreachable in practice
+    return checks[-1] + SHUTDOWN_BUFFER
 
 
 OVERRIDE = Path("/var/lib/dvr-dashboard/override-until")
@@ -772,10 +804,30 @@ def outside_window(start: datetime, end: datetime) -> bool:
     return not is_powered(end)
 
 
-def override_until() -> datetime | None:
+OVERRIDE_INDEFINITE = "indefinite"
+
+
+def override_raw() -> str | None:
     try:
-        ts = datetime.fromisoformat(OVERRIDE.read_text().strip())
-    except (OSError, ValueError):
+        return OVERRIDE.read_text().strip()
+    except OSError:
+        return None
+
+
+def override_indefinite() -> bool:
+    """A hold with no expiry, released only by Cancel override."""
+    return override_raw() == OVERRIDE_INDEFINITE
+
+
+def override_until() -> datetime | None:
+    """The active expiry, or None. An indefinite hold has no expiry and returns
+    None here -- callers that care must also check override_indefinite()."""
+    raw = override_raw()
+    if not raw or raw == OVERRIDE_INDEFINITE:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw)
+    except ValueError:
         return None
     return ts if ts > datetime.now(LOCAL) else None
 
@@ -1592,6 +1644,9 @@ def status() -> dict:
             "powerOff": cutoff.strftime("%H:%M") + suffix,
             "shutdownAt": check_at.strftime("%H:%M") + suffix,
             "override": ov.isoformat() if ov else None,
+            "overrideIndefinite": override_indefinite(),
+            "nextCheck": (None if override_indefinite() else
+                          shutdown_checks_after(ov or now, 1)[0].isoformat()),
             "games": upcoming, "recordings": recs, "problems": problems}
 
 
@@ -1711,12 +1766,12 @@ border-radius:8px;padding:10px 12px;margin-top:10px;display:none}
     <div class="status"><span class="dot" id="dot"></span><span class="big" id="pstate">…</span></div>
     <div class="note" id="pnote"></div>
     <div class="btns">
-      <button class="act primary" onclick="keepAwakeTonight()">Keep awake tonight</button>
+      <button class="act primary" onclick="keepAwake(1)">Keep awake tonight</button>
+      <button class="act" onclick="keepAwake(2)">2 nights</button>
+      <button class="act" onclick="keepAwake(3)">3 nights</button>
+      <button class="act" onclick="keepAwakeForever()">Until I cancel</button>
       <button class="act" onclick="ov(0)">Cancel override</button>
     </div>
-    <div class="note"><b>This does not hold the wall timer open.</b>
-    It only stops the server shutting itself down. If the physical timer is
-    still armed, power is cut anyway — switch it off too.</div>
     <div class="btns"><button class="act danger" id="sd" onclick="sd()">Shut down now</button></div>
     <div class="danger-note" id="sdnote"></div>
   </div>
@@ -2175,14 +2230,24 @@ async function load(){
   document.getElementById('sub').textContent=
     `Power on ${d.powerOn} · off ${d.powerOff} · auto-shutdown ${d.shutdownAt}`;
   const dot=document.getElementById('dot');
-  if(d.override){dot.style.background='var(--ok)';
+  const wall='<br><b>The wall timer still cuts power at '+d.powerOff+'</b> '+
+    'unless you have switched it to always-on. This only stops the server '+
+    'shutting <i>itself</i> down.';
+  if(d.overrideIndefinite){dot.style.background='var(--ok)';
+    document.getElementById('pstate').textContent='Held until cancelled';
+    document.getElementById('pnote').innerHTML=
+      'Every nightly shutdown is skipped until you press Cancel override. '+
+      'No expiry.'+wall}
+  else if(d.override){dot.style.background='var(--ok)';
     document.getElementById('pstate').textContent='Staying awake';
-    document.getElementById('pnote').textContent='Override until '+fD(d.override)+
-      '. The server will not shut itself down before then.'}
+    document.getElementById('pnote').innerHTML=
+      '<b>Next automatic shutdown: '+fD(d.nextCheck)+'.</b> '+
+      'Tonight\'s check is skipped (override runs to '+fD(d.override)+').'+wall}
   else{dot.style.background='var(--accent)';
     document.getElementById('pstate').textContent='Normal schedule';
-    document.getElementById('pnote').textContent=
-      'Shuts down at '+d.shutdownAt+' unless a recording is due.'}
+    document.getElementById('pnote').innerHTML=
+      '<b>Next automatic shutdown: '+fD(d.nextCheck)+'</b> '+
+      '(unless a recording is due).'+wall}
   document.getElementById('recs').innerHTML=
     (d.problems||[]).map(p=>`<div class="err">${esc(p)}</div>`).join('')+
     (d.recordings.length?d.recordings.map(r=>row({...r,team:r.source},false)).join('')
@@ -2246,9 +2311,15 @@ async function ov(h){
   }
   load();
 }
-async function keepAwakeTonight(){
+async function keepAwake(n){
   await fetch('/api/override',{method:'POST',
-    headers:{'Content-Type':'application/json'},body:JSON.stringify({untilShutdown:true})});
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({untilShutdown:true,nights:n})});
+  load();
+}
+async function keepAwakeForever(){
+  await fetch('/api/override',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({indefinite:true})});
   load();
 }
 let armed=false, SD=null;
@@ -2730,12 +2801,21 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body()
             hours = float(body.get("hours", 0))
             until_shutdown = bool(body.get("untilShutdown"))
+            indefinite = bool(body.get("indefinite"))
+            nights = int(body.get("nights", 1))
         except (ValueError, TypeError):
             return self._send(400, b'{"error":"bad request"}', "application/json")
         OVERRIDE.parent.mkdir(parents=True, exist_ok=True)
         now = datetime.now(LOCAL)
+        if indefinite:
+            # No expiry. dvr-clean-shutdown understands this sentinel; if it
+            # ever does not, the ISO parse there fails and the night simply
+            # shuts down as normal -- the safe direction to fail in.
+            OVERRIDE.write_text(OVERRIDE_INDEFINITE)
+            return self._send(200, json.dumps(
+                {"ok": True, "indefinite": True}).encode(), "application/json")
         if until_shutdown:
-            cutoff = keep_awake_cutoff(now)
+            cutoff = keep_awake_cutoff(now, max(1, min(nights, 7)))
             OVERRIDE.write_text(cutoff.isoformat())
             return self._send(200, json.dumps(
                 {"ok": True, "until": cutoff.isoformat()}).encode(), "application/json")
