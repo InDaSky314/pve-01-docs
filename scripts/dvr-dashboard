@@ -1852,6 +1852,11 @@ border-radius:8px;padding:10px 12px;margin-top:10px;display:none}
              onkeydown="if(event.key==='Enter')searchGuide()">
       <button class="act primary" style="flex:0 0 auto;min-height:38px;padding:8px 16px" onclick="searchGuide()">Search</button>
     </div>
+    <label style="display:flex;align-items:center;gap:8px;margin:-4px 0 12px;cursor:pointer;font-size:13px;color:var(--muted)">
+      <input type="checkbox" id="guide-desc" onchange="searchGuide()" style="cursor:pointer">
+      Also search episode descriptions — finds teams and people that never appear in the title
+      (e.g. "Patriots" inside <i>Live: NFL Football</i>)
+    </label>
     <div class="filter" id="guide-cat-filter">
       <button aria-pressed="true" onclick="setGuideCategory('', this)">All</button>
       <button aria-pressed="false" onclick="setGuideCategory('Sports', this)">Sports</button>
@@ -2085,6 +2090,7 @@ async function searchGuide() {
   try {
     let url = `/api/epg/search?q=${encodeURIComponent(q)}&limit=25`;
     if (GUIDE_CAT) url += `&category=${encodeURIComponent(GUIDE_CAT)}`;
+    if (document.getElementById('guide-desc').checked) url += '&desc=1';
     const res = await fetch(url);
     const j = await res.json();
     if (!res.ok || !j.results) throw new Error(j.error || 'Failed to search');
@@ -2437,8 +2443,11 @@ class Handler(BaseHTTPRequestHandler):
             q = params.get("q", [""])[0].strip()
             cat = params.get("category", [""])[0].strip()
             limit = params.get("limit", ["25"])[0].strip()
+            desc = params.get("desc", [""])[0].strip() in ("1", "true", "yes")
 
             cmd = ["/usr/local/bin/epg-find", "--json"]
+            if desc:
+                cmd.append("--desc")
             if q:
                 cmd.append(q)
             if cat:
