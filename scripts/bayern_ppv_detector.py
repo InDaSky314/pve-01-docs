@@ -30,9 +30,40 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 # Xtream API details (CT 105 credentials)
-XTREAM_BASE = "http://cf.teltv.xyz"
-XTREAM_USER = "***REMOVED-PROVIDER-USER***"
-XTREAM_PASS = "***REMOVED-PROVIDER-PASS***"
+def _load_provider_credentials() -> tuple[str, str, str]:
+    """Read the IPTV provider credentials from CT 105's .env.
+
+    These three values were hardcoded here until 2026-09-10, and had therefore
+    been sitting in the PUBLIC repo since 2026-08-16 -- 24 days -- in direct
+    breach of CLAUDE.md's standing rule that provider credentials live only in
+    /srv/media-core/.env (600). Found while scanning a diff before a push.
+
+    .env lives inside CT 105, so read it through pct rather than keeping a
+    second copy on the host that can silently drift out of step.
+
+    Deliberately non-fatal: an unreadable .env yields empty strings and the
+    provider calls fail with their own clear errors, rather than this script
+    refusing to start and taking the scheduler or dashboard down with it.
+    """
+    vals: dict[str, str] = {}
+    try:
+        res = subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "cat",
+                              "/srv/media-core/.env"],
+                             capture_output=True, text=True, timeout=20)
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                vals[key.strip()] = val.strip().strip('"').strip("'")
+    except Exception:                                          # noqa: BLE001
+        pass
+    return (vals.get("XTREAM_BASE", ""), vals.get("XTREAM_USER", ""),
+            vals.get("XTREAM_PASS", ""))
+
+
+XTREAM_BASE, XTREAM_USER, XTREAM_PASS = _load_provider_credentials()
 
 # Target Categories
 TARGET_CATEGORIES = {

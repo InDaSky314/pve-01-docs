@@ -24,6 +24,7 @@ import json
 import logging
 import re
 import shlex
+import sqlite3
 import socket
 import subprocess
 import sys
@@ -259,6 +260,58 @@ PPV_RESOLVE_WINDOW = timedelta(hours=6)
 # check_ppv_fallback_cancellation() drops it the moment the English
 # recording is PROVEN to be capturing bytes. Net effect: the match is never
 # missed, and in the normal case the owner never sees the fallback at all.
+EPG_DB = Path("/var/lib/dvr-dashboard/epg.db")
+# Titles that mean "this channel is not broadcasting anything" -- an off-air
+# slate, a test card, or a placeholder row. Booking one wastes the single tuner
+# for the whole window and produces a file of nothing.
+OFF_AIR_TITLE_RE = re.compile(
+    r"(sendepause|sendeschluss|programmende|kein\s+programm|no\s+live\s+event|"
+    r"es\s+folgt|test\s*card|testbild|off\s*[- ]?air|placeholder|platzhalter)",
+    re.IGNORECASE)
+
+
+def _fallback_channel_is_off_air(ch_name: str, start: datetime, end: datetime) -> tuple[bool, str]:
+    """Is the fallback channel showing an off-air slate across the match window?
+
+    Added 2026-09-10. The comment below used to say a wrong-channel fallback
+    "costs nothing" -- on 2026-09-10 it cost 6h45m of the single tuner and 12 GB
+    recording Sky Bundesliga 1's "Sendepause" slate, while the actual fixture
+    (Bayern vs Bodo/Glimt) ran on a Champions League PPV channel. The premise
+    that made blind booking reasonable -- "zero programmes across all 34
+    channels", verified 2026-08-24 -- has since expired: that channel now
+    carries 23 EPG entries. So the guide can answer this now, and it should.
+
+    Fails OPEN: any lookup problem returns "not off air", because a missing
+    fallback costs the match and that trade has not changed.
+    """
+    if not EPG_DB.exists():
+        return False, "no EPG database"
+    try:
+        con = sqlite3.connect(f"file:{EPG_DB}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        lo = start.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+        hi = end.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+        rows = list(con.execute(
+            """select p.title, p.start_local, p.stop_local
+                 from programmes p join channels c on c.id = p.channel_id
+                where c.name = ? and p.stop_local > ? and p.start_local < ?
+                order by p.start_local""", (ch_name, lo, hi)))
+        con.close()
+    except Exception as exc:                                   # noqa: BLE001
+        logging.warning("[FALLBACK] Could not read EPG for %r (%s) -- booking anyway", ch_name, exc)
+        return False, f"EPG lookup failed: {exc}"
+
+    if not rows:
+        # No guide data for this channel/window is the 2026-08-24 situation,
+        # and the original reasoning still applies there: book it.
+        return False, "no EPG rows for this window"
+
+    titles = [str(r["title"]) for r in rows]
+    if all(OFF_AIR_TITLE_RE.search(t) for t in titles):
+        return True, "; ".join(sorted(set(titles))[:3])
+    return False, f"{len(titles)} programme(s), not all off-air"
+
+
 DYNAMIC_PPV_FALLBACK = {
     # No EPG is published for the Sky Bundesliga channels in this lineup
     # (verified 2026-08-24: zero programmes across all 34 in the fixture
@@ -298,9 +351,40 @@ PPV_PROBE_ABANDON_BY = timedelta(minutes=8)   # must be back on a fallback by ki
 PPV_PROBE_MIN_BYTES = 20_000_000              # bytes that prove the channel is live
 PPV_PROBE_STATE_FILE = Path("/var/lib/dvr-dashboard/ppv-probe-state.json")
 
-XTREAM_BASE = "http://cf.teltv.xyz"
-XTREAM_USER = "***REMOVED-PROVIDER-USER***"
-XTREAM_PASS = "***REMOVED-PROVIDER-PASS***"
+def _load_provider_credentials() -> tuple[str, str, str]:
+    """Read the IPTV provider credentials from CT 105's .env.
+
+    These three values were hardcoded here until 2026-09-10, and had therefore
+    been sitting in the PUBLIC repo since 2026-08-16 -- 24 days -- in direct
+    breach of CLAUDE.md's standing rule that provider credentials live only in
+    /srv/media-core/.env (600). Found while scanning a diff before a push.
+
+    .env lives inside CT 105, so read it through pct rather than keeping a
+    second copy on the host that can silently drift out of step.
+
+    Deliberately non-fatal: an unreadable .env yields empty strings and the
+    provider calls fail with their own clear errors, rather than this script
+    refusing to start and taking the scheduler or dashboard down with it.
+    """
+    vals: dict[str, str] = {}
+    try:
+        res = subprocess.run(["/usr/sbin/pct", "exec", "105", "--", "cat",
+                              "/srv/media-core/.env"],
+                             capture_output=True, text=True, timeout=20)
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                vals[key.strip()] = val.strip().strip('"').strip("'")
+    except Exception:                                          # noqa: BLE001
+        pass
+    return (vals.get("XTREAM_BASE", ""), vals.get("XTREAM_USER", ""),
+            vals.get("XTREAM_PASS", ""))
+
+
+XTREAM_BASE, XTREAM_USER, XTREAM_PASS = _load_provider_credentials()
 
 PPV_TARGET_CATEGORIES = {
     573: {"name": "US| DAZN PPV", "priority": 100},
@@ -1235,6 +1319,17 @@ def ensure_dynamic_ppv_fallback(game: dict[str, Any], jf_channels: dict[str, str
     if conflict:
         logging.info("[FALLBACK] %s is already covered by %s -- not booking a "
                      "second timer for the single tuner", game["name"], reason)
+        return False
+
+    off_air, detail = _fallback_channel_is_off_air(ch_name, game["start"], game["end"])
+    if off_air:
+        logging.warning("[FALLBACK] REFUSING %s on %s: the guide shows only an off-air slate "
+                        "across the whole window (%s). Booking it would hold the single tuner "
+                        "for the match and record nothing.", game["name"], ch_name, detail)
+        log_event("ppv_fallback_refused_off_air", None, want, {
+            "channel": ch_name, "epg": detail,
+            "game_start": game["start"].isoformat(),
+        }, dry_run=dry_run)
         return False
 
     logging.info("[FALLBACK] Booking linear safety net for %s on %s", game["name"], ch_name)
