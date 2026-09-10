@@ -1284,6 +1284,111 @@ def run_auto_scheduler(dry_run: bool = True, games: list[dict[str, Any]] | None 
         schedule_game_timer(game, cid, cname, dry_run=dry_run)
 
 
+# Letters the guide and ESPN spell differently for the same club. Bodo/Glimt
+# is written "Bodø/Glimt" in the German guide and "Bodo/Glimt" by ESPN, and
+# Bayern is "Bayern München" vs "Bayern Munich" -- fold both sides before
+# comparing rather than trying to keep a synonym table current.
+_FOLD = str.maketrans({
+    "ø": "o", "Ø": "O", "æ": "a", "Æ": "A", "å": "a", "Å": "A",
+    "ü": "u", "Ü": "U", "ö": "o", "Ö": "O", "ä": "a", "Ä": "A", "ß": "ss",
+    "é": "e", "è": "e", "ê": "e", "á": "a", "à": "a", "í": "i", "ó": "o", "ú": "u",
+})
+# Words that appear in every fixture title and so prove nothing.
+_FIXTURE_STOPWORDS = {
+    "live", "the", "and", "vs", "versus", "gegen", "fussball", "fußball",
+    "football", "soccer", "match", "game", "spiel", "uefa", "champions",
+    "league", "liga", "bundesliga", "round", "matchday", "spieltag", "week",
+}
+EPG_FIXTURE_MIN_TOKENS = 2
+# A candidate must cover at least this fraction of the fixture window, which
+# rules out pre/post-match shows and 24h 'no live event' filler rows.
+EPG_FIXTURE_MIN_COVERAGE = 0.5
+
+
+def _fixture_tokens(text: str) -> set[str]:
+    folded = str(text or "").translate(_FOLD).lower()
+    return {w for w in re.findall(r"[a-z0-9]+", folded)
+            if len(w) > 3 and w not in _FIXTURE_STOPWORDS}
+
+
+def _epg_fixture_channel(game: dict[str, Any],
+                         jf_channels: dict[str, str]) -> tuple[str | None, str]:
+    """Find the channel actually carrying this fixture, from the guide.
+
+    Added 2026-09-10 after nearly missing Bayern vs Bodo/Glimt. The PPV
+    resolver only searches six provider stream categories, so a Champions
+    League tie on a curated "Soccer PPV" channel scored nothing, and the blind
+    linear fallback booked Sky Bundesliga 1 -- which was showing an off-air
+    slate. The guide had the answer in plain text the whole time:
+    "LIVE: Bayern Munchen vs. Bodo/Glimt" on ch 1117.
+
+    Requires EPG_FIXTURE_MIN_TOKENS distinct significant words from the ESPN
+    fixture name to appear in the programme title, so "Bayern" alone cannot
+    match a magazine show. Only channels present in the Jellyfin lineup are
+    considered, because one we cannot book is no use. Ties break on the
+    longest overlap with the fixture window.
+    """
+    if not EPG_DB.exists():
+        return None, "no EPG database"
+    want = _fixture_tokens(game.get("name", ""))
+    if len(want) < EPG_FIXTURE_MIN_TOKENS:
+        return None, f"fixture name {game.get('name','')!r} has too few distinctive words"
+
+    lo = game["start"].astimezone(LOCAL_TZ)
+    hi = game["end"].astimezone(LOCAL_TZ)
+    try:
+        con = sqlite3.connect(f"file:{EPG_DB}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        rows = list(con.execute(
+            """select c.name ch_name, p.title, p.desc, p.start_local, p.stop_local
+                 from programmes p join channels c on c.id = p.channel_id
+                where p.stop_local > ? and p.start_local < ?
+                order by p.start_local""",
+            (lo.strftime("%Y-%m-%d %H:%M"), hi.strftime("%Y-%m-%d %H:%M"))))
+        con.close()
+    except Exception as exc:                                   # noqa: BLE001
+        return None, f"EPG lookup failed: {exc}"
+
+    window = max(1.0, (hi - lo).total_seconds())
+    best = None
+    for r in rows:
+        ch_name = str(r["ch_name"])
+        if not (jf_channels.get(ch_name) or jf_channels.get(ch_name.lower())):
+            continue
+        title = str(r["title"])
+        if OFF_AIR_TITLE_RE.search(title):
+            continue
+        t_hits = want & _fixture_tokens(title)
+        d_hits = want & _fixture_tokens(r["desc"] or "")
+        # Either field may carry the teams. The Patriots game is titled only
+        # "Live: NFL Football" with both clubs in the description, so a
+        # title-only match would have missed it entirely.
+        if len(t_hits) < EPG_FIXTURE_MIN_TOKENS and len(d_hits) < EPG_FIXTURE_MIN_TOKENS:
+            continue
+        try:
+            st = datetime.strptime(r["start_local"], "%Y-%m-%d %H:%M").replace(tzinfo=LOCAL_TZ)
+            sp = datetime.strptime(r["stop_local"], "%Y-%m-%d %H:%M").replace(tzinfo=LOCAL_TZ)
+        except ValueError:
+            continue
+        overlap = (min(sp, hi) - max(st, lo)).total_seconds()
+        if overlap < window * EPG_FIXTURE_MIN_COVERAGE:
+            continue
+        # Rank by how much of the fixture the programme actually covers, not by
+        # how many words its title happens to share. A Sportsgrid wagering show
+        # is literally titled "San Francisco 49ers vs. Los Angeles Rams ..." and
+        # would out-score the real broadcast, which is called "Live: NFL
+        # Football" -- but it runs an hour against the game's three and a half.
+        score = (overlap, len(t_hits), len(d_hits))
+        if best is None or score > best[0]:
+            best = (score, ch_name, title, sorted(t_hits | d_hits), overlap)
+
+    if best is None:
+        return None, "no channel in the lineup carries this fixture in the guide"
+    (_, ch_name, title, hits, overlap) = best
+    return ch_name, (f"{title!r} on {ch_name} covering {overlap/3600:.1f}h of the window "
+                     f"(matched on {', '.join(hits)})")
+
+
 def ensure_dynamic_ppv_fallback(game: dict[str, Any], jf_channels: dict[str, str],
                                  existing_timers: list[dict[str, Any]], dry_run: bool = True) -> bool:
     """Make sure a dynamic-PPV fixture has its linear-channel safety net
@@ -1293,6 +1398,18 @@ def ensure_dynamic_ppv_fallback(game: dict[str, Any], jf_channels: dict[str, str
     ch_name = DYNAMIC_PPV_FALLBACK.get(team)
     if not ch_name:
         return False
+
+    # Prefer the channel the guide says is actually carrying this fixture over
+    # the hardcoded default. The default is a guess made once; the guide is
+    # specific to tonight.
+    epg_ch, epg_why = _epg_fixture_channel(game, jf_channels)
+    if epg_ch:
+        logging.info("[FALLBACK] Guide places %s on %s -- using it instead of the default %r: %s",
+                     game["name"], epg_ch, ch_name, epg_why)
+        ch_name = epg_ch
+    else:
+        logging.info("[FALLBACK] No guide match for %s (%s); falling back to the default channel %r",
+                     game["name"], epg_why, ch_name)
     cid = jf_channels.get(ch_name) or jf_channels.get(ch_name.lower())
     if not cid:
         logging.warning("[FALLBACK] %s not in the Jellyfin lineup -- cannot book a fallback for %s",
