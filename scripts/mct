@@ -72,6 +72,65 @@ def get_adaptive_backoff(
     return min(max_backoff, backoff)
 
 
+# --- Provider-block detection -------------------------------------------------
+# The IPTV provider blocks a VPN exit IP by refusing the STREAM, not the account
+# API, so network-triage's own probe structurally cannot see it. On 2026-09-10
+# player_api.php answered auth=1/status=Active fourteen times across 65 minutes
+# while every capture segment died on "Server returned 5XX", and the first hour
+# of the game was lost. mct is the component that actually watches streams fail,
+# so mct is what tells network-triage to draw a fresh exit.
+PROVIDER_BLOCK_RE = re.compile(
+    r"(5\d\d\s+Server\s+Error|Server\s+returned\s+5XX|HTTP\s+error\s+5\d\d|\b511\b)",
+    re.IGNORECASE)
+BOUNCE_AFTER_DEAD_SEGMENTS = 2
+BOUNCE_COOLDOWN_SEC = 600.0
+
+
+def maybe_bounce_blocked_exit(consecutive_dead: int, err_msg: str, state: dict,
+                              enabled: bool = True) -> bool:
+    """Ask network-triage for a fresh exit IP when the provider is refusing streams.
+
+    Fires only on consecutive DEAD segments, so nothing is being captured at the
+    time and a bounce cannot interrupt content. Two strikes is ~40s of evidence
+    (the 2026-09-10 pair died 35s apart) against the 65 minutes the API-probe
+    path needed to notice the same outage.
+
+    Rate limiting stays in network-triage (MAX_BOUNCES_PER_HOUR) -- an external
+    signal can be wrong, and that limit is what stops a wrong one becoming a
+    loop. The cooldown here only stops mct re-asking on every restart of a long
+    dead streak. Returns True only when a bounce actually happened.
+    """
+    if not enabled or consecutive_dead < BOUNCE_AFTER_DEAD_SEGMENTS:
+        return False
+    if not PROVIDER_BLOCK_RE.search(err_msg or ""):
+        return False
+    now = time.monotonic()
+    last = state.get("last_attempt")
+    if last is not None and (now - last) < BOUNCE_COOLDOWN_SEC:
+        return False
+    state["last_attempt"] = now
+
+    log(f"[Tunnel-Guard] {consecutive_dead} consecutive dead segments with a provider "
+        f"block in the error text. Asking network-triage for a fresh exit IP...")
+    try:
+        r = subprocess.run(
+            ["/usr/local/bin/network-triage", "--fix-tunnel", "--tunnel-bounce-reason",
+             f"mct: {consecutive_dead} consecutive dead capture segments on provider 5XX"],
+            capture_output=True, text=True, timeout=180)
+        tail = " | ".join(l.strip() for l in (r.stdout or "").strip().splitlines()[-4:] if l.strip())
+        if r.returncode == 0:
+            log(f"[Tunnel-Guard] Bounce accepted: {tail[:300]}")
+            push_loki_alert(f"level=warn source=mct msg='Bounced VPN exit after {consecutive_dead} "
+                            f"dead segments on provider block'")
+            return True
+        log(f"[Tunnel-Guard] Bounce not applied (rc={r.returncode}): {tail[:300]}")
+    except subprocess.TimeoutExpired:
+        log("[Tunnel-Guard] network-triage timed out; continuing with normal restart backoff.")
+    except Exception as exc:                                  # noqa: BLE001
+        log(f"[Tunnel-Guard] Could not run network-triage ({exc}); continuing with normal backoff.")
+    return False
+
+
 def evaluate_capture_success(
     captured_sec: float,
     requested_sec: int,
@@ -1113,6 +1172,11 @@ def main() -> int:
                         help="Disable restart-and-stitch (single-shot mode)")
     parser.add_argument("--max-restarts", type=int, default=MAX_RESTARTS,
                         help="Maximum restart attempts (default: None, bounded only by window)")
+    parser.add_argument("--no-tunnel-bounce", action="store_true",
+                        help="Do not ask network-triage for a fresh VPN exit IP when consecutive "
+                             "segments die on a provider 5XX/511. Left on by default: the block is "
+                             "invisible to network-triage's own probe, so mct is the only component "
+                             "that can see it.")
     parser.add_argument("--restart-backoff", type=float, default=RESTART_BACKOFF_BASE_SEC,
                         help=f"Base backoff in seconds after content-yielding segment (default: {RESTART_BACKOFF_BASE_SEC}s)")
     parser.add_argument("--initial-dead-backoff", type=float, default=INITIAL_DEAD_BACKOFF_SEC,
@@ -1322,6 +1386,7 @@ def main() -> int:
     segment_paths: list[str] = []
     restart_count = 0
     consecutive_dead_restarts = 0
+    bounce_state: dict = {}
     segment_idx = 1
     start_mono = time.monotonic()
     interrupted = [False]
@@ -1529,6 +1594,15 @@ def main() -> int:
                 if mv.returncode != 0:
                     log(f"[Orphan-Guard] Could not archive stub ({mv.stderr.strip()[:120]}); leaving it in place "
                         f"rather than deleting evidence.")
+
+                # A fresh exit IP changes the situation, so drop the dead counter
+                # back to zero: the next attempt is against a different endpoint
+                # and deserves the base 5s backoff, not the 240s the streak had
+                # escalated to. If the new exit is blocked too, the streak simply
+                # rebuilds and the cooldown stops us asking again immediately.
+                if maybe_bounce_blocked_exit(consecutive_dead_restarts, last_err_msg,
+                                             bounce_state, enabled=not args.no_tunnel_bounce):
+                    consecutive_dead_restarts = 0
             else:
                 consecutive_dead_restarts = 0
                 if segment_idx == 1 and args.restart_and_stitch:

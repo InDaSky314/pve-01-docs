@@ -1245,7 +1245,7 @@ except Exception as e:
     TUNNEL_STATE = "/var/lib/dvr-dashboard/tunnel-bounce-state.json"
     # Exit ranges the provider has blocked before. 89.37.173.0/24 has now cost
     # two outages: ~7h on 2026-09-03 and ~7min of a live game on 2026-09-06.
-    KNOWN_BAD_PREFIXES = ("89.37.173.",)
+    KNOWN_BAD_PREFIXES = ("89.37.173.", "188.241.120.")
     MAX_BOUNCES_PER_HOUR = 3
 
     def _tunnel_state(self):
@@ -1291,7 +1291,7 @@ except Exception as e:
         ip = (out or "").strip()
         return ip if ip.count(".") == 3 else ""
 
-    def apply_tunnel_bounce(self, report) -> Tuple[bool, str]:
+    def apply_tunnel_bounce(self, report, external_reason: str = "") -> Tuple[bool, str]:
         """Draw a fresh Surfshark exit IP when the provider has blocked the current one.
 
         DELIBERATELY DIFFERENT POLICY TO THE WAN BOUNCE: this does NOT refuse
@@ -1305,6 +1305,18 @@ except Exception as e:
         cur_ip = self._ct_egress_ip()
         bad_range = any(cur_ip.startswith(pfx) for pfx in self.KNOWN_BAD_PREFIXES)
 
+        # An external caller that has watched real streams fail outranks this
+        # script's own probe. Added 2026-09-10 after the Patriots capture: the
+        # provider blocks STREAMING, not the account API, so player_api.php kept
+        # answering auth=1/status=Active from the blocked exit while every
+        # segment died on "Server returned 5XX". The probe said "No bounce
+        # needed" fourteen times across 65 minutes; mct meanwhile had 16 dead
+        # segments of direct evidence and no way to say so. This is that way.
+        # The rate limit below still applies -- an external signal can be wrong,
+        # and MAX_BOUNCES_PER_HOUR is what stops a wrong one becoming a loop.
+        if external_reason:
+            blocked = True
+
         if not (blocked or bad_range) and self.simulate != "provider-down":
             return False, (f"Provider reachable from CT 105 and exit {cur_ip or 'unknown'} is not in a "
                            f"known-bad range. No bounce needed.")
@@ -1316,7 +1328,12 @@ except Exception as e:
                 f"(limit {self.MAX_BOUNCES_PER_HOUR}). A blocked provider and a dead tunnel look "
                 f"alike from here; thrashing the tunnel will not tell them apart. Investigate manually.")
 
-        why = "provider returned a block" if blocked else f"exit {cur_ip} is in a known-bad range"
+        if external_reason:
+            why = external_reason
+        elif blocked:
+            why = "provider returned a block"
+        else:
+            why = f"exit {cur_ip} is in a known-bad range"
         if self.dry_run:
             return True, (f"[DRY-RUN] Would bounce wgclient1 ({why}).\n"
                           f"  current exit: {cur_ip or 'unknown'}\n"
@@ -1423,6 +1440,12 @@ def main() -> int:
     )
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON format")
     parser.add_argument("--fix", action="store_true", help="Opt-in targeted recovery (WAN bounce). Refuses during recordings.")
+    parser.add_argument("--tunnel-bounce-reason", default="",
+                        metavar="TEXT",
+                        help="Assert an external block signal for --fix-tunnel, bypassing this "
+                             "script's own provider probe (which cannot see a streaming-only "
+                             "block). The rate limit still applies. Used by mct when consecutive "
+                             "capture segments die on provider 5XX/511 errors.")
     parser.add_argument("--fix-tunnel", action="store_true",
                         help="Draw a fresh Surfshark exit IP when the provider has blocked the current one. "
                              "Does NOT refuse during recordings -- restart-and-stitch makes a bounce cheap.")
@@ -1461,7 +1484,7 @@ def main() -> int:
 
     if args.fix_tunnel:
         print("\n--- VPN EXIT-IP RECOVERY (--fix-tunnel) ---")
-        ok, msg = triager.apply_tunnel_bounce(report)
+        ok, msg = triager.apply_tunnel_bounce(report, external_reason=args.tunnel_bounce_reason)
         print(msg)
         return 0 if ok or report.verdict == "PASS" else 1
 

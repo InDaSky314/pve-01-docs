@@ -1,0 +1,27 @@
+[Unit]
+Description=Google TV Streamer logcat -> log-server Loki
+Documentation=file:///root/pve-01-docs/docs/livetv-custom-build-and-updates-20260726.md
+After=network-online.target avahi-daemon.service
+Wants=network-online.target avahi-daemon.service
+
+[Service]
+Type=simple
+# No CHROMECAST_ADDR: the connect port rotates on every reboot/toggle, so the
+# script resolves the current endpoint over mDNS instead. Override DEVICE_NAME
+# / DEVICE_IP here if the device is ever replaced.
+ExecStart=/root/bin/chromecast-logcat.sh
+Restart=always
+RestartSec=30
+# Exponential backoff, 30s -> 5min over 6 steps. The TV shares the household
+# power timer and is simply off for most of the day, and the script exits
+# non-zero when it cannot reach it, so a flat 30s meant a restart every ~35s
+# forever: 612 restarts in 6 hours on 2026-09-10, and 2 journal lines each.
+# systemd resets the interval once the unit runs successfully, so a TV that
+# comes on is picked up within 5 minutes and then reconnects fast thereafter.
+# Losing up to 5 minutes at the start of a session is fine for a diagnostic
+# log shipper; hammering adb and the journal all day is not.
+RestartSteps=6
+RestartMaxDelaySec=5min
+
+[Install]
+WantedBy=multi-user.target
