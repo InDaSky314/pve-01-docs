@@ -973,7 +973,7 @@ def probe_ct_duration(path_in_ct: str) -> float:
     return -1.0
 
 
-def dedupe_base_file(ct_dir: str, base: str) -> str:
+def dedupe_base_file(ct_dir: str, base: str, dry_run: bool = False) -> str:
     """Keep same-day recordings distinct without uglifying the common case.
 
     Dropping the clock from the filename (2026-09-06 rather than
@@ -981,6 +981,15 @@ def dedupe_base_file(ct_dir: str, base: str) -> str:
     day would collide -- a baseball doubleheader being the real case. Only then
     do we suffix, and we suffix in game order: ' G1', ' G2', ... The single-game
     case, which is nearly all of them, stays clean.
+
+    `dry_run` matters more than it looks. This function RENAMES the incumbent,
+    and it runs while the target path is being built -- which is before the
+    dry-run guard further down. On 2026-09-11 a `--dry-run` issued against the
+    same channel and title as a capture that was still recording renamed that
+    live capture's file out from under it. The bytes were safe (ffmpeg writes
+    by descriptor, not by name) but mct finalises by NAME, so a 10.7 GB game
+    would have been declared missing at the end of its own successful capture.
+    A dry run must not touch the filesystem.
     """
     probe = subprocess.run(
         ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
@@ -993,13 +1002,33 @@ def dedupe_base_file(ct_dir: str, base: str) -> str:
     # A file for this fixture/day already exists -> this is game 2 (or later).
     # Rename the incumbent to ' G1' the first time, so the pair reads G1/G2.
     if f"{base} G1" not in existing:
-        subprocess.run(
-            ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
-             f"for f in '{ct_dir}/{base}'.*; do [ -e \"$f\" ] || continue; "
-             f"ext=\"${{f##*.}}\"; mv \"$f\" '{ct_dir}/{base} G1'.\"$ext\"; done"],
-            capture_output=True, text=True,
-        )
-        log(f"Same-day collision on '{base}': renamed the earlier recording to '{base} G1'")
+        if dry_run:
+            log(f"[DRY RUN] Same-day collision on '{base}': would rename the earlier "
+                f"recording to '{base} G1' and take '{base} G2' for this one. "
+                f"Nothing was renamed.")
+            return f"{base} G2"
+        # Rename per file from the listing we already have, rather than through a
+        # shell glob. The old version took `ext="${f##*.}"`, i.e. the LAST
+        # extension only, so `<base>.raw.ts` became `<base> G1.ts` -- silently
+        # dropping the `.raw` marker that mct-orphan-sweep keys on with
+        # `find -name "*.raw.ts"`. Slicing the whole suffix keeps double
+        # extensions intact, and avoids the quoting hazards of globbing
+        # user-supplied titles in `sh -c`.
+        renamed = 0
+        for name in existing.splitlines():
+            name = name.strip()
+            if not name.startswith(f"{base}."):
+                continue
+            suffix = name[len(base):]
+            res = subprocess.run(
+                ["/usr/sbin/pct", "exec", CT_ID, "--", "mv", "-n",
+                 f"{ct_dir}/{name}", f"{ct_dir}/{base} G1{suffix}"],
+                capture_output=True, text=True,
+            )
+            if res.returncode == 0:
+                renamed += 1
+        log(f"Same-day collision on '{base}': renamed {renamed} file(s) of the earlier "
+            f"recording to '{base} G1'")
         return f"{base} G2"
     n = 2
     while f"{base} G{n}" in existing:
@@ -1417,7 +1446,7 @@ def main() -> int:
     # libraries from overlapping.
     container_dir = f"/media/recordings/In Progress/{args.category}/{safe_title}"
     ct105_dir = f"/srv/media-core{container_dir}"
-    base_file = dedupe_base_file(ct105_dir, f"{safe_title} {ts_str}")
+    base_file = dedupe_base_file(ct105_dir, f"{safe_title} {ts_str}", dry_run=args.dry_run)
     raw_path = f"{container_dir}/{base_file}.raw.ts"
     clean_path = f"{container_dir}/{base_file}.ts"
     nfo_path = f"{container_dir}/{base_file}.nfo"
