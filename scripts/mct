@@ -434,6 +434,145 @@ def load_espn_schedule() -> list[dict[str, Any]]:
     return games
 
 
+# --- League-wide ESPN fixture lookup for ad-hoc bookings -----------------------
+# load_espn_schedule() only fetches the five hardcoded teams the dashboard
+# tracks, so a game booked straight from the guide has no fixture to match and
+# runs blind: no auto-extend into overtime, no clean stop at the whistle. That
+# is not hypothetical -- the Rams/49ers capture on 2026-09-11 ran to its hard
+# cap with a two-line log and no supervisor, and would have been truncated had
+# the game gone long.
+#
+# The teams are in the EPG DESCRIPTION, never the title: the programme is called
+# "Live: NFL Football" while its description reads "NFC West rivals the Los
+# Angeles Rams and San Francisco 49ers meet in Week 1...". So infer the league
+# from the programme text, pull ESPN's league-wide scoreboard for that date, and
+# match the description against the competitor names.
+ESPN_LEAGUE_PATTERNS: tuple[tuple[str, str], ...] = (
+    (r"college\s+football|ncaa\s+football|\bcfb\b", "football/college-football"),
+    (r"\bnfl\b|national\s+football\s+league", "football/nfl"),
+    (r"\bmlb\b|major\s+league\s+baseball", "baseball/mlb"),
+    (r"\bnba\b|national\s+basketball", "basketball/nba"),
+    (r"\bnhl\b|national\s+hockey", "hockey/nhl"),
+    (r"champions\s+league|uefa", "soccer/uefa.champions"),
+    (r"bundesliga", "soccer/ger.1"),
+    (r"premier\s+league", "soccer/eng.1"),
+)
+# Words in a team's display name too generic to identify it on their own.
+_TEAM_STOPWORDS = {"city", "state", "united", "club", "town", "county", "real"}
+
+
+def infer_espn_league(*texts: str) -> str | None:
+    """Which ESPN league does this programme belong to? None if undecidable."""
+    blob = " ".join(t for t in texts if t).lower()
+    for pattern, sport_path in ESPN_LEAGUE_PATTERNS:
+        if re.search(pattern, blob):
+            return sport_path
+    return None
+
+
+def _team_tokens(name: str) -> set[str]:
+    return {w.lower() for w in re.findall(r"[A-Za-z0-9]{4,}", name or "")
+            if w.lower() not in _TEAM_STOPWORDS}
+
+
+_SCOREBOARD_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+SCOREBOARD_TTL_SEC = 120.0
+
+
+def load_espn_scoreboard(sport_path: str, start_dt: datetime) -> list[dict[str, Any]]:
+    """Every fixture in a league around `start_dt`.
+
+    ESPN's `dates=` is indexed by US EASTERN, not UTC and not local: a 02:35
+    CEST kickoff is 20:35 the PREVIOUS day in Bristol, and querying the obvious
+    date returns zero events. Verified against the live Rams/49ers fixture --
+    `dates=20260911` gave 0, `dates=20260910` gave 1. A two-day range spanning
+    the boundary is correct and costs one request rather than two.
+
+    Cached for SCOREBOARD_TTL_SEC. The supervisor re-resolves the fixture on
+    every poll for the length of a game, and without this that is a few hundred
+    extra requests per capture against an API this system already leans on --
+    agy flagged exactly this when reviewing the first cut of this function.
+    """
+    start_utc = start_dt.astimezone(timezone.utc)
+    lo = (start_utc - timedelta(days=1)).strftime("%Y%m%d")
+    hi = (start_utc + timedelta(days=1)).strftime("%Y%m%d")
+    key = f"{sport_path}:{lo}-{hi}"
+
+    hit = _SCOREBOARD_CACHE.get(key)
+    if hit and (time.monotonic() - hit[0]) < SCOREBOARD_TTL_SEC:
+        return hit[1]
+
+    games: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    url = (f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}"
+           f"/scoreboard?dates={lo}-{hi}")
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url), timeout=12) as resp:
+            data = json.load(resp)
+    except Exception:
+        return hit[1] if hit else []
+    if True:
+        for event in data.get("events", []):
+            eid = event.get("id")
+            if not eid or eid in seen:
+                continue
+            seen.add(eid)
+            try:
+                s_dt = datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
+            except Exception:
+                continue
+            comp = (event.get("competitions") or [{}])[0]
+            status_type = ((comp.get("status") or {}).get("type") or {})
+            competitors = [((c.get("team") or {}).get("displayName") or "")
+                           for c in (comp.get("competitors") or [])]
+            games.append({
+                "id": eid,
+                "team": (event.get("shortName") or event.get("name") or "Game"),
+                "name": event.get("name") or event.get("shortName") or "Game",
+                "shortName": event.get("shortName") or "",
+                "competitors": [c for c in competitors if c],
+                "start": s_dt,
+                "end": s_dt + timedelta(hours=3, minutes=15),
+                "state": status_type.get("state", "pre"),
+                "completed": bool(status_type.get("completed", False)),
+                "status_detail": status_type.get("detail") or status_type.get("shortDetail") or "",
+            })
+    _SCOREBOARD_CACHE[key] = (time.monotonic(), games)
+    return games
+
+
+def find_espn_fixture_by_description(desc: str, start_dt: datetime,
+                                     sport_path: str) -> dict[str, Any] | None:
+    """Match a scoreboard fixture against the programme description.
+
+    Requires BOTH competitors to be named. One is not enough: the channel
+    "Los Angeles: NBC 4 (KNBC)" would satisfy a Rams fixture on "angeles"
+    alone, which is luck rather than identification -- and on a Sunday the
+    same luck would attach the wrong game out of thirteen.
+    """
+    if not desc:
+        return None
+    blob = desc.lower()
+    start_utc = start_dt.astimezone(timezone.utc)
+    best = None
+    for g in load_espn_scoreboard(sport_path, start_dt):
+        # Signed, not absolute: a booking starts BEFORE kickoff (pre-game
+        # padding), rarely after. -60m/+120m covers real padding without
+        # reaching the next game of a doubleheader, which +-4h does.
+        offset = (g["start"] - start_utc).total_seconds()
+        if not (-3600 <= offset <= 7200):
+            continue
+        drift = abs(offset)
+        comps = g.get("competitors") or []
+        if len(comps) < 2:
+            continue
+        if not all(any(tok in blob for tok in _team_tokens(c)) for c in comps):
+            continue
+        if best is None or drift < best[0]:
+            best = (drift, g)
+    return best[1] if best else None
+
+
 def find_espn_fixture(title: str, channel_name: str, start_dt: datetime, games: list[dict[str, Any]]) -> dict[str, Any] | None:
     start_utc = start_dt.astimezone(timezone.utc)
     target_str = f"{title} {channel_name}".lower()
@@ -1304,6 +1443,18 @@ def main() -> int:
     # 3. ESPN fixture matching and Hard Cap calculation
     espn_games = load_espn_schedule()
     fixture = find_espn_fixture(title, ch["name"], start_dt, espn_games)
+    espn_league = infer_espn_league(title, meta.get("plot", ""), " ".join(meta.get("genres") or []))
+    if not fixture and espn_league:
+        fixture = find_espn_fixture_by_description(meta.get("plot", ""), start_dt, espn_league)
+        if fixture:
+            log(f"ESPN fixture resolved from the programme description via the "
+                f"{espn_league} scoreboard: {fixture['name']}")
+        else:
+            log(f"No {espn_league} fixture matched the description; capture will run "
+                f"to its hard cap without live supervision.")
+    elif not fixture:
+        log("Could not infer a league from the programme; capture will run to its "
+            "hard cap without live supervision.")
     hard_cap_sec, hard_cap_end_dt, ext_reason, is_clamped, clamp_info = calculate_hard_cap(
         start_dt, duration_sec, max_ext_sec, fixed_pad_sec, fixture,
         getattr(args, 'booking_id', None),
@@ -1470,6 +1621,9 @@ def main() -> int:
                     try:
                         latest_games = load_espn_schedule()
                         cur_fixture = find_espn_fixture(title, ch["name"], start_dt, latest_games)
+                        if not cur_fixture and espn_league:
+                            cur_fixture = find_espn_fixture_by_description(
+                                meta.get("plot", ""), start_dt, espn_league)
                     except Exception as exc:
                         log(f"[Supervisor] ESPN poll error ({exc}), continuing...")
                         continue
