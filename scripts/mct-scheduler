@@ -13,6 +13,8 @@ import json
 import os
 import re
 import signal
+import importlib.machinery
+import importlib.util
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -24,6 +26,71 @@ LOG_DIR = Path("/var/log/mct")
 MCT_BIN = "/usr/local/bin/mct"
 LOCAL_TZ = ZoneInfo("Europe/Berlin")
 LOOKAHEAD_SECONDS = 300  # 5 minutes ahead
+
+
+
+# --- Launch-time channel resolution --------------------------------------------
+# The dashboard books a dynamic-PPV fixture (Bayern) with channel "not in guide
+# yet" when nothing in the EPG matches at booking time, expecting the slot to be
+# filled in later. Nothing ever filled it in: this scheduler passed the literal
+# string to `mct --channel` and the capture died at launch. On 2026-09-12 that
+# booking also sat on the tuner window as a phantom, refusing every manual
+# rebooking with "Tuner conflict: overlapping MCT capture ... on not in guide
+# yet not in guide yet" -- unrecordable itself, and blocking the recordable.
+#
+# The reason the slot is empty at booking time is structural: Sunday Bundesliga
+# is DAZN's in Germany, and the provider only lists the live PPV feed a few
+# hours before kickoff. At T-5 minutes it exists. So resolve here, at launch,
+# from the guide, using sports-dvr-auto's fixture resolver -- the same one that
+# found Bayern vs Bodo/Glimt on "Soccer PPV 18".
+PLACEHOLDER_CHANNELS = {"", "not in guide yet", "tbd", "tba", "none", "unknown"}
+_SDA_MOD = None
+
+
+def _sports_dvr_auto():
+    global _SDA_MOD
+    if _SDA_MOD is not None:
+        return _SDA_MOD
+    for cand in (Path("/usr/local/bin/sports-dvr-auto"),
+                 Path("/root/pve-01-docs/scripts/sports-dvr-auto")):
+        if not cand.exists():
+            continue
+        try:
+            loader = importlib.machinery.SourceFileLoader("sports_dvr_auto", str(cand))
+            spec = importlib.util.spec_from_file_location("sports_dvr_auto", str(cand), loader=loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            _SDA_MOD = mod
+            return mod
+        except Exception as exc:                               # noqa: BLE001
+            log(f"Could not load sports-dvr-auto for guide resolution ({exc})")
+    return None
+
+
+def resolve_channel_from_guide(b: dict, start_dt: datetime, end_dt: datetime) -> tuple[str, str] | None:
+    """(channel_number, channel_name) for the fixture named in the booking, or None."""
+    mod = _sports_dvr_auto()
+    if mod is None or not hasattr(mod, "_epg_fixture_channel"):
+        return None
+    game = {"name": str(b.get("title") or b.get("name") or ""), "start": start_dt, "end": end_dt}
+    try:
+        # Lineup keyed by channel name, as the resolver expects; the EPG db's
+        # channel table IS the lineup, so use it rather than a Jellyfin call.
+        import sqlite3
+        con = sqlite3.connect(f"file:{mod.EPG_DB}?mode=ro", uri=True)
+        rows = list(con.execute("select name, number from channels"))
+        con.close()
+        lineup = {name: "x" for name, _ in rows}
+        numbers = {name: str(num or "") for name, num in rows}
+        ch_name, why = mod._epg_fixture_channel(game, lineup)
+    except Exception as exc:                                   # noqa: BLE001
+        log(f"Guide resolution error for '{game['name']}': {exc}")
+        return None
+    if not ch_name:
+        log(f"Guide has no channel for '{game['name']}' yet: {why}")
+        return None
+    log(f"Guide resolved '{game['name']}' -> {numbers.get(ch_name) or '?'} {ch_name}: {why}")
+    return numbers.get(ch_name, ""), ch_name
 
 
 def log(msg: str) -> None:
@@ -199,6 +266,24 @@ def trigger_upcoming(bookings: list[dict], now: datetime, changed: list[bool], d
                 changed[0] = True
                 log(f"Booking expired without running: '{b.get('title') or b.get('name')}' (id={b.get('id')})")
                 continue
+
+            ch_field = str(b.get("channel") or "").strip()
+            if ch_field.lower() in PLACEHOLDER_CHANNELS:
+                resolved = resolve_channel_from_guide(b, start_dt, end_dt)
+                if not resolved or not resolved[0]:
+                    # Not marked failed: the slot can still appear before the
+                    # window closes, and the expiry rule above ends it cleanly
+                    # if it never does. Loud on every tick by design.
+                    log(f"HOLDING '{b.get('title') or b.get('name')}' (id={b.get('id')}): channel is "
+                        f"{ch_field!r} and the guide cannot place the fixture yet. Will retry each tick "
+                        f"until {end_dt:%H:%M}.")
+                    continue
+                b["channel"] = resolved[0]
+                b["channel_number"] = resolved[0]
+                b["channel_name"] = resolved[1]
+                b["channel_display"] = f"{resolved[0]} {resolved[1]}".strip()
+                b["channel_resolved_at_launch"] = now.isoformat()
+                changed[0] = True
 
             slug = re.sub(r'[^a-zA-Z0-9_-]', '_', str(b.get('id', 'mct')))
             logfile = str(LOG_DIR / f"mct-{slug}.log")
