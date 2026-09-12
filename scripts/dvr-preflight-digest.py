@@ -121,6 +121,18 @@ def get_override_state(now: datetime) -> dict[str, Any]:
         raw = OVERRIDE_FILE.read_text(encoding="utf-8").strip()
         if not raw:
             return state
+        # "Until I cancel" on the dashboard writes this sentinel instead of a
+        # timestamp (added 2026-09-08 to dvr-dashboard and dvr-clean-shutdown --
+        # and missed here, so the 2026-09-12 digest reported "NO active shutdown
+        # override" while the host was in fact held indefinitely).
+        if raw == "indefinite":
+            state["active"] = True
+            state["expiry"] = None
+            state["expiry_str"] = "cancelled"
+            state["description"] = ("Active keep-awake hold with NO expiry (\"Until I cancel\" on the "
+                                    "dashboard). Nightly clean shutdown is suppressed on every night "
+                                    "until the override is cancelled.")
+            return state
         expiry = datetime.fromisoformat(raw)
         if expiry.tzinfo is None:
             expiry = expiry.replace(tzinfo=LOCAL_TZ)
@@ -318,8 +330,9 @@ def evaluate_scheduled_recordings(
 
         # Check if active override safely covers this recording's completion
         override_covers = False
-        if needs_pwr and override_state["active"] and override_state["expiry"]:
-            if override_state["expiry"] >= padded_end:
+        if needs_pwr and override_state["active"]:
+            # An indefinite hold has no expiry and covers every window.
+            if override_state["expiry"] is None or override_state["expiry"] >= padded_end:
                 override_covers = True
 
         timers.append({
@@ -653,7 +666,8 @@ def render_email(report: dict[str, Any], agy_diag: dict[str, str] | None = None)
     # Build concise subject line
     if is_clear:
         if report["override_state"]["active"]:
-            ov_exp = report["override_state"]["expiry"].strftime("%a %d %b %H:%M")
+            exp = report["override_state"]["expiry"]
+            ov_exp = exp.strftime("%a %d %b %H:%M") if exp else "cancelled"
             subject = f"[DVR PRE-FLIGHT] ALL CLEAR: {num_timers} recording(s) scheduled (Override active until {ov_exp})"
         else:
             subject = f"[DVR PRE-FLIGHT] ALL CLEAR: {num_timers} recording(s) scheduled (Next 48h)"

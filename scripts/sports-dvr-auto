@@ -264,6 +264,18 @@ EPG_DB = Path("/var/lib/dvr-dashboard/epg.db")
 # Titles that mean "this channel is not broadcasting anything" -- an off-air
 # slate, a test card, or a placeholder row. Booking one wastes the single tuner
 # for the whole window and produces a file of nothing.
+# Placeholder rows the EPG builder emits for channels that publish no
+# schedule (Big Ten, some RSNs): a 4h block titled with the channel name and
+# an overview of "Plays around the clock -- no schedule data published."
+# They are real rows in the guide, so containment matching happily binds a
+# timer to one -- which is how the Badgers timer got re-anchored to a
+# 22:00-02:00 filler block on 2026-09-11 and would have stopped 75 minutes into
+# the game. A placeholder must never be a match target.
+SYNTHETIC_PROGRAMME_RE = re.compile(
+    r"(no\s+schedule\s+data|plays\s+around\s+the\s+clock|placeholder|platzhalter|"
+    r"sendepause|no\s+live\s+event|off\s*[- ]?air)",
+    re.IGNORECASE)
+
 OFF_AIR_TITLE_RE = re.compile(
     r"(sendepause|sendeschluss|programmende|kein\s+programm|no\s+live\s+event|"
     r"es\s+folgt|test\s*card|testbild|off\s*[- ]?air|placeholder|platzhalter)",
@@ -1005,6 +1017,12 @@ def find_matching_program_id(channel_id: str, game_start: datetime) -> str | Non
     containment_id = None
     for p in programs.get("Items", []):
         if p.get("ChannelId") != channel_id:
+            continue
+        # A synthetic filler block is never the programme we are looking for,
+        # however neatly it contains the kickoff. Binding a timer to one
+        # rewrites the timer's window to the block's, which is exactly the
+        # 2026-09-11 Badgers failure. Skip before either match path sees it.
+        if SYNTHETIC_PROGRAMME_RE.search(f"{p.get('Name', '')} {p.get('Overview', '')}"):
             continue
         try:
             p_start = datetime.fromisoformat(str(p["StartDate"]).replace("Z", "+00:00"))
