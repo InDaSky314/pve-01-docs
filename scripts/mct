@@ -84,10 +84,48 @@ PROVIDER_BLOCK_RE = re.compile(
     re.IGNORECASE)
 BOUNCE_AFTER_DEAD_SEGMENTS = 2
 BOUNCE_COOLDOWN_SEC = 600.0
+# Provider stream ids used to tell "this exit is blocked" from "this channel
+# is down". Both present as 5XX on the channel being captured; only the first
+# is fixed by a tunnel bounce. On 2026-09-13 the Big Ten feed was dead on the
+# provider's side and the guard bounced anyway -- twice, the first landing in
+# a known-bad range -- for nothing. Before bouncing, pull a few hundred KB from
+# a reference channel over the same exit: if that streams, the exit is fine.
+# Milwaukee Brewers HD and LA NBC 4 both streamed cleanly during that incident.
+TUNNEL_REFERENCE_STREAM_IDS = ("1904210", "1819976")
+
+
+def exit_is_actually_blocked(failing_url: str) -> tuple[bool, str]:
+    """Probe reference channels over the current exit. True only if THEY fail too.
+
+    Builds the reference URL from the failing one by swapping the stream id,
+    so no credential handling happens here. Fails towards "blocked" if no
+    reference can be built -- the pre-existing behaviour.
+    """
+    m = re.match(r"^(.*/)\d+\.ts$", failing_url or "")
+    if not m:
+        return True, "could not derive a reference URL; assuming blocked"
+    base = m.group(1)
+    for sid in TUNNEL_REFERENCE_STREAM_IDS:
+        if failing_url.endswith(f"/{sid}.ts"):
+            continue
+        try:
+            r = subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
+                                f"curl -sL --max-time 8 -r 0-500000 '{base}{sid}.ts' -o /tmp/mct-ref.ts "
+                                f"-w '%{{http_code}}'; s=$(stat -c %s /tmp/mct-ref.ts 2>/dev/null || echo 0); "
+                                f"rm -f /tmp/mct-ref.ts; echo \" $s\""],
+                               capture_output=True, text=True, timeout=25)
+            parts = (r.stdout or "").split()
+            code = parts[0] if parts else "?"
+            size = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            if code.startswith("2") and size >= 200_000:
+                return False, f"reference stream {sid} answered {code} with {size} bytes -- exit is fine"
+        except Exception:                                      # noqa: BLE001
+            continue
+    return True, "reference streams failed too -- exit looks blocked"
 
 
 def maybe_bounce_blocked_exit(consecutive_dead: int, err_msg: str, state: dict,
-                              enabled: bool = True) -> bool:
+                              enabled: bool = True, failing_url: str = "") -> bool:
     """Ask network-triage for a fresh exit IP when the provider is refusing streams.
 
     Fires only on consecutive DEAD segments, so nothing is being captured at the
@@ -110,8 +148,14 @@ def maybe_bounce_blocked_exit(consecutive_dead: int, err_msg: str, state: dict,
         return False
     state["last_attempt"] = now
 
+    blocked, verdict = exit_is_actually_blocked(failing_url)
+    if not blocked:
+        log(f"[Tunnel-Guard] {consecutive_dead} consecutive dead segments with a provider block "
+            f"in the error text, but {verdict}. This is the CHANNEL, not the exit -- not bouncing.")
+        return False
+
     log(f"[Tunnel-Guard] {consecutive_dead} consecutive dead segments with a provider "
-        f"block in the error text. Asking network-triage for a fresh exit IP...")
+        f"block in the error text; {verdict}. Asking network-triage for a fresh exit IP...")
     try:
         r = subprocess.run(
             ["/usr/local/bin/network-triage", "--fix-tunnel", "--tunnel-bounce-reason",
@@ -571,6 +615,122 @@ def find_espn_fixture_by_description(desc: str, start_dt: datetime,
         if best is None or drift < best[0]:
             best = (drift, g)
     return best[1] if best else None
+
+
+# --- Content guard: is the stream the game, or a slate on a loop? -------------
+# On 2026-09-13 the Badgers capture recorded 1,744 byte-identical five-second
+# segments -- 24 GB of the provider's "channel unavailable" clip -- because
+# every one of them was >1 MB and exited 0, which the restart guard reads as a
+# legitimate content reset. Nothing in the loop asked whether the bytes were
+# the same bytes as last time. The three BTN overflow channels in the lineup
+# were never tried.
+#
+# Three deterministic signals, no ML: (1) consecutive segments with an
+# identical leading fingerprint; (2) consecutive segments that reach EOF with
+# rc 0 in seconds -- live streams do not end; (3) for candidate alternates, a
+# frozen-frame check so a static "offline" card that is not byte-identical is
+# still rejected. When a slate is confirmed, try same-network alternates
+# between segments (the tuner is free then), and escalate the backoff instead
+# of hammering at 5s.
+SLATE_FINGERPRINT_BYTES = 1_000_000
+SLATE_IDENTICAL_STREAK = 3        # segments with the same fingerprint => slate
+SLATE_SHORT_SEGMENT_SEC = 30.0    # rc 0 faster than this is a suspect EOF
+SLATE_SHORT_STREAK = 5            # ... this many in a row => slate
+SLATE_PROBE_BYTES = 1_500_000
+SLATE_FAILOVER_COOLDOWN_SEC = 300.0
+
+
+def segment_fingerprint(ct_path: str) -> str:
+    """md5 of the first SLATE_FINGERPRINT_BYTES of a file inside CT 105."""
+    try:
+        r = subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
+                            f"head -c {SLATE_FINGERPRINT_BYTES} '{ct_path}' | md5sum"],
+                           capture_output=True, text=True, timeout=30)
+        return (r.stdout or "").split()[0] if r.returncode == 0 and r.stdout.strip() else ""
+    except Exception:                                          # noqa: BLE001
+        return ""
+
+
+def sample_is_frozen(container_path: str) -> tuple[bool, str]:
+    """Does this sample hold a static picture? ffmpeg freezedetect, no decode to disk.
+
+    A slate that is NOT byte-identical (a clock, a spinner) still shows as one
+    long freeze. Fails OPEN (not frozen) on any error, so a probe hiccup can
+    never reject a real feed.
+    """
+    try:
+        r = subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "docker", "exec", "jellyfin",
+                            "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-v", "info", "-t", "8",
+                            "-i", container_path, "-an",
+                            "-vf", "freezedetect=n=-50dB:d=3", "-f", "null", "-"],
+                           capture_output=True, text=True, timeout=60)
+        err = r.stderr or ""
+        starts = err.count("freeze_start")
+        ends = err.count("freeze_end")
+        if starts and not ends:
+            return True, "one continuous frozen picture across the sample"
+        return False, f"{starts} freeze event(s), {ends} resumed"
+    except Exception as exc:                                   # noqa: BLE001
+        return False, f"freezedetect unavailable ({exc})"
+
+
+def find_alternate_channels(ch: dict[str, str], channels: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Other feeds of the same network, by name: "Big Ten" -> the BTN Overflow
+    channels, "Sky Sport Bundesliga 2" -> its Mobil/Sat variants. Two leading
+    words is the narrowest prefix that still groups these; a single word would
+    lump every "Sky" channel together."""
+    words = [w.lower() for w in re.findall(r"[A-Za-z0-9]+", ch.get("name", ""))]
+    if not words:
+        return []
+    # Require as many shared leading words as the primary has, up to three.
+    # "Big Ten" (2 words) admits the BTN Overflow channels on 2; "Sky Sport
+    # Bundesliga 2 HD" needs 3, which keeps "Sky Sport News" -- live, and
+    # exactly the wrong thing to fail over to -- out. Most-similar first.
+    need = min(3, len(words))
+    scored = []
+    for c in channels:
+        if c.get("chno") == ch.get("chno"):
+            continue
+        cw = [w.lower() for w in re.findall(r"[A-Za-z0-9]+", c.get("name", ""))]
+        shared = 0
+        for a, b in zip(words, cw):
+            if a != b:
+                break
+            shared += 1
+        if shared >= need:
+            scored.append((shared, c))
+    scored.sort(key=lambda t: -t[0])
+    return [c for _, c in scored]
+
+
+def probe_channel_live(c: dict[str, str], slate_fp: str) -> tuple[bool, str]:
+    """Pull a short sample and decide whether it is a live feed.
+
+    Runs between segments, when the capture's own connection is closed, so it
+    does not contend with it on the single tuner.
+    """
+    tmp = f"/tmp/mct-probe-{c.get('chno','x')}.ts"
+    try:
+        r = subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
+                            f"curl -sL --max-time 10 -r 0-{SLATE_PROBE_BYTES} '{c['url']}' -o {tmp} "
+                            f"-w '%{{http_code}}' && stat -c %s {tmp}"],
+                           capture_output=True, text=True, timeout=30)
+        parts = (r.stdout or "").split()
+        code, size = (parts[0] if parts else "?"), (int(parts[1]) if len(parts) > 1 else 0)
+        if size < 200_000:
+            return False, f"http {code}, only {size} bytes"
+        fp = segment_fingerprint(tmp)
+        if slate_fp and fp == slate_fp:
+            return False, "same slate as the primary"
+        frozen, why = sample_is_frozen(tmp)
+        if frozen:
+            return False, f"static picture ({why})"
+        return True, f"http {code}, {size} bytes, moving picture"
+    except Exception as exc:                                   # noqa: BLE001
+        return False, f"probe error ({exc})"
+    finally:
+        subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "rm", "-f", tmp],
+                       capture_output=True, timeout=15)
 
 
 def find_espn_fixture(title: str, channel_name: str, start_dt: datetime, games: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -1567,6 +1727,14 @@ def main() -> int:
     restart_count = 0
     consecutive_dead_restarts = 0
     bounce_state: dict = {}
+    # Content-guard state (see segment_fingerprint et al.).
+    last_fp = ""
+    identical_streak = 0
+    short_eof_streak = 0
+    slate_fp = ""
+    slate_streak = 0                 # feeds the backoff once a slate is confirmed
+    seg_launch_mono = time.monotonic()
+    failover_state: dict = {"tried": set(), "last": None}
     segment_idx = 1
     start_mono = time.monotonic()
     interrupted = [False]
@@ -1629,6 +1797,7 @@ def main() -> int:
                 log(f"[Restart-Guard] Launching segment {segment_idx} (target duration: {remaining_sec}s, output: {seg_raw_path})")
 
             ffmpeg_err_f = open(ffmpeg_err_path, "wb")
+            seg_launch_mono = time.monotonic()
             p = subprocess.Popen(seg_ffmpeg_cmd, stdin=subprocess.PIPE,
                                  stdout=subprocess.DEVNULL, stderr=ffmpeg_err_f)
             current_p[0] = p
@@ -1784,7 +1953,8 @@ def main() -> int:
                 # escalated to. If the new exit is blocked too, the streak simply
                 # rebuilds and the cooldown stops us asking again immediately.
                 if maybe_bounce_blocked_exit(consecutive_dead_restarts, last_err_msg,
-                                             bounce_state, enabled=not args.no_tunnel_bounce):
+                                             bounce_state, enabled=not args.no_tunnel_bounce,
+                                             failing_url=ch.get("url", "")):
                     consecutive_dead_restarts = 0
             else:
                 consecutive_dead_restarts = 0
@@ -1794,8 +1964,72 @@ def main() -> int:
                     renamed_ct = f"/srv/media-core{renamed_seg1}"
                     subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "mv", "-f", seg_ct_path, renamed_ct], check=True)
                     seg_raw_path = renamed_seg1
-                segment_paths.append(seg_raw_path)
-                log(f"[Restart-Guard] Segment {segment_idx} preserved ({seg_size} bytes): {seg_raw_path}")
+                    seg_ct_path = renamed_ct
+
+                # --- Content guard -------------------------------------------
+                seg_elapsed = time.monotonic() - seg_launch_mono
+                fp = segment_fingerprint(seg_ct_path)
+                identical_streak = identical_streak + 1 if (fp and fp == last_fp) else 0
+                last_fp = fp
+                short_eof_streak = (short_eof_streak + 1
+                                    if (p.returncode == 0 and seg_elapsed < SLATE_SHORT_SEGMENT_SEC)
+                                    else 0)
+                is_slate = (identical_streak >= SLATE_IDENTICAL_STREAK - 1
+                            or short_eof_streak >= SLATE_SHORT_STREAK)
+
+                if not is_slate:
+                    slate_streak = 0
+                    segment_paths.append(seg_raw_path)
+                    log(f"[Restart-Guard] Segment {segment_idx} preserved ({seg_size} bytes): {seg_raw_path}")
+                else:
+                    slate_streak += 1
+                    slate_fp = fp or slate_fp
+                    why = (f"{identical_streak + 1} consecutive segments with identical content"
+                           if identical_streak >= SLATE_IDENTICAL_STREAK - 1
+                           else f"{short_eof_streak} consecutive segments reached EOF in under "
+                                f"{SLATE_SHORT_SEGMENT_SEC:.0f}s")
+                    log(f"[Content-Guard] Segment {segment_idx} is NOT the programme: {why}. "
+                        f"Not keeping it ({seg_size} bytes, {seg_elapsed:.0f}s).")
+                    # Drop the earlier copies of the same slate we already kept,
+                    # so the stitch never contains it. They sit at the tail.
+                    pruned = 0
+                    while segment_paths:
+                        tail_fp = segment_fingerprint(f"/srv/media-core{segment_paths[-1]}")
+                        if tail_fp and tail_fp == slate_fp:
+                            segment_paths.pop(); pruned += 1
+                        else:
+                            break
+                    if pruned:
+                        log(f"[Content-Guard] Removed {pruned} earlier slate segment(s) from the stitch list.")
+                    if slate_streak == 1:
+                        ch_label = f"{ch.get('chno', '?')} {ch.get('name', '?')}"
+                        push_loki_alert(f"level=alert source=mct msg='Content guard: {title} on "
+                                        f"{ch_label} is a slate ({why}); trying alternates'")
+
+                    # Fail over to another feed of the same network, if one is live.
+                    now_m = time.monotonic()
+                    last_fo = failover_state["last"]
+                    if last_fo is None or (now_m - last_fo) >= SLATE_FAILOVER_COOLDOWN_SEC:
+                        failover_state["last"] = now_m
+                        cands = [c for c in find_alternate_channels(ch, channels)
+                                 if c.get("chno") not in failover_state["tried"]]
+                        if not cands:
+                            log("[Content-Guard] No untried same-network alternates in the lineup.")
+                        for cand in cands:
+                            failover_state["tried"].add(cand.get("chno"))
+                            ok, detail = probe_channel_live(cand, slate_fp)
+                            log(f"[Content-Guard] Probe {cand.get('chno')} {cand.get('name')}: "
+                                f"{'LIVE' if ok else 'no'} -- {detail}")
+                            if ok:
+                                log(f"[Content-Guard] FAILING OVER {ch.get('chno')} {ch.get('name')} -> "
+                                    f"{cand.get('chno')} {cand.get('name')}")
+                                cand_label = f"{cand.get('chno', '?')} {cand.get('name', '?')}"
+                                push_loki_alert(f"level=warn source=mct msg='{title}: failed over to "
+                                                f"{cand_label} after slate on {ch.get('chno', '?')}'")
+                                ch = cand
+                                identical_streak = short_eof_streak = slate_streak = 0
+                                last_fp = ""
+                                break
 
             if not args.restart_and_stitch:
                 log("[Supervisor] Restart-and-stitch disabled. Ending capture.")
@@ -1813,7 +2047,7 @@ def main() -> int:
                 break
 
             current_backoff = get_adaptive_backoff(
-                consecutive_dead=consecutive_dead_restarts,
+                consecutive_dead=max(consecutive_dead_restarts, slate_streak),
                 base_backoff=args.restart_backoff,
                 initial_dead=args.initial_dead_backoff,
                 max_backoff=args.max_backoff,

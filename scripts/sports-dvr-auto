@@ -32,6 +32,7 @@ import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from datetime import time as dtime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -69,6 +70,13 @@ EVENT_LOG_FILE = Path("/var/lib/dvr-dashboard/dvr-automation-events.jsonl")
 
 # Early completion recovery settings (2026-09-05)
 MCT_BOOKINGS_FILE = Path("/var/lib/dvr-dashboard/mct-bookings.json")
+# Owner's rule (2026-09-13): any game that STARTS past midnight local time is
+# recorded by MCT, not Jellyfin. The overnight games are the ones nobody is
+# awake to rescue, and MCT is the engine with reconnect, restart-and-stitch,
+# ESPN supervision and now content checking; Jellyfin's recorder is a raw
+# byte copy with none of that. Window is [00:00, mains power-on).
+MCT_OVERNIGHT_FROM = dtime(0, 0)
+MCT_OVERNIGHT_UNTIL = dtime(5, 5)
 OPENLIGADB_BASE = "https://api.openligadb.de/getmatchdata"
 MAX_EARLY_COMPLETE_ATTEMPTS = 4
 EARLY_COMPLETE_MIN_RETRY_INTERVAL = timedelta(minutes=2)
@@ -1037,6 +1045,82 @@ def find_matching_program_id(channel_id: str, game_start: datetime) -> str | Non
     return best_id or containment_id
 
 
+
+def starts_overnight(game: dict[str, Any]) -> bool:
+    t = game["start"].astimezone(LOCAL_TZ).time()
+    return MCT_OVERNIGHT_FROM <= t < MCT_OVERNIGHT_UNTIL
+
+
+def _channel_number_for(name: str) -> str:
+    """Channel number from the EPG lineup table, by exact name. Empty if unknown;
+    mct resolves by name in that case."""
+    try:
+        con = sqlite3.connect(f"file:{EPG_DB}?mode=ro", uri=True)
+        row = con.execute("select number from channels where name = ? limit 1", (name,)).fetchone()
+        con.close()
+        return str(row[0]) if row and row[0] else ""
+    except Exception:                                          # noqa: BLE001
+        return ""
+
+
+def schedule_mct_booking(game: dict[str, Any], channel_name: str, dry_run: bool = True) -> bool:
+    """Book a game through MCT by appending to mct-bookings.json in the
+    dashboard's own schema. mct-scheduler launches it at T-5 min.
+
+    Idempotent by construction: mct_booking_conflict() runs before every
+    scheduling decision, so a window MCT already owns is never booked twice.
+    """
+    name = f"{game['team']}: {game['name']}"
+    chno = _channel_number_for(channel_name)
+    start_dt = game["start"].astimezone(LOCAL_TZ)
+    end_dt = game["end"].astimezone(LOCAL_TZ)
+    entry = {
+        "id": str(game.get("id") or f"mct-{int(start_dt.timestamp())}"),
+        "channel": chno or channel_name,
+        "title": name,
+        "name": name,
+        "start": start_dt.isoformat(),
+        "end": end_dt.isoformat(),
+        "duration_sec": int((end_dt - start_dt).total_seconds()),
+        "status": "booked",
+        "created_at": datetime.now(LOCAL_TZ).isoformat(),
+        "team": game.get("team"),
+        "channel_number": chno,
+        "channel_name": channel_name,
+        "channel_display": f"{chno} {channel_name}".strip(),
+        "category": "Sports",
+        "genre": "Sports",
+        "engine": "mct",
+        "window_source": "auto-overnight",
+        "fixed_pad": 900,
+    }
+    logging.info("[SCHEDULE] Overnight game -> MCT: %s on %s (%s to %s)",
+                 name, entry["channel_display"], start_dt.strftime("%a %H:%M"), end_dt.strftime("%H:%M"))
+    if dry_run:
+        logging.info("  [DRY-RUN] Would append to %s", MCT_BOOKINGS_FILE)
+        return True
+    try:
+        bookings = json.loads(MCT_BOOKINGS_FILE.read_text()) if MCT_BOOKINGS_FILE.exists() else []
+        if not isinstance(bookings, list):
+            bookings = []
+        if any(b.get("id") == entry["id"] and b.get("status") not in ("cancelled", "done", "failed")
+               for b in bookings):
+            logging.info("[SCHEDULE] MCT booking %s already exists; not duplicating", entry["id"])
+            return False
+        bookings.append(entry)
+        tmp = MCT_BOOKINGS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(bookings, indent=2) + "\n")
+        tmp.replace(MCT_BOOKINGS_FILE)
+        log_event("mct_booking_scheduled", None, name, {
+            "channel": entry["channel_display"], "start": entry["start"], "end": entry["end"],
+            "reason": "starts past midnight local time",
+        }, dry_run=False)
+        return True
+    except Exception as exc:                                   # noqa: BLE001
+        logging.error("[SCHEDULE] Could not write MCT booking for %s: %s", name, exc)
+        return False
+
+
 def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str, dry_run: bool = True,
                         name_suffix: str = "") -> bool:
     """Create a Jellyfin LiveTv timer for a game.
@@ -1299,7 +1383,10 @@ def run_auto_scheduler(dry_run: bool = True, games: list[dict[str, Any]] | None 
                          game["name"], game["team"], mct_reason)
             continue
 
-        schedule_game_timer(game, cid, cname, dry_run=dry_run)
+        if starts_overnight(game):
+            schedule_mct_booking(game, cname, dry_run=dry_run)
+        else:
+            schedule_game_timer(game, cid, cname, dry_run=dry_run)
 
 
 # Letters the guide and ESPN spell differently for the same club. Bodo/Glimt
