@@ -91,10 +91,11 @@ BOUNCE_COOLDOWN_SEC = 600.0
 # a known-bad range -- for nothing. Before bouncing, pull a few hundred KB from
 # a reference channel over the same exit: if that streams, the exit is fine.
 # Milwaukee Brewers HD and LA NBC 4 both streamed cleanly during that incident.
-TUNNEL_REFERENCE_STREAM_IDS = ("1904210", "1819976")
+TUNNEL_REFERENCE_CHANNEL_NAMES = ("Milwaukee Brewers HD", "Los Angeles: NBC 4 (KNBC)")
+TUNNEL_REFERENCE_STREAM_IDS = ("1904210", "1819976")   # last resort if names are not in the lineup
 
 
-def exit_is_actually_blocked(failing_url: str) -> tuple[bool, str]:
+def exit_is_actually_blocked(failing_url: str, channels: list[dict[str, str]] | None = None) -> tuple[bool, str]:
     """Probe reference channels over the current exit. True only if THEY fail too.
 
     Builds the reference URL from the failing one by swapping the stream id,
@@ -105,12 +106,22 @@ def exit_is_actually_blocked(failing_url: str) -> tuple[bool, str]:
     if not m:
         return True, "could not derive a reference URL; assuming blocked"
     base = m.group(1)
-    for sid in TUNNEL_REFERENCE_STREAM_IDS:
-        if failing_url.endswith(f"/{sid}.ts"):
-            continue
+    # Prefer references resolved by name from the current playlist, so a
+    # provider renumbering does not silently turn this check into a no-op
+    # (agy review, 2026-09-13). Hardcoded ids only if the names are gone.
+    ref_urls: list[tuple[str, str]] = []
+    for name in TUNNEL_REFERENCE_CHANNEL_NAMES:
+        for c in (channels or []):
+            if c.get("name") == name and c.get("url") and c["url"] != failing_url:
+                ref_urls.append((name, c["url"]))
+                break
+    if not ref_urls:
+        ref_urls = [(sid, f"{base}{sid}.ts") for sid in TUNNEL_REFERENCE_STREAM_IDS
+                    if not failing_url.endswith(f"/{sid}.ts")]
+    for sid, ref_url in ref_urls:
         try:
             r = subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
-                                f"curl -sL --max-time 8 -r 0-500000 '{base}{sid}.ts' -o /tmp/mct-ref.ts "
+                                f"curl -sL --max-time 8 -r 0-500000 '{ref_url}' -o /tmp/mct-ref.ts "
                                 f"-w '%{{http_code}}'; s=$(stat -c %s /tmp/mct-ref.ts 2>/dev/null || echo 0); "
                                 f"rm -f /tmp/mct-ref.ts; echo \" $s\""],
                                capture_output=True, text=True, timeout=25)
@@ -125,7 +136,8 @@ def exit_is_actually_blocked(failing_url: str) -> tuple[bool, str]:
 
 
 def maybe_bounce_blocked_exit(consecutive_dead: int, err_msg: str, state: dict,
-                              enabled: bool = True, failing_url: str = "") -> bool:
+                              enabled: bool = True, failing_url: str = "",
+                              channels: list[dict[str, str]] | None = None) -> bool:
     """Ask network-triage for a fresh exit IP when the provider is refusing streams.
 
     Fires only on consecutive DEAD segments, so nothing is being captured at the
@@ -148,7 +160,7 @@ def maybe_bounce_blocked_exit(consecutive_dead: int, err_msg: str, state: dict,
         return False
     state["last_attempt"] = now
 
-    blocked, verdict = exit_is_actually_blocked(failing_url)
+    blocked, verdict = exit_is_actually_blocked(failing_url, channels)
     if not blocked:
         log(f"[Tunnel-Guard] {consecutive_dead} consecutive dead segments with a provider block "
             f"in the error text, but {verdict}. This is the CHANNEL, not the exit -- not bouncing.")
@@ -701,6 +713,63 @@ def find_alternate_channels(ch: dict[str, str], channels: list[dict[str, str]]) 
             scored.append((shared, c))
     scored.sort(key=lambda t: -t[0])
     return [c for _, c in scored]
+
+
+EPG_DB_PATH = "/var/lib/dvr-dashboard/epg.db"
+_GUIDE_STOP = {"live", "the", "and", "vs", "versus", "at", "football", "soccer", "game", "week"}
+
+
+def _guide_says_about(chno: str, start_dt: datetime, end_dt: datetime) -> list[str]:
+    """Programme titles+descriptions the guide lists for a channel across a window.
+    Empty list means the guide has nothing for that channel (schedule-less
+    network) -- which is different from listing something else."""
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{EPG_DB_PATH}?mode=ro", uri=True)
+        lo = start_dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+        hi = end_dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+        rows = con.execute(
+            """select p.title, coalesce(p.desc,'') from programmes p
+                 join channels c on c.id = p.channel_id
+                where c.number = ? and p.stop_local > ? and p.start_local < ?""",
+            (str(chno), lo, hi)).fetchall()
+        con.close()
+        # A synthetic filler row ("Plays around the clock -- no schedule data
+        # published", "Sendepause") is the guide saying it knows nothing, not
+        # the guide naming a different programme. Treat it as no listing.
+        return [f"{t} {d}" for t, d in rows
+                if not _SYNTHETIC_ROW_RE.search(f"{t} {d}")]
+    except Exception:                                          # noqa: BLE001
+        return []
+
+
+_SYNTHETIC_ROW_RE = re.compile(
+    r"(no\s+schedule\s+data|plays\s+around\s+the\s+clock|placeholder|platzhalter|"
+    r"sendepause|no\s+live\s+event|off\s*[- ]?air)", re.IGNORECASE)
+
+
+def alternate_carries_fixture(cand: dict[str, str], title: str,
+                              start_dt: datetime, end_dt: datetime) -> tuple[str, str]:
+    """('verified' | 'unverified' | 'wrong', why).
+
+    agy's review (2026-09-13, A.3) made the point that matters: a live,
+    moving, non-slate picture on "Big Ten Network Overflow 2" is very likely
+    a DIFFERENT Big Ten game. Before switching, ask the guide. If it names
+    our teams -> verified. If it names something else -> wrong, skip. If it
+    has nothing for that channel (BTN publishes no schedule) -> unverified:
+    fail over anyway, because the alternative is recording nothing, but say
+    so loudly so nobody mistakes it for a confirmed match.
+    """
+    want = {w.lower() for w in re.findall(r"[A-Za-z]{4,}", title or "") if w.lower() not in _GUIDE_STOP}
+    texts = _guide_says_about(cand.get("chno", ""), start_dt, end_dt)
+    if not texts:
+        return "unverified", "guide has no listing for this channel"
+    for t in texts:
+        toks = {w.lower() for w in re.findall(r"[A-Za-z]{4,}", t)}
+        hits = want & toks
+        if len(hits) >= 2:
+            return "verified", f"guide names {', '.join(sorted(hits))}"
+    return "wrong", f"guide lists something else: {texts[0][:60]!r}"
 
 
 def probe_channel_live(c: dict[str, str], slate_fp: str) -> tuple[bool, str]:
@@ -1954,7 +2023,7 @@ def main() -> int:
                 # rebuilds and the cooldown stops us asking again immediately.
                 if maybe_bounce_blocked_exit(consecutive_dead_restarts, last_err_msg,
                                              bounce_state, enabled=not args.no_tunnel_bounce,
-                                             failing_url=ch.get("url", "")):
+                                             failing_url=ch.get("url", ""), channels=channels):
                     consecutive_dead_restarts = 0
             else:
                 consecutive_dead_restarts = 0
@@ -1974,8 +2043,21 @@ def main() -> int:
                 short_eof_streak = (short_eof_streak + 1
                                     if (p.returncode == 0 and seg_elapsed < SLATE_SHORT_SEGMENT_SEC)
                                     else 0)
-                is_slate = (identical_streak >= SLATE_IDENTICAL_STREAK - 1
-                            or short_eof_streak >= SLATE_SHORT_STREAK)
+                # Identical bytes are conclusive on their own: a live TS carries
+                # PCR/PTS, so two reconnects to a live feed never produce the same
+                # leading megabyte even of a static picture. Short EOFs are NOT
+                # conclusive -- an edge that closes every ~20s while serving real,
+                # unique video would trip it (agy A.1) -- so that path also has to
+                # show a frozen picture before anything is discarded.
+                is_slate = identical_streak >= SLATE_IDENTICAL_STREAK - 1
+                if not is_slate and short_eof_streak >= SLATE_SHORT_STREAK:
+                    frozen, fwhy = sample_is_frozen(seg_raw_path)
+                    if frozen:
+                        is_slate = True
+                    else:
+                        log(f"[Content-Guard] {short_eof_streak} short segments in a row but the picture "
+                            f"moves ({fwhy}); treating as a flaky edge, not a slate.")
+                        short_eof_streak = 0
 
                 if not is_slate:
                     slate_streak = 0
@@ -2017,10 +2099,21 @@ def main() -> int:
                             log("[Content-Guard] No untried same-network alternates in the lineup.")
                         for cand in cands:
                             failover_state["tried"].add(cand.get("chno"))
+                            # Ask the guide BEFORE spending a tuner connection on a probe.
+                            verdict, gwhy = alternate_carries_fixture(
+                                cand, title, start_dt, start_dt + timedelta(seconds=hard_cap_sec))
+                            if verdict == "wrong":
+                                log(f"[Content-Guard] Skip {cand.get('chno')} {cand.get('name')}: {gwhy}")
+                                continue
                             ok, detail = probe_channel_live(cand, slate_fp)
                             log(f"[Content-Guard] Probe {cand.get('chno')} {cand.get('name')}: "
-                                f"{'LIVE' if ok else 'no'} -- {detail}")
+                                f"{'LIVE' if ok else 'no'} -- {detail}; guide: {verdict} ({gwhy})")
                             if ok:
+                                if verdict == "unverified":
+                                    cand_label = f"{cand.get('chno', '?')} {cand.get('name', '?')}"
+                                    push_loki_alert(f"level=alert source=mct msg='{title}: UNVERIFIED failover "
+                                                    f"to {cand_label} -- guide has no listing, this may be a "
+                                                    f"different game. Check it.'")
                                 log(f"[Content-Guard] FAILING OVER {ch.get('chno')} {ch.get('name')} -> "
                                     f"{cand.get('chno')} {cand.get('name')}")
                                 cand_label = f"{cand.get('chno', '?')} {cand.get('name', '?')}"
@@ -2029,6 +2122,7 @@ def main() -> int:
                                 ch = cand
                                 identical_streak = short_eof_streak = slate_streak = 0
                                 last_fp = ""
+                                failover_state["just_switched"] = True
                                 break
 
             if not args.restart_and_stitch:
@@ -2052,6 +2146,11 @@ def main() -> int:
                 initial_dead=args.initial_dead_backoff,
                 max_backoff=args.max_backoff,
             )
+            if failover_state.pop("just_switched", False):
+                # The probe just held a connection on the single-slot account
+                # and the provider's session teardown lags. 5s is not enough
+                # (agy A.4); give it a moment before opening the new feed.
+                current_backoff = max(current_backoff, 20.0)
 
             if (rem_time - current_backoff) < args.min_restart_remaining:
                 log(f"[Supervisor] Remaining window ({rem_time}s) minus backoff ({current_backoff:.1f}s) below threshold ({args.min_restart_remaining}s). Ending capture.")

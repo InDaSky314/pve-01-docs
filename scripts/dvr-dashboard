@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import base64
 import hmac
+import fcntl
 import json
+import tempfile
 import os
 import re
 import socket
@@ -199,9 +201,15 @@ def load_mct_bookings() -> list[dict[str, Any]]:
 
 def save_mct_bookings(bookings: list[dict[str, Any]]) -> None:
     MCT_BOOKINGS.parent.mkdir(parents=True, exist_ok=True)
-    tmp = MCT_BOOKINGS.with_suffix(".tmp")
-    tmp.write_text(json.dumps(bookings, indent=2) + "\n")
-    tmp.replace(MCT_BOOKINGS)
+    # Three scripts write this file. Until 2026-09-13 all used the same .tmp
+    # name and no lock, so two writes in the same second clobbered each other
+    # (agy review C.4). Exclusive lock for the write, unique temp file.
+    with open(MCT_BOOKINGS.with_suffix(".lock"), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        fd, tmp = tempfile.mkstemp(dir=str(MCT_BOOKINGS.parent), prefix=".mct-bookings.", suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(bookings, indent=2) + "\n")
+        os.replace(tmp, MCT_BOOKINGS)
 
 CT = "105"
 JELLYFIN_URL = "http://127.0.0.1:8096"

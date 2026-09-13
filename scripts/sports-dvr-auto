@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import logging
 import re
 import shlex
@@ -1056,7 +1057,10 @@ def _channel_number_for(name: str) -> str:
     mct resolves by name in that case."""
     try:
         con = sqlite3.connect(f"file:{EPG_DB}?mode=ro", uri=True)
-        row = con.execute("select number from channels where name = ? limit 1", (name,)).fetchone()
+        # NOCASE: resolve_channel_id can return a lowercased name (jf_channels
+        # carries both cases and local_matches iterates them all -- agy C.1).
+        row = con.execute("select number from channels where name = ? collate nocase limit 1",
+                          (name,)).fetchone()
         con.close()
         return str(row[0]) if row and row[0] else ""
     except Exception:                                          # noqa: BLE001
@@ -1100,17 +1104,25 @@ def schedule_mct_booking(game: dict[str, Any], channel_name: str, dry_run: bool 
         logging.info("  [DRY-RUN] Would append to %s", MCT_BOOKINGS_FILE)
         return True
     try:
-        bookings = json.loads(MCT_BOOKINGS_FILE.read_text()) if MCT_BOOKINGS_FILE.exists() else []
-        if not isinstance(bookings, list):
-            bookings = []
-        if any(b.get("id") == entry["id"] and b.get("status") not in ("cancelled", "done", "failed")
-               for b in bookings):
-            logging.info("[SCHEDULE] MCT booking %s already exists; not duplicating", entry["id"])
-            return False
-        bookings.append(entry)
-        tmp = MCT_BOOKINGS_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(bookings, indent=2) + "\n")
-        tmp.replace(MCT_BOOKINGS_FILE)
+        import fcntl, tempfile
+        # dvr-dashboard and mct-scheduler write this file too, and until
+        # 2026-09-13 all three used the same .tmp name with no lock (agy C.4).
+        # Hold the shared lock across the whole read-modify-write.
+        lock_path = MCT_BOOKINGS_FILE.with_suffix(".lock")
+        with open(lock_path, "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            bookings = json.loads(MCT_BOOKINGS_FILE.read_text()) if MCT_BOOKINGS_FILE.exists() else []
+            if not isinstance(bookings, list):
+                bookings = []
+            if any(b.get("id") == entry["id"] and b.get("status") not in ("cancelled", "done", "failed")
+                   for b in bookings):
+                logging.info("[SCHEDULE] MCT booking %s already exists; not duplicating", entry["id"])
+                return False
+            bookings.append(entry)
+            fd, tmp = tempfile.mkstemp(dir=str(MCT_BOOKINGS_FILE.parent), prefix=".mct-bookings.", suffix=".json")
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(bookings, indent=2) + "\n")
+            os.replace(tmp, MCT_BOOKINGS_FILE)
         log_event("mct_booking_scheduled", None, name, {
             "channel": entry["channel_display"], "start": entry["start"], "end": entry["end"],
             "reason": "starts past midnight local time",
@@ -1356,9 +1368,12 @@ def run_auto_scheduler(dry_run: bool = True, games: list[dict[str, Any]] | None 
         # can't resolve until hours before kickoff (and may never label at
         # all), so the fallback must not be gated behind that resolution
         # succeeding.
-        if game["team"] in DYNAMIC_PPV_FALLBACK:
+        if game["team"] in DYNAMIC_PPV_FALLBACK and not starts_overnight(game):
             if ensure_dynamic_ppv_fallback(game, jf_channels, existing_timers, dry_run=dry_run):
                 existing_timers = get_existing_timers()
+        elif game["team"] in DYNAMIC_PPV_FALLBACK:
+            logging.info("[FALLBACK] %s starts overnight -> MCT owns it; no Jellyfin safety net "
+                         "(it would collide on the single tuner and nothing cancels it)", game["name"])
 
         cid, cname = resolve_channel_id(game, jf_channels)
         if not cid:
