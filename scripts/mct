@@ -283,6 +283,56 @@ def jf_api(endpoint: str, method: str = "GET", data: dict | None = None) -> dict
         return None
 
 
+# --- Live-TV pre-emption ------------------------------------------------------
+# The provider allows ONE connection and Threadfin is a redirector, so a viewer
+# on live TV and a recording each hold their own upstream connection -- even on
+# the same channel. On 2026-09-13 at 20:20 the living-room Streamer was on live
+# TV two hours before the Packers capture; had that continued, the capture
+# would have opened its connection into an account that was already full.
+# Owner's call: a scheduled recording outranks live viewing. Warn the screen,
+# give it a moment to be read, stop playback, then let the provider's session
+# teardown lag clear before the tuner is opened.
+PREEMPT_LEAD_SEC = 45          # act this long before the capture opens the tuner
+PREEMPT_MESSAGE_SEC = 12       # how long the on-screen warning shows before the stop
+
+
+def live_tv_sessions() -> list[dict[str, Any]]:
+    """Jellyfin sessions currently playing a LIVE channel."""
+    sessions = jf_api("/Sessions") or []
+    out = []
+    for sess in sessions if isinstance(sessions, list) else []:
+        now_playing = sess.get("NowPlayingItem") or {}
+        if now_playing.get("Type") == "TvChannel" or now_playing.get("IsLive"):
+            out.append(sess)
+    return out
+
+
+def preempt_live_viewers(title: str, channel_name: str) -> int:
+    """Stop live playback on every session so the capture can have the tuner.
+    Returns the number of sessions stopped."""
+    stopped = 0
+    for sess in live_tv_sessions():
+        sid = sess.get("Id")
+        who = f"{sess.get('UserName', '?')} on {sess.get('DeviceName', '?')}"
+        watching = (sess.get("NowPlayingItem") or {}).get("Name", "live TV")
+        log(f"[Pre-empt] {who} is watching {watching!r} live; the recording needs the single tuner.")
+        jf_api(f"/Sessions/{sid}/Message", method="POST", data={
+            "Header": "DVR recording starting",
+            "Text": (f"'{title}' starts recording in {PREEMPT_MESSAGE_SEC}s and needs the tuner. "
+                     f"Live TV will stop. Watch it under In Progress once it begins."),
+            "TimeoutMs": PREEMPT_MESSAGE_SEC * 1000,
+        })
+        time.sleep(PREEMPT_MESSAGE_SEC)
+        r = jf_api(f"/Sessions/{sid}/Playing/Stop", method="POST")
+        ok = r is not None
+        log(f"[Pre-empt] {'Stopped' if ok else 'FAILED to stop'} live playback for {who}.")
+        push_loki_alert(f"level=warn source=mct msg='Pre-empted live TV for {who} to record {title} on "
+                        f"{channel_name}' ")
+        if ok:
+            stopped += 1
+    return stopped
+
+
 def jf_get_image_bytes(item_id: str) -> bytes | None:
     token = get_jf_token()
     headers = {"Authorization": f'MediaBrowser Token="{token}"', "User-Agent": "MCT/1.0"}
@@ -1569,6 +1619,10 @@ def main() -> int:
                         help="Disable restart-and-stitch (single-shot mode)")
     parser.add_argument("--max-restarts", type=int, default=MAX_RESTARTS,
                         help="Maximum restart attempts (default: None, bounded only by window)")
+    parser.add_argument("--no-preempt", action="store_true",
+                        help="Do not stop live-TV playback on Jellyfin clients before opening the tuner. "
+                             "Default is to pre-empt: the provider allows one connection and a scheduled "
+                             "recording outranks live viewing.")
     parser.add_argument("--no-tunnel-bounce", action="store_true",
                         help="Do not ask network-triage for a fresh VPN exit IP when consecutive "
                              "segments die on a provider 5XX/511. Left on by default: the block is "
@@ -1776,7 +1830,18 @@ def main() -> int:
 
     if lead > 1 and not args.stream_url:
         log(f"Waiting {lead:.0f}s until {start_dt.isoformat()} before opening the tuner")
-        time.sleep(lead)
+        # Sleep up to PREEMPT_LEAD_SEC short of start, clear any live viewer,
+        # then sleep the remainder so the provider's session teardown has
+        # cleared before ffmpeg connects.
+        if not args.no_preempt and lead > PREEMPT_LEAD_SEC:
+            time.sleep(lead - PREEMPT_LEAD_SEC)
+            if preempt_live_viewers(title, ch.get("name", "")):
+                log(f"[Pre-empt] Waiting the remaining {PREEMPT_LEAD_SEC}s for the provider to release the connection.")
+            time.sleep(max(0.0, (start_dt - datetime.now(LOCAL_TZ)).total_seconds()))
+        else:
+            time.sleep(lead)
+            if not args.no_preempt:
+                preempt_live_viewers(title, ch.get("name", ""))
         ok, err = check_exclusion(start_dt.astimezone(timezone.utc), nominal_end_dt.astimezone(timezone.utc),
                                   getattr(args, 'booking_id', None))
         if not ok:
