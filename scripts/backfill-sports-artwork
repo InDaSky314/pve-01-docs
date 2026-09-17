@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Re-derive the ESPN fixture for every finished sports recording and give it a
+proper team-logo card (audit 2026-09-17). Runs on the host.
+
+For each <folder>/<basename>.mkv|.ts under Commercial Free/Sports - CF:
+  1. read <basename>.nfo -> title, aired date, plot
+  2. infer the league (mct.infer_espn_league) and find the fixture on that
+     day's scoreboard by team tokens in title+plot (mct's description matcher)
+  3. render <basename>-poster.jpg + <basename>-thumb.jpg via sports_card;
+     when the folder holds exactly one recording also write poster.jpg/thumb.jpg
+     (the generic ones), keeping any previous poster as poster.jpg.orig
+  4. ask Jellyfin to re-read the item's images -- it caches image paths and
+     hashes, so a file swap alone changes nothing on screen.
+
+--dry-run reports what it would do. --only <folder-substring> limits scope.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import re
+import sqlite3
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, "/usr/local/lib/media-core")
+import sports_card  # noqa: E402
+
+LOCAL_TZ = ZoneInfo("Europe/Berlin")
+CT = "105"
+ROOT = "/srv/media-core/media/recordings/Commercial Free/Sports - CF"
+JF = "http://127.0.0.1:8096"
+
+
+def load_mct():
+    ld = importlib.machinery.SourceFileLoader("mct", "/usr/local/bin/mct")
+    sp = importlib.util.spec_from_file_location("mct", "/usr/local/bin/mct", loader=ld)
+    m = importlib.util.module_from_spec(sp)
+    ld.exec_module(m)
+    return m
+
+
+def ct(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(["/usr/sbin/pct", "exec", CT, "--"] + cmd, capture_output=True, text=True, **kw)
+
+
+def ct_write(path: str, data: bytes) -> None:
+    subprocess.run(["/usr/sbin/pct", "exec", CT, "--", "sh", "-c", f"cat > '{path}'"], input=data, check=True)
+
+
+def list_recordings() -> list[tuple[str, str]]:
+    """(folder, basename) for every finished recording."""
+    r = ct(["find", ROOT, "-mindepth", "2", "-maxdepth", "2", "-type", "f",
+            "(", "-name", "*.mkv", "-o", "-name", "*.ts", ")"])
+    out = []
+    for line in r.stdout.splitlines():
+        p = Path(line.strip())
+        if p.name.endswith(".raw.ts"):
+            continue
+        out.append((str(p.parent), p.stem))
+    return sorted(out)
+
+
+def read_nfo(folder: str, base: str) -> dict:
+    r = ct(["cat", f"{folder}/{base}.nfo"])
+    if r.returncode != 0:
+        return {}
+    try:
+        root = ET.fromstring(r.stdout)
+    except ET.ParseError:
+        return {}
+    g = lambda tag: (root.findtext(tag) or "").strip()
+    return {"title": g("title"), "plot": g("plot"), "aired": g("aired") or g("premiered") or g("releasedate"),
+            "genres": [e.text or "" for e in root.findall("genre")]}
+
+
+def jf_token() -> str:
+    r = ct(["python3", "-c", "import sqlite3;c=sqlite3.connect('file:/srv/media-core/jellyfin/config/data/jellyfin.db?mode=ro',uri=True);r=list(c.execute('select AccessToken from ApiKeys limit 1'));print(r[0][0] if r else '')"])
+    return r.stdout.strip()
+
+
+def jf_refresh_images(token: str, folder: str, base: str) -> str:
+    """Find the item by path and force it to re-read images."""
+    path = f"/media/recordings/Commercial Free/Sports - CF/{Path(folder).name}"
+    q = urllib.parse.urlencode({"Recursive": "true", "IncludeItemTypes": "Movie,Video", "Fields": "Path",
+                                "SearchTerm": base[:40], "Limit": "20"})
+    r = ct(["curl", "-s", "--max-time", "30", "-H", f"X-Emby-Token: {token}", f"{JF}/Items?{q}"])
+    try:
+        items = json.loads(r.stdout).get("Items", [])
+    except Exception:  # noqa: BLE001
+        return "lookup failed"
+    hit = next((i for i in items if str(i.get("Path", "")).startswith(path)), None)
+    if not hit:
+        return "item not found in Jellyfin"
+    r = ct(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "30", "-X", "POST",
+            "-H", f"X-Emby-Token: {token}",
+            f"{JF}/Items/{hit['Id']}/Refresh?ImageRefreshMode=FullRefresh&ReplaceAllImages=true&MetadataRefreshMode=None"])
+    return f"refresh HTTP {r.stdout.strip()}"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--only", default="", help="substring of the folder name")
+    ap.add_argument("--force", action="store_true", help="redo folders that already have a card")
+    a = ap.parse_args()
+    mct = load_mct()
+    token = "" if a.dry_run else jf_token()
+
+    recs = list_recordings()
+    per_folder: dict[str, int] = {}
+    for f, _ in recs:
+        per_folder[f] = per_folder.get(f, 0) + 1
+
+    done = skipped = failed = 0
+    for folder, base in recs:
+        if a.only and a.only.lower() not in folder.lower():
+            continue
+        nfo = read_nfo(folder, base)
+        title = nfo.get("title") or Path(folder).name
+        m = re.search(r"(\d{4})-(\d{2})-(\d{2})", base) or re.search(r"(\d{4})-(\d{2})-(\d{2})", nfo.get("aired", ""))
+        if not m:
+            print(f"  SKIP {base}: no date"); skipped += 1; continue
+        day = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), 12, 0, tzinfo=LOCAL_TZ)
+        leagues = mct.infer_espn_leagues(title, nfo.get("plot", ""), " ".join(nfo.get("genres", [])), Path(folder).name)
+        if not leagues:
+            print(f"  SKIP {base}: cannot infer league from {title!r}"); skipped += 1; continue
+
+        # Try each candidate competition; accept the fixture on that day whose
+        # two competitors are BOTH named in title/plot/folder.
+        blob = f"{title} {nfo.get('plot','')} {Path(folder).name}".lower()
+        best, league = None, None
+        for cand in leagues:
+            for g in mct.load_espn_scoreboard(cand, day):
+                if abs((g["start"] - day).total_seconds()) > 20 * 3600:
+                    continue
+                comps = g.get("competitors") or []
+                if len(comps) == 2 and all(any(tok in blob for tok in mct._team_tokens(c)) for c in comps):
+                    if best is None or abs((g["start"] - day).total_seconds()) < abs((best["start"] - day).total_seconds()):
+                        best, league = g, cand
+            if best:
+                break
+        if not best:
+            print(f"  SKIP {base}: no fixture in {leagues} on {day:%Y-%m-%d} names both teams"); skipped += 1; continue
+
+        fx = sports_card.fixture_from_espn_event(best["_espn_event"], league)
+        existing = ct(["ls", folder]).stdout.split()
+        if not a.force and f"{base}-poster.jpg" in existing:
+            print(f"  ok   {base}: card already present"); continue
+        print(f"  CARD {base}  <-  {fx['name']}  ({fx['venue'] or 'no venue'})")
+        if a.dry_run:
+            done += 1; continue
+        try:
+            import tempfile
+            with tempfile.TemporaryDirectory() as td:
+                out = sports_card.render_cards(fx, Path(td), base)
+                poster = Path(out["poster"]).read_bytes(); thumb = Path(out["thumb"]).read_bytes()
+            ct_write(f"{folder}/{base}-poster.jpg", poster)
+            ct_write(f"{folder}/{base}-thumb.jpg", thumb)
+            if per_folder[folder] == 1:
+                for old in ("poster.jpg", "poster.png"):
+                    if old in existing and "poster.jpg.orig" not in existing:
+                        ct(["mv", "-n", f"{folder}/{old}", f"{folder}/poster.jpg.orig"])
+                        break
+                ct_write(f"{folder}/poster.jpg", poster)
+                ct_write(f"{folder}/thumb.jpg", thumb)
+            print(f"        wrote card; jellyfin: {jf_refresh_images(token, folder, base)}")
+            done += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"  FAIL {base}: {exc}"); failed += 1
+    print(f"\n{done} card(s), {skipped} skipped, {failed} failed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

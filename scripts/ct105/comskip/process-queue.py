@@ -454,8 +454,15 @@ def copy_sidecars(src_media, out_path):
             src = os.path.join(src_dir, fn)
             if not os.path.isfile(src):
                 continue
-            if low.startswith(("poster.", "folder.", "fanart.")):
+            # thumb/landscape added 2026-09-17: mct now writes a 16:9 thumb.jpg
+            # beside the 2:3 poster (sports card artwork). Without this the
+            # thumb was left in the raw folder and deleted by cleanup.
+            # <basename>-poster/-thumb are per-recording variants for folders
+            # holding several games; they are renamed to the output basename.
+            if low.startswith(("poster.", "folder.", "fanart.", "thumb.", "landscape.")):
                 dst = os.path.join(out_dir, fn)
+            elif os.path.splitext(fn)[0] in (src_base + "-poster", src_base + "-thumb"):
+                dst = os.path.join(out_dir, out_base + os.path.splitext(fn)[0][len(src_base):] + os.path.splitext(fn)[1])
             elif low.endswith(".nfo") and os.path.splitext(fn)[0] == src_base:
                 dst = os.path.join(out_dir, out_base + ".nfo")
             else:

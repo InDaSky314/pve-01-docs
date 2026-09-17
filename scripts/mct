@@ -536,6 +536,8 @@ def load_espn_schedule() -> list[dict[str, Any]]:
                     "state": status_type.get("state", "pre"),
                     "completed": bool(status_type.get("completed", False)),
                     "status_detail": status_type.get("detail") or status_type.get("shortDetail") or "",
+                    "_espn_event": event,
+                    "sport_path": sport_path,
                 })
     return games
 
@@ -567,13 +569,59 @@ ESPN_LEAGUE_PATTERNS: tuple[tuple[str, str], ...] = (
 _TEAM_STOPWORDS = {"city", "state", "united", "club", "town", "county", "real"}
 
 
-def infer_espn_league(*texts: str) -> str | None:
-    """Which ESPN league does this programme belong to? None if undecidable."""
+# A club name alone does not fix the competition -- Bayern plays the
+# Bundesliga, the Champions League and the DFB-Pokal in the same fortnight --
+# but it does fix the CANDIDATE set. When the text names a club and no
+# competition, try these in order until one day's scoreboard names both teams.
+CLUB_LEAGUE_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (r"bayern|m[uü]nchen|dortmund|leverkusen|leipzig|frankfurt|stuttgart|wolfsburg|"
+     r"gladbach|freiburg|hoffenheim|union berlin|bremen|augsburg|mainz|heidenheim|"
+     r"elversberg|st\.? ?pauli|hamburg|k[oö]ln|bochum|darmstadt|kiel",
+     ("soccer/ger.1", "soccer/uefa.champions", "soccer/ger.pokal", "soccer/uefa.europa")),
+    (r"bod[oø]|glimt|real madrid|barcelona|arsenal|liverpool|chelsea|man(chester)? (city|united)|"
+     r"psg|paris|juventus|inter|milan|atl[eé]tico|benfica|porto|ajax|celtic",
+     ("soccer/uefa.champions", "soccer/uefa.europa")),
+    (r"packers|vikings|bears|lions|chiefs|49ers|rams|cowboys|eagles|patriots|seahawks|"
+     r"steelers|ravens|bengals|bills|dolphins|jets|broncos|chargers|raiders|colts|"
+     r"texans|jaguars|titans|saints|falcons|panthers|buccaneers|giants|commanders|cardinals",
+     ("football/nfl",)),
+    (r"brewers|cubs|cardinals|reds|pirates|yankees|red sox|dodgers|giants|mets|braves|"
+     r"phillies|padres|astros|rangers|mariners|orioles|guardians|tigers|twins|royals|"
+     r"white sox|blue jays|rays|marlins|nationals|rockies|diamondbacks|angels|athletics",
+     ("baseball/mlb",)),
+    (r"bucks|celtics|lakers|knicks|bulls|heat|warriors|nuggets|suns|76ers|mavericks|"
+     r"clippers|cavaliers|pacers|timberwolves|thunder|kings|magic|hawks|pelicans|"
+     r"grizzlies|rockets|spurs|nets|raptors|pistons|hornets|wizards|jazz|blazers",
+     ("basketball/nba",)),
+    (r"badgers|wisconsin|leathernecks|eagles|notre dame|fighting irish|buckeyes|wolverines|"
+     r"nittany|hawkeyes|gophers|cornhuskers|illini|spartans|boilermakers|hoosiers|"
+     r"terrapins|scarlet knights|ducks|huskies|trojans|bruins",
+     ("football/college-football", "basketball/mens-college-basketball")),
+)
+
+
+def infer_espn_leagues(*texts: str) -> list[str]:
+    """Ordered candidate leagues for this programme text. Explicit competition
+    words win; otherwise club names narrow it; empty if undecidable."""
     blob = " ".join(t for t in texts if t).lower()
+    out: list[str] = []
     for pattern, sport_path in ESPN_LEAGUE_PATTERNS:
+        if re.search(pattern, blob) and sport_path not in out:
+            out.append(sport_path)
+    if out:
+        return out
+    for pattern, leagues in CLUB_LEAGUE_HINTS:
         if re.search(pattern, blob):
-            return sport_path
-    return None
+            for lg in leagues:
+                if lg not in out:
+                    out.append(lg)
+    return out
+
+
+def infer_espn_league(*texts: str) -> str | None:
+    """First candidate from infer_espn_leagues, kept for existing callers."""
+    c = infer_espn_leagues(*texts)
+    return c[0] if c else None
 
 
 def _team_tokens(name: str) -> set[str]:
@@ -610,15 +658,30 @@ def load_espn_scoreboard(sport_path: str, start_dt: datetime) -> list[dict[str, 
 
     games: list[dict[str, Any]] = []
     seen: set[str] = set()
-    url = (f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}"
-           f"/scoreboard?dates={lo}-{hi}")
-    try:
-        with urllib.request.urlopen(urllib.request.Request(url), timeout=12) as resp:
-            data = json.load(resp)
-    except Exception:
-        return hit[1] if hit else []
+    # One call per day, NOT the "dates=A-B" range form. The range form was
+    # adopted on 2026-09-13 on review advice and worked that day; by
+    # 2026-09-17 ESPN answers it with HTTP 400 for every client (curl too),
+    # which made this function return [] and every description-resolved
+    # fixture silently lose live supervision. Two cached single-date calls
+    # cost one extra request per 120s and do not depend on undocumented
+    # query syntax. Bodies are gunzipped if ESPN sends them compressed --
+    # sports-dvr-auto's journal shows it does, intermittently.
+    events: list[dict[str, Any]] = []
+    for day in {lo, (start_utc).strftime("%Y%m%d"), hi}:
+        url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/scoreboard?dates={day}"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url), timeout=12) as resp:
+                raw = resp.read()
+            if raw[:2] == b"\x1f\x8b":
+                import gzip
+                raw = gzip.decompress(raw)
+            events.extend(json.loads(raw).get("events", []))
+        except Exception:
+            continue
+    if not events and hit:
+        return hit[1]
     if True:
-        for event in data.get("events", []):
+        for event in events:
             eid = event.get("id")
             if not eid or eid in seen:
                 continue
@@ -642,6 +705,8 @@ def load_espn_scoreboard(sport_path: str, start_dt: datetime) -> list[dict[str, 
                 "state": status_type.get("state", "pre"),
                 "completed": bool(status_type.get("completed", False)),
                 "status_detail": status_type.get("detail") or status_type.get("shortDetail") or "",
+                "_espn_event": event,
+                "sport_path": sport_path,
             })
     _SCOREBOARD_CACHE[key] = (time.monotonic(), games)
     return games
@@ -850,6 +915,29 @@ def probe_channel_live(c: dict[str, str], slate_fp: str) -> tuple[bool, str]:
     finally:
         subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "rm", "-f", tmp],
                        capture_output=True, timeout=15)
+
+
+
+# --- Sports card artwork (audit 2026-09-17) -----------------------------------
+# The EPG programme image is a generic still and the channel-logo fallback is
+# the wrong subject entirely (a 96x96 "Soccer PPV 18" icon on the Bodo/Glimt
+# game). When a fixture is attached, compose a card from the two team logos
+# instead. sports_card lives on the host; CT 105 has no Pillow.
+def attach_sports_card(meta: dict, fixture: dict, title: str) -> None:
+    try:
+        sys.path.insert(0, "/usr/local/lib/media-core")
+        import sports_card                                      # noqa: WPS433
+        import tempfile
+        fx = sports_card.fixture_from_espn_event(fixture["_espn_event"], fixture.get("sport_path", ""))
+        with tempfile.TemporaryDirectory() as td:
+            out = sports_card.render_cards(fx, Path(td))
+            meta["poster_bytes"] = Path(out["poster"]).read_bytes()
+            meta["thumb_bytes"] = Path(out["thumb"]).read_bytes()
+        meta["poster_source"] = f"sports card ({fx.get('name') or title})"
+        log(f"Artwork: composed team-logo card for {fx.get('name') or title} "
+            f"({len(meta['poster_bytes'])} B poster, {len(meta['thumb_bytes'])} B thumb)")
+    except Exception as exc:                                    # noqa: BLE001
+        log(f"Artwork: card generation failed ({exc}); keeping the EPG/channel image")
 
 
 def find_espn_fixture(title: str, channel_name: str, start_dt: datetime, games: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -1376,6 +1464,11 @@ def finalize_and_promote_capture(
             write_poster_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{poster_path}'"]
             subprocess.run(write_poster_cmd, input=meta["poster_bytes"], check=True)
             log(f"Wrote poster: {poster_path} ({len(meta['poster_bytes'])} bytes from {meta['poster_source']})")
+            if meta.get("thumb_bytes"):
+                thumb_path = poster_path.rsplit("/", 1)[0] + "/thumb.jpg"
+                subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
+                                f"cat > '/srv/media-core{thumb_path}'"], input=meta["thumb_bytes"], check=True)
+                log(f"Wrote thumb: {thumb_path}")
         except Exception as exc:
             log(f"WARNING: Failed writing poster.jpg: {exc}")
 
@@ -1490,6 +1583,11 @@ def concat_and_stitch_segments(
                 write_poster_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{poster_path}'"]
                 subprocess.run(write_poster_cmd, input=meta["poster_bytes"], check=True)
                 log(f"Wrote poster: {poster_path}")
+                if meta.get("thumb_bytes"):
+                    thumb_path = poster_path.rsplit("/", 1)[0] + "/thumb.jpg"
+                    subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
+                                    f"cat > '/srv/media-core{thumb_path}'"], input=meta["thumb_bytes"], check=True)
+                    log(f"Wrote thumb: {thumb_path}")
             except Exception as exc:
                 log(f"WARNING: Failed writing poster: {exc}")
 
@@ -1755,12 +1853,22 @@ def main() -> int:
     # 3. ESPN fixture matching and Hard Cap calculation
     espn_games = load_espn_schedule()
     fixture = find_espn_fixture(title, ch["name"], start_dt, espn_games)
-    espn_league = infer_espn_league(title, meta.get("plot", ""), " ".join(meta.get("genres") or []))
-    if not fixture and espn_league:
-        fixture = find_espn_fixture_by_description(meta.get("plot", ""), start_dt, espn_league)
+    espn_leagues = infer_espn_leagues(title, meta.get("plot", ""), " ".join(meta.get("genres") or []))
+    espn_league = espn_leagues[0] if espn_leagues else None
+    if fixture and fixture.get("_espn_event"):
+        attach_sports_card(meta, fixture, title)
+    if not fixture and espn_leagues:
+        for cand in espn_leagues:
+            # title first: for a slot-titled programme ("Eastern Michigan vs.
+            # Wisconsin") the teams are in the title, not the plot.
+            fixture = (find_espn_fixture_by_description(f"{title} {meta.get('plot', '')}", start_dt, cand))
+            if fixture:
+                espn_league = cand
+                break
         if fixture:
             log(f"ESPN fixture resolved from the programme description via the "
                 f"{espn_league} scoreboard: {fixture['name']}")
+            attach_sports_card(meta, fixture, title)
         else:
             log(f"No {espn_league} fixture matched the description; capture will run "
                 f"to its hard cap without live supervision.")
