@@ -55,3 +55,12 @@ Owner: "most of the auto-generated artwork is random screen grabs."
 ~09:00 agy 1b review + 4b design (light, fits the current window)
 10:09  agy window resets -> 2b research, 3b review
 then   2c / 4c builds, agy reviews, email.
+
+## Outcome (written 2026-09-17 morning; details in the email of the same day)
+
+| WS | Result |
+|----|--------|
+| 1 | 630 non-event channels probed straight from the provider (`/root/audit-20260917/lineup-probe.tsv`, seeded into `/var/lib/dvr-dashboard/lineup-probe/`). Event-slot groups idle on a Thursday morning account for most SLATE hits; linear channels not LIVE at 08:00–09:00 CEST were re-probed. Productionised as `lineup-probe` + weekly timer (Thu 14:00 CEST); mails when a linear channel is bad two runs running. |
+| 2 | agy WS2b research verified id-by-id against the live epgshare files; 17 aliases wired (Big Ten Overflow 2/3, CHSN ×3, BBC Earth via CA2, TCM, AHC, FXM, Law&Crime, Vice, El Rey, Magnolia, GAF, SHOxBET, FanDuel TV, MeTV scraper). All 17 now carry real data. Remaining gaps are FAST/loop channels (Prime 24/7, music, shopping). |
+| 3 | Timers armed, Badgers MCT booking dry-resolves to Peacock PPV 016, Packers + Bayern timers present, exit Zurich / 0 bounces, disk 22 % free. No change needed. |
+| 4 | Deterministic team-logo cards (`sports_card.py`) rendered **at booking time** for every wanted game into `/var/lib/dvr-dashboard/cards/<espn id>/`, applied by `sports-artwork-sweep` (15 min) when a recording lands in In Progress or Sports - CF, matching on team names or stadium + date; ESPN re-derivation second; optional Claude fixture resolver third (needs `ANTHROPIC_API_KEY` in CT105 `.env`). MCT still renders inline at capture start. agy 4c review findings all fixed (cache lockout, per-recording thumb naming, rescue thumb, comskip stems, `_team_tokens`, per-item Jellyfin refresh by path). |
