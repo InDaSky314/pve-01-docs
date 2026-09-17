@@ -23,6 +23,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -950,8 +951,9 @@ def write_artwork(meta: dict, poster_path: str, base_file: str | None = None) ->
             targets.append((f"{d}/{base_file}-thumb.jpg", meta["thumb_bytes"]))
     for path, data in targets:
         try:
-            subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
-                            f"cat > '/srv/media-core{path}.tmp' && mv -f '/srv/media-core{path}.tmp' '/srv/media-core{path}'"],
+            q = shlex.quote(f"/srv/media-core{path}")
+            qt = shlex.quote(f"/srv/media-core{path}.tmp")
+            subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > {qt} && mv -f {qt} {q}"],
                            input=data, check=True)
         except Exception as exc:  # noqa: BLE001
             log(f"WARNING: Failed writing {path}: {exc}")

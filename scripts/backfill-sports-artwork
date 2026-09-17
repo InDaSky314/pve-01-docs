@@ -221,13 +221,15 @@ def main() -> int:
     ap.add_argument("--force", action="store_true", help="redo folders that already have a card")
     ap.add_argument("--max-age-days", type=int, default=0, help="skip recordings older than this (0 = no limit)")
     a = ap.parse_args()
+    recs = list_recordings()
+    if not recs:
+        return 0                      # nothing on disk: skip the heavy mct import (15-min sweep)
     mct = load_mct()
     token = "" if a.dry_run else jf_token()
     key = anthropic_key()
     if not key:
         print("note: no ANTHROPIC_API_KEY in CT105 .env -- LLM fixture fallback disabled")
 
-    recs = list_recordings()
     per_folder: dict[str, int] = {}
     for f, _, _ in recs:
         per_folder[f] = per_folder.get(f, 0) + 1
