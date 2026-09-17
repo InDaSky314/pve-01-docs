@@ -28,6 +28,7 @@ Runs daily via media-core-sync.timer; run manually with:
   python3 /srv/media-core/sync/xtream-sync.py
 """
 import calendar
+import datetime as _dt
 import gzip
 import json
 import re
@@ -38,6 +39,7 @@ import time
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import loki_alert
 import channel_naming            # display-name rules, shared with the tooling
@@ -320,9 +322,26 @@ def build_playlist(base, user, pw, cfg):
             missing = 0
             id_list = sel["ids"].keys() if isinstance(sel["ids"], dict) else sel["ids"]
             for sid in id_list:
+                # A null/empty entry is a deliberate gap: it holds its channel
+                # number and emits nothing. Use it to keep numbering stable
+                # when a feed has no replacement.
+                # In the dict form (curated names) a gap is a key beginning
+                # "gap" -- e.g. "gap:1587172" -- so the old id stays on record.
+                if sid in (None, "", "null") or str(sid).startswith("gap"):
+                    next_chno += 1
+                    continue
                 s = by_id.get(int(sid))
                 if s is None:
+                    # HOLD THE NUMBER. Until 2026-09-17 a feed the provider had
+                    # dropped was simply skipped, so every channel after it in
+                    # the group shifted down by one. When the provider removed
+                    # the GO: Big Ten and ESPN feeds on 2026-09-14, ch 122
+                    # silently became NFL Network and ch 108 (Green Bay CBS 5)
+                    # ceased to exist -- while the DVR kept booking the
+                    # Badgers on 122 and the Packers had just recorded on 108.
+                    # A dead slot is now a gap, never a renumbering.
                     missing += 1
+                    next_chno += 1
                     continue
                 if s["stream_id"] in seen_ids:
                     continue
@@ -668,6 +687,24 @@ def ppv_programmes(raw, xid):
             return [_prog(xid, start, start + 3 * 3600, title)]
         if title:
             return [_prog(xid, now, now + 12 * 3600, title)]
+    # Peacock event slots (added 2026-09-17):
+    #   "US (Peacock 016) | Eastern Michigan vs. Wisconsin (2026-09-19 12:00:00)"
+    # One timestamp, in parentheses, at the end -- and it is US EASTERN, not
+    # UTC: the Badgers kickoff ESPN lists at 16:30Z appears here as 12:00, the
+    # slot opening half an hour before. Without this branch every Peacock slot
+    # rendered as "No event scheduled" and the guide could not place the game.
+    m = re.search(r"\|\s*(?P<title>[^|]+?)\s*\((?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\)\s*$", name)
+    if m:
+        title = m.group("title").strip(" -|:")
+        try:
+            local = _dt.datetime.strptime(m.group("ts"), "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=ZoneInfo("America/New_York"))
+            start = int(local.timestamp())
+        except (ValueError, OverflowError):
+            start = 0
+        if title and start and start + 4 * 3600 > time.time():
+            return [_prog(xid, start, start + 4 * 3600, title,
+                          "Event time as published by the provider (US Eastern).")]
     return [_prog(xid, now, now + 24 * 3600, "No event scheduled",
                   "Event slot — fills in when the provider schedules one.")]
 
@@ -694,8 +731,16 @@ def build_epg(base, user, pw, cfg, chosen):
 
     kept_pr = 0
     covered = set()
-    out_tmp = EPG_OUT.with_suffix(".xml.tmp")
     EPG_OUT.parent.mkdir(parents=True, exist_ok=True)
+    # Unique temp file, not a fixed ".xml.tmp". Two overlapping runs sharing
+    # one temp name is how epg.xml ended up with a 646 KB hole of NUL bytes on
+    # 2026-09-17 (and epg.xml.broken-20260714 before that): one run truncates
+    # the shared file while the other is still writing at its offset, and
+    # whichever renames last publishes the holey result. The XML then fails
+    # to parse and the dashboard's guide index stops updating.
+    with tempfile.NamedTemporaryFile(dir=str(EPG_OUT.parent), prefix=".epg.",
+                                     suffix=".xml", delete=False) as _t:
+        out_tmp = Path(_t.name)
     with open(out_tmp, "wb") as out:
         out.write(b'<?xml version="1.0" encoding="utf-8"?>\n')
         out.write(b'<tv generator-info-name="media-core-sync">\n')
