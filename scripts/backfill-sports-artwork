@@ -244,6 +244,15 @@ def main() -> int:
         if not m:
             print(f"  SKIP {base}: no date"); skipped += 1; continue
         day = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), 12, 0, tzinfo=LOCAL_TZ)
+        # Doubleheaders (agy final review, item 2): two fixtures with the same
+        # teams and venue on one day are only told apart by time. The .ts
+        # mtime is the recording's end; subtract a typical game length so the
+        # nearest-kickoff choice picks the right game.
+        st = ct(["stat", "-c", "%Y", f"{folder}/{base}{ext}"]).stdout.strip()
+        if st.isdigit():
+            rec_time = datetime.fromtimestamp(int(st), LOCAL_TZ) - timedelta(hours=2, minutes=30)
+            if abs((rec_time - day).total_seconds()) < 36 * 3600:
+                day = rec_time
         if a.max_age_days and (datetime.now(LOCAL_TZ) - day).days > a.max_age_days:
             continue
         existing = ct(["ls", "-1", folder]).stdout.splitlines()

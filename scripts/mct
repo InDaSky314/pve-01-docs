@@ -1499,7 +1499,7 @@ def finalize_and_promote_capture(
     write_artwork(meta, poster_path, os.path.splitext(os.path.basename(clean_path))[0])
 
     try:
-        write_nfo_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{nfo_path}'"]
+        write_nfo_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > {shlex.quote('/srv/media-core' + nfo_path)}"]
         subprocess.run(write_nfo_cmd, input=nfo_content, text=True, check=True)
         log(f"Wrote NFO: {nfo_path} (lockdata={meta['lockdata']}, genres={meta['genres']}, plot_len={len(meta['plot'])})")
     except Exception as exc:
@@ -1597,7 +1597,7 @@ def concat_and_stitch_segments(
         stitched_stem = Path(stitched_path).stem
         stitched_nfo_xml = build_nfo_xml(stitched_stem, start_dt, meta["plot"], meta["genres"], meta["lockdata"])
         try:
-            write_nfo_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{stitched_nfo_path}'"]
+            write_nfo_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > {shlex.quote('/srv/media-core' + stitched_nfo_path)}"]
             subprocess.run(write_nfo_cmd, input=stitched_nfo_xml, text=True, check=True)
             log(f"Wrote stitched NFO: {stitched_nfo_path}")
         except Exception as exc:

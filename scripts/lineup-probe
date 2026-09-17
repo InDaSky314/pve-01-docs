@@ -69,12 +69,20 @@ trap 'rm -f "$CH"' EXIT
 total=$(wc -l < "$CH"); n=0; echo "lineup-probe: $total channels in playlist" >&2
 
 viewer_present() {
-  pct exec 105 -- bash -c 'K=$(cat /srv/media-core/.jellyfin_api_key); curl -s --max-time 10 -H "X-Emby-Token: $K" http://127.0.0.1:8096/Sessions | python3 -c "import json,sys; sys.exit(0 if any((s.get(\"NowPlayingItem\") or {}).get(\"Type\")==\"TvChannel\" for s in json.load(sys.stdin)) else 1)"' 2>/dev/null
+  # any session playing live TV: Jellyfin reports Type TvChannel, LiveTvProgram or Program, and IsLive
+  pct exec 105 -- bash -c 'K=$(cat /srv/media-core/.jellyfin_api_key); curl -s --max-time 10 -H "X-Emby-Token: $K" http://127.0.0.1:8096/Sessions | python3 -c "
+import json,sys
+live=False
+for s in json.load(sys.stdin):
+    n=s.get(\"NowPlayingItem\") or {}
+    if n.get(\"IsLive\") or n.get(\"Type\") in (\"TvChannel\",\"LiveTvProgram\",\"Program\") or n.get(\"ChannelId\"): live=True
+sys.exit(0 if live else 1)"' 2>/dev/null
 }
 capture_running() {
-  # MCT capture (host unit) OR a Jellyfin LiveTV timer currently recording
+  # MCT capture (host unit) OR any Jellyfin recording in progress (the same
+  # check mct's own exclusion uses: /LiveTv/Recordings?IsInProgress=true)
   systemctl list-units 'mct-*' --state=running --no-pager 2>/dev/null | grep -q "MCT capture" && return 0
-  pct exec 105 -- bash -c 'K=$(cat /srv/media-core/.jellyfin_api_key); curl -s --max-time 10 -H "X-Emby-Token: $K" http://127.0.0.1:8096/LiveTv/Timers | python3 -c "import json,sys; sys.exit(0 if any(t.get(\"Status\")==\"InProgress\" for t in json.load(sys.stdin).get(\"Items\",[])) else 1)"' 2>/dev/null
+  pct exec 105 -- bash -c 'K=$(cat /srv/media-core/.jellyfin_api_key); curl -s --max-time 10 -H "X-Emby-Token: $K" "http://127.0.0.1:8096/LiveTv/Recordings?IsInProgress=true" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get(\"Items\") else 1)"' 2>/dev/null
 }
 
 while IFS=$'\t' read -r chno name group url; do
@@ -82,7 +90,7 @@ while IFS=$'\t' read -r chno name group url; do
   [ -n "$ONLY" ] && ! echo "$ONLY" | grep -q ",$chno," && continue
   [ -z "$ONLY" ] && grep -q "^${chno}	" "$OUT" && continue           # resumable
   n=$((n+1))
-  while [ $((n % 10)) -eq 1 ] && viewer_present; do echo "$(date +%H:%M) live viewer present, waiting" >&2; sleep 120; done
+  while [ $((n % 3)) -eq 1 ] && viewer_present; do echo "$(date +%H:%M) live viewer present, waiting" >&2; sleep 120; done
   while capture_running; do sleep 300; done
   res=$(pct exec 105 -- bash -c "out=\$(timeout 12 curl -sL --max-time 8 -r 0-1200000 '$url' -o /tmp/lp.ts -w '%{http_code}'); sz=\$(stat -c %s /tmp/lp.ts 2>/dev/null||echo 0); fp=\$(head -c 1000000 /tmp/lp.ts 2>/dev/null | md5sum | cut -c1-12); fz=n/a; if [ \"\$sz\" -gt 300000 ]; then e=\$(docker exec jellyfin /usr/lib/jellyfin-ffmpeg/ffmpeg -v info -t 6 -i /tmp/lp.ts -an -vf freezedetect=n=-50dB:d=2 -f null - 2>&1); s=\$(echo \"\$e\" | grep -c freeze_start); en=\$(echo \"\$e\" | grep -c freeze_end); [ \"\$s\" -gt 0 ] && [ \"\$en\" -eq 0 ] && fz=frozen || fz=moving; fi; rm -f /tmp/lp.ts; echo \"\$out \$sz \$fp \$fz\"" 2>/dev/null)
   set -- $res; http=${1:-000}; bytes=${2:-0}; fp=${3:-}; fz=${4:-n/a}
