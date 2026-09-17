@@ -23,6 +23,7 @@ output files. No network unless a logo is not yet cached.
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import urllib.request
 from datetime import datetime
@@ -68,22 +69,39 @@ def _font(path: str, size: int) -> ImageFont.FreeTypeFont:
 
 
 def cached_logo(url: str | None) -> Image.Image | None:
-    """Fetch a team logo once, keep it under LOGO_CACHE keyed by URL hash."""
+    """Fetch a team logo once, keep it under LOGO_CACHE keyed by URL hash.
+
+    Written atomically (temp + os.replace) and validated before use: a 0-byte
+    or HTML error body must not become a permanent cache entry that locks the
+    club out of its logo forever (agy 4c finding 2). An unreadable cached file
+    is unlinked so the next render retries the download."""
     if not url:
         return None
     LOGO_CACHE.mkdir(parents=True, exist_ok=True)
     p = LOGO_CACHE / (hashlib.sha1(url.encode()).hexdigest()[:16] + ".png")
-    if not p.exists():
+    for attempt in (1, 2):
+        if p.exists():
+            try:
+                im = Image.open(p)
+                im.load()
+                return im.convert("RGBA")
+            except Exception:                                  # noqa: BLE001
+                p.unlink(missing_ok=True)
+                if attempt == 2:
+                    return None
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "media-core-sports-card/1.0"})
             with urllib.request.urlopen(req, timeout=15) as r:
-                p.write_bytes(r.read())
+                data = r.read()
+            if len(data) < 256:
+                return None
+            Image.open(io.BytesIO(data)).verify()
+            tmp = p.with_suffix(".tmp%d" % os.getpid())
+            tmp.write_bytes(data)
+            os.replace(tmp, p)
         except Exception:                                      # noqa: BLE001
             return None
-    try:
-        return Image.open(p).convert("RGBA")
-    except Exception:                                          # noqa: BLE001
-        return None
+    return None
 
 
 def _badge(abbrev: str, size: int) -> Image.Image:
@@ -133,10 +151,14 @@ def _shrink_to(text: str, font_path: str, start: int, max_w: int, d: ImageDraw.I
 
 def order_teams(fixture: dict[str, Any]) -> tuple[dict, dict, str]:
     """(first, second, joiner). Soccer: home first, 'vs'. US: away first, 'at'.
-    Neutral site: 'vs' either way."""
-    comps = fixture.get("competitors") or []
-    home = next((c for c in comps if c.get("homeAway") == "home"), comps[0] if comps else {})
-    away = next((c for c in comps if c.get("homeAway") == "away"), comps[1] if len(comps) > 1 else {})
+    Neutral site: 'vs' either way. Degrades to placeholder dicts when ESPN
+    hands over fewer than two competitors, so the card still renders."""
+    comps = list(fixture.get("competitors") or [])
+    while len(comps) < 2:
+        comps.append({"displayName": "TBD", "abbreviation": "TBD"})
+    home = next((c for c in comps if c.get("homeAway") == "home"), comps[0])
+    away = next((c for c in comps if c.get("homeAway") == "away" and c is not home),
+                next(c for c in comps if c is not home))
     soccer = str(fixture.get("sport_path", "")).startswith(SOCCER_PREFIX)
     neutral = bool(fixture.get("neutral_site"))
     if soccer:
@@ -144,15 +166,55 @@ def order_teams(fixture: dict[str, Any]) -> tuple[dict, dict, str]:
     return away, home, ("vs" if neutral else "at")
 
 
+def _team_label(c: dict[str, Any]) -> str:
+    """'#4 Wisconsin Badgers' when ESPN carries a poll rank, else the name."""
+    name = c.get("displayName", "?")
+    rank = c.get("rank")
+    return f"#{rank} {name}" if rank else name
+
+
+def _wrap(text: str, font: ImageFont.FreeTypeFont, max_w: int, d: ImageDraw.ImageDraw) -> list[str]:
+    """Greedy word wrap so long matchups (FCS, Liga MX) do not run off the
+    canvas edges (agy 4c finding 3)."""
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        cand = (cur + " " + w).strip()
+        if d.textbbox((0, 0), cand, font=font)[2] <= max_w or not cur:
+            cur = cand
+        else:
+            lines.append(cur); cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _centered_block(d: ImageDraw.ImageDraw, y: int, text: str, font_path: str, start: int,
+                    max_w: int, width: int, fill=FG, min_size: int = 30) -> int:
+    """Centre `text` on up to two lines: shrink first, wrap only below min_size."""
+    font = _shrink_to(text, font_path, start, max_w, d)
+    if font.size < min_size:
+        font = _font(font_path, min_size)
+        lines = _wrap(text, font, max_w, d)[:2]
+    else:
+        lines = [text]
+    for ln in lines:
+        y = _centered(d, y, ln, font, width, fill) + 8
+    return y - 8
+
+
 def _lines(fixture: dict[str, Any]) -> tuple[str, str, str, str]:
     first, second, joiner = order_teams(fixture)
     league = LEAGUE_LABELS.get(fixture.get("sport_path", ""), fixture.get("league_label") or "")
+    if fixture.get("note"):
+        league = f"{league} · {fixture['note']}" if league else fixture["note"]
+    elif fixture.get("week"):
+        league = f"{league} · Week {fixture['week']}" if league else f"Week {fixture['week']}"
     when = fixture.get("start")
     if isinstance(when, datetime):
         when_s = when.astimezone(LOCAL_TZ).strftime("%a %d %b %Y · %H:%M")
     else:
         when_s = str(when or "")
-    matchup = f"{first.get('displayName', '?')} {joiner} {second.get('displayName', '?')}"
+    matchup = f"{_team_label(first)} {joiner} {_team_label(second)}"
     venue = fixture.get("venue") or ""
     return league, matchup, when_s, venue
 
@@ -168,7 +230,7 @@ def render_poster(fixture: dict[str, Any], out_path: Path) -> Path:
     d.rectangle((0, 0, W, 14), fill=ACCENT)
     y = 56
     if league:
-        y = _centered(d, y, league.upper(), _font(FONT_BOLD, 44), W, MUTED) + 30
+        y = _centered(d, y, league.upper(), _shrink_to(league.upper(), FONT_BOLD, 44, W - 80, d), W, MUTED) + 30
 
     # stacked logos with the joiner between
     logo_sz = 460
@@ -180,8 +242,7 @@ def render_poster(fixture: dict[str, Any], out_path: Path) -> Path:
     y += logo_sz + 44
 
     # text block, sized to fit
-    f_match = _shrink_to(matchup, FONT_BOLD, 52, W - 80, d)
-    y = _centered(d, y, matchup, f_match, W) + 22
+    y = _centered_block(d, y, matchup, FONT_BOLD, 52, W - 80, W) + 22
     y = _centered(d, y, when_s, _font(FONT_REG, 38), W, MUTED) + 14
     if venue:
         f_v = _shrink_to(venue, FONT_REG, 34, W - 80, d)
@@ -208,9 +269,8 @@ def render_thumb(fixture: dict[str, Any], out_path: Path) -> Path:
 
     y = top + logo_sz + 40
     if league:
-        y = _centered(d, y, league.upper(), _font(FONT_BOLD, 36), W, MUTED) + 16
-    f_match = _shrink_to(matchup, FONT_BOLD, 56, W - 160, d)
-    y = _centered(d, y, matchup, f_match, W) + 18
+        y = _centered(d, y, league.upper(), _shrink_to(league.upper(), FONT_BOLD, 36, W - 160, d), W, MUTED) + 16
+    y = _centered_block(d, y, matchup, FONT_BOLD, 56, W - 160, W) + 18
     tail = when_s + (f"   ·   {venue}" if venue else "")
     f_t = _shrink_to(tail, FONT_REG, 36, W - 160, d)
     _centered(d, y, tail, f_t, W, MUTED)
@@ -240,17 +300,24 @@ def fixture_from_espn_event(event: dict[str, Any], sport_path: str) -> dict[str,
     comps = []
     for c in comp.get("competitors") or []:
         t = c.get("team") or {}
+        rank = (c.get("curatedRank") or {}).get("current")
         comps.append({"displayName": t.get("displayName") or t.get("name") or "?",
                       "abbreviation": t.get("abbreviation") or "",
                       "logo": t.get("logo") or ((t.get("logos") or [{}])[0].get("href")),
-                      "homeAway": c.get("homeAway")})
+                      "homeAway": c.get("homeAway"),
+                      "rank": rank if isinstance(rank, int) and 0 < rank < 99 else None})
+    notes = [n.get("headline") for n in comp.get("notes") or [] if n.get("headline")]
+    broadcasts = [b for n in comp.get("broadcasts") or [] for b in (n.get("names") or [])]
     try:
         start = datetime.fromisoformat(str(event.get("date")).replace("Z", "+00:00"))
     except ValueError:
         start = None
     return {"name": event.get("name") or "", "start": start, "sport_path": sport_path,
             "competitors": comps, "venue": (comp.get("venue") or {}).get("fullName") or "",
-            "neutral_site": bool(comp.get("neutralSite"))}
+            "neutral_site": bool(comp.get("neutralSite")),
+            "week": (event.get("week") or {}).get("number"),
+            "note": notes[0] if notes else "",
+            "broadcast": broadcasts[0] if broadcasts else ""}
 
 
 if __name__ == "__main__":

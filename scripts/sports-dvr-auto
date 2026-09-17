@@ -1072,6 +1072,51 @@ def _channel_number_for(name: str) -> str:
         return ""
 
 
+# --- pre-rendered artwork (owner request 2026-09-17: "pre-create it once the
+# game is scheduled"). The card is rendered from the ESPN fixture at booking
+# time and parked under CARDS_DIR; sports-artwork-sweep applies it when the
+# recording lands, so a Jellyfin-engine capture gets the same card as an MCT
+# one without a second ESPN round trip.
+CARDS_DIR = Path("/var/lib/dvr-dashboard/cards")
+CARDS_KEEP_DAYS = 14
+
+
+def prerender_card(game: dict[str, Any], channel_name: str, timer_name: str) -> None:
+    event = game.get("_espn_event")
+    if not event or not event.get("id"):
+        return
+    try:
+        import sys as _sys
+        if "/usr/local/lib/media-core" not in _sys.path:
+            _sys.path.insert(0, "/usr/local/lib/media-core")
+        import sports_card  # noqa: WPS433
+        out = CARDS_DIR / str(event["id"])
+        if (out / "fixture.json").exists():
+            return
+        fx = sports_card.fixture_from_espn_event(event, game.get("sport_path", ""))
+        sports_card.render_cards(fx, out)
+        comps = fx.get("competitors") or []
+        (out / "fixture.json").write_text(json.dumps({
+            "event_id": str(event["id"]), "name": fx.get("name"), "sport_path": fx.get("sport_path"),
+            "start": fx["start"].isoformat() if fx.get("start") else None,
+            "teams": [c.get("displayName") for c in comps],
+            "channel": channel_name, "timer_name": timer_name,
+            "rendered": datetime.now(timezone.utc).isoformat(),
+        }, ensure_ascii=False, indent=1))
+        logging.info("[ARTWORK] Pre-rendered card for %s -> %s", fx.get("name"), out)
+        # prune old entries so the dir does not grow forever
+        cutoff = datetime.now(timezone.utc) - timedelta(days=CARDS_KEEP_DAYS)
+        for d in CARDS_DIR.iterdir():
+            fj = d / "fixture.json"
+            try:
+                if fj.exists() and datetime.fromisoformat(json.loads(fj.read_text()).get("start") or "") < cutoff:
+                    shutil.rmtree(d, ignore_errors=True)
+            except (ValueError, OSError):
+                pass
+    except Exception as exc:  # noqa: BLE001 -- artwork must never block a booking
+        logging.warning("[ARTWORK] pre-render failed for %s: %s", game.get("name"), exc)
+
+
 def schedule_mct_booking(game: dict[str, Any], channel_name: str, dry_run: bool = True) -> bool:
     """Book a game through MCT by appending to mct-bookings.json in the
     dashboard's own schema. mct-scheduler launches it at T-5 min.
@@ -1182,6 +1227,7 @@ def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str
     res = jf_request("/emby/LiveTv/Timers", data=payload, method="POST")
     if res is not None:
         logging.info("  [SUCCESS] Timer created for %s", name)
+        prerender_card(game, channel_name, name)
         return True
     logging.error("  [FAILED] Could not create timer for %s", name)
     return False
@@ -1388,6 +1434,8 @@ def run_auto_scheduler(dry_run: bool = True, games: list[dict[str, Any]] | None 
         if is_overlapping_timer(cid, game["start"], game["end"], existing_timers,
                                 timer_name=f"{game['team']}: {game['name']}"):
             logging.info("Skip %s (%s): Overlapping timer already exists on %s", game["name"], game["team"], cname)
+            if not dry_run:
+                prerender_card(game, cname, f"{game['team']}: {game['name']}")   # idempotent; covers timers booked before 2026-09-17
             continue
 
         # The single tuner is shared with the Manual Capture Tool. Without this
@@ -1401,10 +1449,13 @@ def run_auto_scheduler(dry_run: bool = True, games: list[dict[str, Any]] | None 
         if mct_conflict:
             logging.info("Skip %s (%s): %s owns this window on the shared tuner",
                          game["name"], game["team"], mct_reason)
+            if not dry_run:
+                prerender_card(game, cname, f"{game['team']}: {game['name']}")
             continue
 
         if starts_overnight(game):
-            schedule_mct_booking(game, cname, dry_run=dry_run)
+            if schedule_mct_booking(game, cname, dry_run=dry_run) and not dry_run:
+                prerender_card(game, cname, f"{game['team']}: {game['name']}")
         else:
             schedule_game_timer(game, cid, cname, dry_run=dry_run)
 

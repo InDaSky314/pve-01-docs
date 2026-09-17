@@ -625,8 +625,13 @@ def infer_espn_league(*texts: str) -> str | None:
 
 
 def _team_tokens(name: str) -> set[str]:
-    return {w.lower() for w in re.findall(r"[A-Za-z0-9]{4,}", name or "")
+    """Distinctive words of a team name for substring matching. Falls back to
+    the whole lower-cased name when stopword/length filtering would leave
+    nothing ("Ayr United", "Jets" is fine, "Real" alone is not) -- an empty
+    set made `any()` False and the club unmatchable (agy 4c finding 7)."""
+    toks = {w.lower() for w in re.findall(r"[A-Za-z0-9]{4,}", name or "")
             if w.lower() not in _TEAM_STOPWORDS}
+    return toks or {(name or "").strip().lower()} - {""}
 
 
 _SCOREBOARD_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
@@ -923,6 +928,36 @@ def probe_channel_live(c: dict[str, str], slate_fp: str) -> tuple[bool, str]:
 # the wrong subject entirely (a 96x96 "Soccer PPV 18" icon on the Bodo/Glimt
 # game). When a fixture is attached, compose a card from the two team logos
 # instead. sports_card lives on the host; CT 105 has no Pillow.
+def write_artwork(meta: dict, poster_path: str, base_file: str | None = None) -> None:
+    """Write poster (+thumb) beside a finished recording.
+
+    Writes the folder-generic poster.jpg/thumb.jpg AND, when `base_file` is
+    given, <base_file>-poster.jpg/-thumb.jpg. Jellyfin binds folder-level
+    art to the folder, so in a folder that holds several games (Live NFL
+    Football) only the per-recording names put the right card on the right
+    item (agy 4c findings 5/8). thumb is derived from the poster's directory,
+    never by string surgery on the file name.
+    """
+    if not meta.get("poster_bytes"):
+        return
+    d = os.path.dirname(poster_path)
+    targets = [(f"{d}/poster.jpg", meta["poster_bytes"])]
+    if meta.get("thumb_bytes"):
+        targets.append((f"{d}/thumb.jpg", meta["thumb_bytes"]))
+    if base_file:
+        targets.append((f"{d}/{base_file}-poster.jpg", meta["poster_bytes"]))
+        if meta.get("thumb_bytes"):
+            targets.append((f"{d}/{base_file}-thumb.jpg", meta["thumb_bytes"]))
+    for path, data in targets:
+        try:
+            subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
+                            f"cat > '/srv/media-core{path}.tmp' && mv -f '/srv/media-core{path}.tmp' '/srv/media-core{path}'"],
+                           input=data, check=True)
+        except Exception as exc:  # noqa: BLE001
+            log(f"WARNING: Failed writing {path}: {exc}")
+    log(f"Wrote artwork ({meta.get('poster_source','?')}): {', '.join(os.path.basename(t[0]) for t in targets)}")
+
+
 def attach_sports_card(meta: dict, fixture: dict, title: str) -> None:
     try:
         sys.path.insert(0, "/usr/local/lib/media-core")
@@ -1459,18 +1494,7 @@ def finalize_and_promote_capture(
         log(f"WARNING: Pre-remux failed ({err}). Falling back to direct promotion of raw file to {clean_path} to preserve capture.")
         subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "mv", "-f", raw_ct_path, clean_ct_path], check=False)
 
-    if meta.get("poster_bytes"):
-        try:
-            write_poster_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{poster_path}'"]
-            subprocess.run(write_poster_cmd, input=meta["poster_bytes"], check=True)
-            log(f"Wrote poster: {poster_path} ({len(meta['poster_bytes'])} bytes from {meta['poster_source']})")
-            if meta.get("thumb_bytes"):
-                thumb_path = poster_path.rsplit("/", 1)[0] + "/thumb.jpg"
-                subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
-                                f"cat > '/srv/media-core{thumb_path}'"], input=meta["thumb_bytes"], check=True)
-                log(f"Wrote thumb: {thumb_path}")
-        except Exception as exc:
-            log(f"WARNING: Failed writing poster.jpg: {exc}")
+    write_artwork(meta, poster_path, os.path.splitext(os.path.basename(clean_path))[0])
 
     try:
         write_nfo_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{nfo_path}'"]
@@ -1578,18 +1602,7 @@ def concat_and_stitch_segments(
             log(f"WARNING: Failed writing stitched NFO: {exc}")
 
         # Write poster
-        if meta.get("poster_bytes"):
-            try:
-                write_poster_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{poster_path}'"]
-                subprocess.run(write_poster_cmd, input=meta["poster_bytes"], check=True)
-                log(f"Wrote poster: {poster_path}")
-                if meta.get("thumb_bytes"):
-                    thumb_path = poster_path.rsplit("/", 1)[0] + "/thumb.jpg"
-                    subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c",
-                                    f"cat > '/srv/media-core{thumb_path}'"], input=meta["thumb_bytes"], check=True)
-                    log(f"Wrote thumb: {thumb_path}")
-            except Exception as exc:
-                log(f"WARNING: Failed writing poster: {exc}")
+        write_artwork(meta, poster_path, os.path.splitext(os.path.basename(clean_path))[0])
 
         # Archive raw segments out of /media/recordings
         if hasattr(mod, "archive_segments"):
@@ -1684,12 +1697,7 @@ def _rescue_segments(
                         f"echo '{seg_clean_p}' >> /srv/media-core/media/recordings/.postprocess/queue"],
                        check=False)
 
-    if meta.get("poster_bytes"):
-        try:
-            write_poster_cmd = ["/usr/sbin/pct", "exec", CT_ID, "--", "sh", "-c", f"cat > '/srv/media-core{poster_path}'"]
-            subprocess.run(write_poster_cmd, input=meta["poster_bytes"], check=True)
-        except Exception:
-            pass
+    write_artwork(meta, poster_path)
 
     jf_api("/Library/Refresh", method="POST")
     log(f"All {len(segment_paths)} partial segments promoted and rescued. Playable in Jellyfin.")
@@ -1857,6 +1865,8 @@ def main() -> int:
     espn_league = espn_leagues[0] if espn_leagues else None
     if fixture and fixture.get("_espn_event"):
         attach_sports_card(meta, fixture, title)
+    elif fixture:
+        log("Fixture matched without ESPN event payload; keeping EPG artwork")
     if not fixture and espn_leagues:
         for cand in espn_leagues:
             # title first: for a slot-titled programme ("Eastern Michigan vs.

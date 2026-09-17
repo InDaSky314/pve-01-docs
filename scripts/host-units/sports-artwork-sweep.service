@@ -1,0 +1,8 @@
+[Unit]
+Description=Give finished sports recordings a team-logo card (covers Jellyfin-engine captures mct never touched)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/backfill-sports-artwork --max-age-days 21
+Nice=10

@@ -963,11 +963,11 @@
       "BALLYSPORTINDIANAPLUS": "FanDuel Sports Indiana",
       "BALLYSPORTDETROIT": "FanDuel Sports Network Detroit HD",
       "CSNPHILADELPHIAPLUS": "NBC Sports Philadelphia Plus us2",
-      "CSNCHICAGOPLUS": "NBC Sports 4K us2",
+      "CSNCHICAGOPLUS": "CHSN Plus",
       "SPECTRUMBAYNEWS9": "Spectrum Bay News 9 Tampa us2",
       "BALLYSPORTNEWORLEANS": "FanDuel Sports New Orleans",
       "ONEAMERICANNEWSNETWORK": "One America News Network HD us2",
-      "CSNCHICAGO": "NBC Sports 4K us2",
+      "CSNCHICAGO": "CHSN Chicago Sports Network",
       "BALLYSPORTCINCINNATI": "FanDuel Sports Ohio - Cincinnati HD",
       "BALLYSPORTNEWORLEANSPLUS": "FanDuel Sports New Orleans",
       "CSNBAYAREA": "NBC Sports Bay Area HD us2",
@@ -1043,7 +1043,24 @@
       "BALLY SPORTS PRIME TICKET": "scraped.bally.primeticket",
       "BALLY SPORTS GREAT LAKES": "scraped.bally.greatlakes",
       "FANDUEL SPORTS NETWORK SOCAL HD": "scraped.bally.primeticket",
-      "FANDUEL TV MIDWEST": "scraped.bally.greatlakes"
+      "FANDUEL TV MIDWEST": "scraped.bally.greatlakes",
+      "Big Ten": "Big Ten Network HD",
+      "Big Ten Network Overflow 2": "Big Ten Network Overflow HD",
+      "Big Ten Network Overflow 3": "Big Ten Network Overflow",
+      "Chicago Sports Network HD": "CHSN Chicago Sports Network",
+      "Chicago Sports Network Plus HD": "CHSN Plus",
+      "Chicago Sports Network 4K": "CHSN Chicago Sports Network",
+      "TCM HD": "Turner Classic Movies HD",
+      "America Heroes HD": "American Heroes Channel HD",
+      "FXM HD": "FX Movie Channel HD",
+      "Law & Crime": "Law and Crime",
+      "Viceland HD": "Vice HD",
+      "El Rey": "El Rey Network",
+      "DIY HD": "Magnolia Network HD",
+      "Great American Country 4K": "Great American Family HD",
+      "Showtime BET HD": "SHO x BET HD",
+      "TVG Network": "FanDuel TV",
+      "MeTV": "scraped.metv.us"
     },
     "UK": {
       "BBC WORLD NEWS": "BBC NEWS",
@@ -1095,10 +1112,12 @@
       "http://192.168.9.115:8090/hallmark_drama.xml",
       "http://192.168.9.115:8090/bally_arizona.xml",
       "http://192.168.9.115:8090/bally_prime_ticket.xml",
-      "http://192.168.9.115:8090/bally_great_lakes.xml"
+      "http://192.168.9.115:8090/bally_great_lakes.xml",
+      "http://192.168.9.115:8090/metv.xml"
     ],
     "UK": [
-      "https://epgshare01.online/epgshare01/epg_ripper_UK1.xml.gz"
+      "https://epgshare01.online/epgshare01/epg_ripper_UK1.xml.gz",
+      "https://epgshare01.online/epgshare01/epg_ripper_CA2.xml.gz"
     ],
     "DE": [
       "https://epgshare01.online/epgshare01/epg_ripper_DE1.xml.gz"

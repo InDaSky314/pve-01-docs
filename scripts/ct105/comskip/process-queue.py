@@ -46,6 +46,17 @@ PP_DIR = os.path.join(RECORDINGS, ".postprocess")
 # is in here never keep a finished fixture folder alive.
 ARTWORK_STEMS = {"poster", "folder", "fanart", "thumb", "banner",
                  "logo", "landscape", "clearart", "disc"}
+
+
+def _is_artwork(fn: str) -> bool:
+    """poster.jpg, thumb.jpg, ... and the per-recording <base>-poster.jpg /
+    <base>-thumb.jpg variants mct writes for shared folders (2026-09-17)."""
+    stem = os.path.splitext(fn)[0].lower()
+    if stem in ARTWORK_STEMS:
+        return True
+    return any(stem.endswith("-" + a) for a in ARTWORK_STEMS)
+
+
 QUEUE = os.path.join(PP_DIR, "queue")
 LOCK = os.path.join(PP_DIR, ".runner.lock")
 WORK = os.path.join(PP_DIR, "work")
@@ -355,8 +366,7 @@ def cleanup_source(host_path, out_path):
         # empty ghost entry in the In Progress library.
         d = os.path.dirname(host_path)
         try:
-            leftovers = [f for f in os.listdir(d)
-                         if os.path.splitext(f)[0].lower() not in ARTWORK_STEMS]
+            leftovers = [f for f in os.listdir(d) if not _is_artwork(f)]
             if not leftovers:
                 shutil.rmtree(d, ignore_errors=True)
                 log(f"cleanup: removed empty folder {os.path.basename(d)}")

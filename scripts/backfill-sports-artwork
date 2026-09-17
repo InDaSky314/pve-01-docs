@@ -36,7 +36,12 @@ import sports_card  # noqa: E402
 
 LOCAL_TZ = ZoneInfo("Europe/Berlin")
 CT = "105"
-ROOT = "/srv/media-core/media/recordings/Commercial Free/Sports - CF"
+ROOTS = {  # path -> depth of <folder>/<file> below it
+    "/srv/media-core/media/recordings/Commercial Free/Sports - CF": 2,
+    "/srv/media-core/media/recordings/In Progress/Sports": 2,
+    "/srv/media-core/media/recordings/In Progress/Other": 2,
+}
+CARDS_DIR = Path("/var/lib/dvr-dashboard/cards")   # pre-rendered by sports-dvr-auto at booking time
 JF = "http://127.0.0.1:8096"
 
 
@@ -56,16 +61,17 @@ def ct_write(path: str, data: bytes) -> None:
     subprocess.run(["/usr/sbin/pct", "exec", CT, "--", "sh", "-c", f"cat > '{path}'"], input=data, check=True)
 
 
-def list_recordings() -> list[tuple[str, str]]:
-    """(folder, basename) for every finished recording."""
-    r = ct(["find", ROOT, "-mindepth", "2", "-maxdepth", "2", "-type", "f",
-            "(", "-name", "*.mkv", "-o", "-name", "*.ts", ")"])
+def list_recordings() -> list[tuple[str, str, str]]:
+    """(folder, basename, ext) for every finished recording."""
     out = []
-    for line in r.stdout.splitlines():
-        p = Path(line.strip())
-        if p.name.endswith(".raw.ts"):
-            continue
-        out.append((str(p.parent), p.stem))
+    for root, depth in ROOTS.items():
+        r = ct(["find", root, "-mindepth", str(depth), "-maxdepth", str(depth), "-type", "f",
+                "(", "-name", "*.mkv", "-o", "-name", "*.ts", ")"])
+        for line in r.stdout.splitlines():
+            p = Path(line.strip())
+            if p.name.endswith(".raw.ts") or ".seg" in p.name:
+                continue
+            out.append((str(p.parent), p.stem, p.suffix))
     return sorted(out)
 
 
@@ -87,23 +93,106 @@ def jf_token() -> str:
     return r.stdout.strip()
 
 
-def jf_refresh_images(token: str, folder: str, base: str) -> str:
-    """Find the item by path and force it to re-read images."""
-    path = f"/media/recordings/Commercial Free/Sports - CF/{Path(folder).name}"
-    q = urllib.parse.urlencode({"Recursive": "true", "IncludeItemTypes": "Movie,Video", "Fields": "Path",
-                                "SearchTerm": base[:40], "Limit": "20"})
-    r = ct(["curl", "-s", "--max-time", "30", "-H", f"X-Emby-Token: {token}", f"{JF}/Items?{q}"])
-    try:
-        items = json.loads(r.stdout).get("Items", [])
-    except Exception:  # noqa: BLE001
-        return "lookup failed"
-    hit = next((i for i in items if str(i.get("Path", "")).startswith(path)), None)
-    if not hit:
-        return "item not found in Jellyfin"
+def jf_item_id_for_path(ct_path: str) -> str:
+    """Resolve a recording's Jellyfin item id from its path via the library DB
+    (read-only). SearchTerm found 2 of 8 recordings in the first backfill --
+    Jellyfin tokenises titles with dates and '@' oddly -- while the path is
+    exact (agy 4c finding 8)."""
+    r = ct(["python3", "-c",
+            "import sqlite3,sys;c=sqlite3.connect('file:/srv/media-core/jellyfin/config/data/jellyfin.db?mode=ro',uri=True);"
+            "r=list(c.execute('select Id from BaseItems where Path=?',(sys.argv[1],)));print(r[0][0] if r else '')",
+            ct_path])
+    return r.stdout.strip().replace("-", "").lower()
+
+
+def jf_refresh_images(token: str, folder: str, base: str, ext: str) -> str:
+    """Force one item to re-read its images. Per item, never library-wide:
+    a whole-library FullRefresh contends with the guide refresh for the DB."""
+    jf_path = f"/media/recordings/{folder.split('/media/recordings/',1)[1]}/{base}{ext}"
+    item = jf_item_id_for_path(jf_path)
+    if not item:
+        return "item not found in Jellyfin (not scanned yet?)"
     r = ct(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "30", "-X", "POST",
             "-H", f"X-Emby-Token: {token}",
-            f"{JF}/Items/{hit['Id']}/Refresh?ImageRefreshMode=FullRefresh&ReplaceAllImages=true&MetadataRefreshMode=None"])
+            f"{JF}/Items/{item}/Refresh?ImageRefreshMode=FullRefresh&ReplaceAllImages=true&MetadataRefreshMode=None"])
     return f"refresh HTTP {r.stdout.strip()}"
+
+
+DEFAULT_LEAGUES = ("football/nfl", "football/college-football", "baseball/mlb", "basketball/nba",
+                   "hockey/nhl", "soccer/ger.1", "soccer/uefa.champions", "soccer/eng.1")
+
+
+def anthropic_key() -> str:
+    """ANTHROPIC_API_KEY from CT 105's .env (600, never in the repo). Empty
+    when the owner has not provisioned one -- the LLM step is then skipped."""
+    r = ct(["sh", "-c", "grep -m1 '^ANTHROPIC_API_KEY=' /srv/media-core/.env 2>/dev/null | cut -d= -f2-"])
+    return r.stdout.strip().strip('"').strip("'")
+
+
+def llm_pick_fixture(key: str, nfo: dict, folder: str, day: datetime, candidates: list[tuple[str, dict]]) -> tuple[dict, str] | None:
+    """Ask Claude which of the day's fixtures a vaguely-titled recording is.
+    Only runs when deterministic matching (pre-rendered store, both team
+    names in title/plot) found nothing. Returns (game, sport_path) or None.
+    The model only ever sees recording metadata and ESPN fixture names, and
+    only answers with an id -- no free-form output is trusted."""
+    if not key or not candidates:
+        return None
+    menu = "\n".join(f"{g['_espn_event'].get('id')} | {sp} | {g['name']} | {g['start'].astimezone(LOCAL_TZ):%a %H:%M}"
+                     for sp, g in candidates if g.get("_espn_event", {}).get("id"))
+    prompt = (f"A DVR recorded a sports broadcast. Identify which fixture it is.\n\n"
+              f"Recording title: {nfo.get('title','')}\nFolder: {Path(folder).name}\n"
+              f"Description: {(nfo.get('plot') or '')[:600]}\nRecorded on (local, Europe/Berlin): {day:%Y-%m-%d}\n\n"
+              f"Candidate fixtures (id | league | matchup | local kickoff):\n{menu}\n\n"
+              f"Reply with the single best id, or NONE if no candidate fits.")
+    body = json.dumps({"model": "claude-haiku-4-5-20251001", "max_tokens": 16,
+                       "messages": [{"role": "user", "content": prompt}]}).encode()
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
+        "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            out = json.loads(r.read())
+        answer = "".join(b.get("text", "") for b in out.get("content", [])).strip()
+    except Exception as exc:  # noqa: BLE001
+        print(f"        llm: request failed ({exc})"); return None
+    m = re.search(r"\d{6,}", answer)
+    if not m:
+        return None
+    return next(((g, sp) for sp, g in candidates if str(g["_espn_event"].get("id")) == m.group(0)), None)
+
+
+def install_card(folder: str, base: str, existing: list[str], sole: bool, poster: bytes, thumb: bytes) -> None:
+    """Per-recording files always; the folder-generic ones only when this is
+    the folder's only recording (a shared folder keeps its own poster)."""
+    ct_write(f"{folder}/{base}-poster.jpg", poster)
+    ct_write(f"{folder}/{base}-thumb.jpg", thumb)
+    if sole:
+        for old in ("poster.jpg", "poster.png"):
+            if old in existing and "poster.jpg.orig" not in existing:
+                ct(["mv", "-n", f"{folder}/{old}", f"{folder}/poster.jpg.orig"])
+                break
+        ct_write(f"{folder}/poster.jpg", poster)
+        ct_write(f"{folder}/thumb.jpg", thumb)
+
+
+def prerendered_match(mct, blob: str, day: datetime) -> tuple[Path, dict] | None:
+    """A card sports-dvr-auto rendered at booking time whose fixture is on
+    this day (+-1 day, kickoffs cross midnight) and whose two teams are both
+    named in the recording's title/plot/folder. No network."""
+    best = None
+    for d in sorted(CARDS_DIR.glob("*/fixture.json")) if CARDS_DIR.exists() else []:
+        try:
+            fx = json.loads(d.read_text())
+            start = datetime.fromisoformat(fx["start"]) if fx.get("start") else None
+        except (ValueError, KeyError, json.JSONDecodeError):
+            continue
+        if not start or abs((start - day).total_seconds()) > 30 * 3600:
+            continue
+        teams = fx.get("teams") or []
+        if len(teams) == 2 and all(any(tok in blob for tok in mct._team_tokens(t)) for t in teams):
+            drift = abs((start - day).total_seconds())
+            if best is None or drift < best[0]:
+                best = (drift, d.parent, fx)
+    return (best[1], best[2]) if best else None
 
 
 def main() -> int:
@@ -111,17 +200,21 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--only", default="", help="substring of the folder name")
     ap.add_argument("--force", action="store_true", help="redo folders that already have a card")
+    ap.add_argument("--max-age-days", type=int, default=0, help="skip recordings older than this (0 = no limit)")
     a = ap.parse_args()
     mct = load_mct()
     token = "" if a.dry_run else jf_token()
+    key = anthropic_key()
+    if not key:
+        print("note: no ANTHROPIC_API_KEY in CT105 .env -- LLM fixture fallback disabled")
 
     recs = list_recordings()
     per_folder: dict[str, int] = {}
-    for f, _ in recs:
+    for f, _, _ in recs:
         per_folder[f] = per_folder.get(f, 0) + 1
 
     done = skipped = failed = 0
-    for folder, base in recs:
+    for folder, base, ext in recs:
         if a.only and a.only.lower() not in folder.lower():
             continue
         nfo = read_nfo(folder, base)
@@ -130,15 +223,34 @@ def main() -> int:
         if not m:
             print(f"  SKIP {base}: no date"); skipped += 1; continue
         day = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), 12, 0, tzinfo=LOCAL_TZ)
+        if a.max_age_days and (datetime.now(LOCAL_TZ) - day).days > a.max_age_days:
+            continue
+        existing = ct(["ls", "-1", folder]).stdout.splitlines()
+        if not a.force and f"{base}-poster.jpg" in existing:
+            continue
         leagues = mct.infer_espn_leagues(title, nfo.get("plot", ""), " ".join(nfo.get("genres", [])), Path(folder).name)
-        if not leagues:
+        if not leagues and not key:
             print(f"  SKIP {base}: cannot infer league from {title!r}"); skipped += 1; continue
 
         # Try each candidate competition; accept the fixture on that day whose
         # two competitors are BOTH named in title/plot/folder.
         blob = f"{title} {nfo.get('plot','')} {Path(folder).name}".lower()
+        pre = prerendered_match(mct, blob, day)
+        if pre:
+            card_dir, pfx = pre
+            print(f"  CARD {base}  <-  {pfx.get('name')}  (pre-rendered at booking)")
+            if a.dry_run:
+                done += 1; continue
+            try:
+                install_card(folder, base, existing, per_folder[folder] == 1,
+                             (card_dir / "poster.jpg").read_bytes(), (card_dir / "thumb.jpg").read_bytes())
+                print(f"        wrote card; jellyfin: {jf_refresh_images(token, folder, base, ext)}")
+                done += 1
+            except Exception as exc:  # noqa: BLE001
+                print(f"  FAIL {base}: {exc}"); failed += 1
+            continue
         best, league = None, None
-        for cand in leagues:
+        for cand in (leagues or ()):
             for g in mct.load_espn_scoreboard(cand, day):
                 if abs((g["start"] - day).total_seconds()) > 20 * 3600:
                     continue
@@ -148,13 +260,17 @@ def main() -> int:
                         best, league = g, cand
             if best:
                 break
+        if not best and key:
+            cands = [(sp, g) for sp in (leagues or DEFAULT_LEAGUES) for g in mct.load_espn_scoreboard(sp, day)
+                     if abs((g["start"] - day).total_seconds()) <= 20 * 3600 and len(g.get("competitors") or []) == 2]
+            pick = llm_pick_fixture(key, nfo, folder, day, cands)
+            if pick:
+                best, league = pick
+                print(f"        llm resolved {base!r} -> {best['name']}")
         if not best:
-            print(f"  SKIP {base}: no fixture in {leagues} on {day:%Y-%m-%d} names both teams"); skipped += 1; continue
+            print(f"  SKIP {base}: no fixture in {leagues or DEFAULT_LEAGUES} on {day:%Y-%m-%d} names both teams"); skipped += 1; continue
 
         fx = sports_card.fixture_from_espn_event(best["_espn_event"], league)
-        existing = ct(["ls", folder]).stdout.split()
-        if not a.force and f"{base}-poster.jpg" in existing:
-            print(f"  ok   {base}: card already present"); continue
         print(f"  CARD {base}  <-  {fx['name']}  ({fx['venue'] or 'no venue'})")
         if a.dry_run:
             done += 1; continue
@@ -163,16 +279,8 @@ def main() -> int:
             with tempfile.TemporaryDirectory() as td:
                 out = sports_card.render_cards(fx, Path(td), base)
                 poster = Path(out["poster"]).read_bytes(); thumb = Path(out["thumb"]).read_bytes()
-            ct_write(f"{folder}/{base}-poster.jpg", poster)
-            ct_write(f"{folder}/{base}-thumb.jpg", thumb)
-            if per_folder[folder] == 1:
-                for old in ("poster.jpg", "poster.png"):
-                    if old in existing and "poster.jpg.orig" not in existing:
-                        ct(["mv", "-n", f"{folder}/{old}", f"{folder}/poster.jpg.orig"])
-                        break
-                ct_write(f"{folder}/poster.jpg", poster)
-                ct_write(f"{folder}/thumb.jpg", thumb)
-            print(f"        wrote card; jellyfin: {jf_refresh_images(token, folder, base)}")
+            install_card(folder, base, existing, per_folder[folder] == 1, poster, thumb)
+            print(f"        wrote card; jellyfin: {jf_refresh_images(token, folder, base, ext)}")
             done += 1
         except Exception as exc:  # noqa: BLE001
             print(f"  FAIL {base}: {exc}"); failed += 1
