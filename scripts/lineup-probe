@@ -71,7 +71,11 @@ total=$(wc -l < "$CH"); n=0; echo "lineup-probe: $total channels in playlist" >&
 viewer_present() {
   pct exec 105 -- bash -c 'K=$(cat /srv/media-core/.jellyfin_api_key); curl -s --max-time 10 -H "X-Emby-Token: $K" http://127.0.0.1:8096/Sessions | python3 -c "import json,sys; sys.exit(0 if any((s.get(\"NowPlayingItem\") or {}).get(\"Type\")==\"TvChannel\" for s in json.load(sys.stdin)) else 1)"' 2>/dev/null
 }
-capture_running() { systemctl list-units 'mct-*' --state=running --no-pager 2>/dev/null | grep -q "MCT capture"; }
+capture_running() {
+  # MCT capture (host unit) OR a Jellyfin LiveTV timer currently recording
+  systemctl list-units 'mct-*' --state=running --no-pager 2>/dev/null | grep -q "MCT capture" && return 0
+  pct exec 105 -- bash -c 'K=$(cat /srv/media-core/.jellyfin_api_key); curl -s --max-time 10 -H "X-Emby-Token: $K" http://127.0.0.1:8096/LiveTv/Timers | python3 -c "import json,sys; sys.exit(0 if any(t.get(\"Status\")==\"InProgress\" for t in json.load(sys.stdin).get(\"Items\",[])) else 1)"' 2>/dev/null
+}
 
 while IFS=$'\t' read -r chno name group url; do
   echo "$group" | grep -Eq "^($EVENT_GROUPS)$" && continue          # slots, not channels
