@@ -174,6 +174,25 @@ def install_card(folder: str, base: str, existing: list[str], sole: bool, poster
         ct_write(f"{folder}/thumb.jpg", thumb)
 
 
+def venue_named(blob: str, venue: str) -> bool:
+    """'Aus der Allianz Arena München' names the fixture at 'Allianz Arena,
+    Munich' -- the German feeds often describe a match by venue alone
+    (Bayern-Union 2026-09-18). Match on the stadium part before the comma,
+    all its significant words, case/diacritics-insensitively."""
+    import unicodedata
+    def norm(t: str) -> str:
+        return "".join(ch for ch in unicodedata.normalize("NFKD", t.lower()) if not unicodedata.combining(ch))
+    stadium = (venue or "").split(",")[0].strip()
+    words = [w for w in re.findall(r"[a-z0-9]{3,}", norm(stadium)) if w not in ("stadium", "arena", "park", "field", "the")]
+    return bool(words) and len(words) >= 1 and all(w in norm(blob) for w in words) and any(k in norm(blob) for k in ("arena", "stadium", "park", "field", "stadion", "ballpark", "dome", "center", "centre", "bowl", "coliseum"))
+
+
+def fixture_fits(mct, blob: str, teams: list[str], venue: str) -> bool:
+    if len(teams) == 2 and all(any(tok in blob for tok in mct._team_tokens(t)) for t in teams):
+        return True
+    return venue_named(blob, venue)
+
+
 def prerendered_match(mct, blob: str, day: datetime) -> tuple[Path, dict] | None:
     """A card sports-dvr-auto rendered at booking time whose fixture is on
     this day (+-1 day, kickoffs cross midnight) and whose two teams are both
@@ -188,7 +207,7 @@ def prerendered_match(mct, blob: str, day: datetime) -> tuple[Path, dict] | None
         if not start or abs((start - day).total_seconds()) > 30 * 3600:
             continue
         teams = fx.get("teams") or []
-        if len(teams) == 2 and all(any(tok in blob for tok in mct._team_tokens(t)) for t in teams):
+        if fixture_fits(mct, blob, teams, fx.get("venue") or ""):
             drift = abs((start - day).total_seconds())
             if best is None or drift < best[0]:
                 best = (drift, d.parent, fx)
@@ -255,7 +274,8 @@ def main() -> int:
                 if abs((g["start"] - day).total_seconds()) > 20 * 3600:
                     continue
                 comps = g.get("competitors") or []
-                if len(comps) == 2 and all(any(tok in blob for tok in mct._team_tokens(c)) for c in comps):
+                venue = ((g.get("_espn_event", {}).get("competitions") or [{}])[0].get("venue") or {}).get("fullName", "")
+                if fixture_fits(mct, blob, comps, venue):
                     if best is None or abs((g["start"] - day).total_seconds()) < abs((best["start"] - day).total_seconds()):
                         best, league = g, cand
             if best:

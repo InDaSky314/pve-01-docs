@@ -1,0 +1,7 @@
+[Unit]
+Description=Weekly probe: does every curated linear channel carry footage?
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/lineup-probe
+Nice=15

@@ -1,0 +1,9 @@
+[Unit]
+Description=lineup-probe weekly (Thu 14:00 CEST = 08:00 ET, US channels on air, no games)
+
+[Timer]
+OnCalendar=Thu *-*-* 14:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

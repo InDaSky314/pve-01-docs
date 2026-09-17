@@ -799,6 +799,8 @@ def fetch_espn_schedule() -> list[dict[str, Any]]:
                 "state": status_type.get("state", "pre"),
                 "completed": bool(status_type.get("completed", False)),
                 "status_detail": status_type.get("detail") or status_type.get("shortDetail") or "",
+                "_espn_event": ev,
+                "sport_path": sport_path,
             })
 
     games.sort(key=lambda g: g["start"])
@@ -1100,6 +1102,7 @@ def prerender_card(game: dict[str, Any], channel_name: str, timer_name: str) -> 
             "event_id": str(event["id"]), "name": fx.get("name"), "sport_path": fx.get("sport_path"),
             "start": fx["start"].isoformat() if fx.get("start") else None,
             "teams": [c.get("displayName") for c in comps],
+            "venue": fx.get("venue") or "",
             "channel": channel_name, "timer_name": timer_name,
             "rendered": datetime.now(timezone.utc).isoformat(),
         }, ensure_ascii=False, indent=1))
@@ -1227,7 +1230,6 @@ def schedule_game_timer(game: dict[str, Any], channel_id: str, channel_name: str
     res = jf_request("/emby/LiveTv/Timers", data=payload, method="POST")
     if res is not None:
         logging.info("  [SUCCESS] Timer created for %s", name)
-        prerender_card(game, channel_name, name)
         return True
     logging.error("  [FAILED] Could not create timer for %s", name)
     return False
@@ -1415,6 +1417,13 @@ def run_auto_scheduler(dry_run: bool = True, games: list[dict[str, Any]] | None 
             logging.info("Skip %s (%s): Auto-record toggled OFF in %s", game["name"], team, SPORTS_CONFIG_FILE)
             continue
 
+        # Card first, whatever happens to the booking below: a game we want
+        # will be recorded by SOME engine (Jellyfin timer, PPV fallback, MCT,
+        # or the owner by hand) and the sweep applies the card by teams,
+        # venue or date when the recording lands (owner request 2026-09-17).
+        if not dry_run:
+            prerender_card(game, "", f"{game['team']}: {game['name']}")
+
         # Book the linear safety net first: the English PPV slot usually
         # can't resolve until hours before kickoff (and may never label at
         # all), so the fallback must not be gated behind that resolution
@@ -1434,8 +1443,6 @@ def run_auto_scheduler(dry_run: bool = True, games: list[dict[str, Any]] | None 
         if is_overlapping_timer(cid, game["start"], game["end"], existing_timers,
                                 timer_name=f"{game['team']}: {game['name']}"):
             logging.info("Skip %s (%s): Overlapping timer already exists on %s", game["name"], game["team"], cname)
-            if not dry_run:
-                prerender_card(game, cname, f"{game['team']}: {game['name']}")   # idempotent; covers timers booked before 2026-09-17
             continue
 
         # The single tuner is shared with the Manual Capture Tool. Without this
@@ -1449,13 +1456,10 @@ def run_auto_scheduler(dry_run: bool = True, games: list[dict[str, Any]] | None 
         if mct_conflict:
             logging.info("Skip %s (%s): %s owns this window on the shared tuner",
                          game["name"], game["team"], mct_reason)
-            if not dry_run:
-                prerender_card(game, cname, f"{game['team']}: {game['name']}")
             continue
 
         if starts_overnight(game):
-            if schedule_mct_booking(game, cname, dry_run=dry_run) and not dry_run:
-                prerender_card(game, cname, f"{game['team']}: {game['name']}")
+            schedule_mct_booking(game, cname, dry_run=dry_run)
         else:
             schedule_game_timer(game, cid, cname, dry_run=dry_run)
 

@@ -1,0 +1,100 @@
+#!/bin/bash
+# lineup-probe -- does each curated linear channel actually carry footage?
+#
+# Built from the 2026-09-17 audit prober. Pulls ~1 MB from every non-event
+# channel in the live playlist, straight from the provider (ONE connection --
+# so it yields to a live viewer and never runs beside an MCT capture), and
+# classifies: SLATE (provider "unavailable" clip, by fingerprint), DEAD (<300 KB
+# or HTTP error), FROZEN (still frame for 6 s), LIVE.
+#
+# Weekly via lineup-probe.timer. Writes STATE/<date>.tsv, diffs against the
+# previous run and mails the owner when a linear channel is SLATE/DEAD/FROZEN
+# two runs in a row (one bad probe is usually the provider having a moment).
+#
+#   lineup-probe                 full run
+#   lineup-probe --chno 129,130  re-probe a few channels (appends to today's file)
+#   lineup-probe --report        only the summary/diff of the latest two runs
+set -u
+STATE=/var/lib/dvr-dashboard/lineup-probe
+SLATE_FP=3cdbaf640cc0
+EVENT_GROUPS="Soccer PPV|DAZN PPV|DAZN PPV GB|Sky Sports\+ PPV|Peacock PPV|NFL|NBA|NHL|MLB|UEFA|UK Football|BBC Streams|HBO Max|Big Brother"
+MAIL_TO=${LINEUP_PROBE_MAIL:-nathan.karras@gmail.com}
+mkdir -p "$STATE"; chmod 700 "$STATE"
+TODAY=$(date +%F); OUT="$STATE/$TODAY.tsv"; ONLY=""; REPORT_ONLY=0
+while [ $# -gt 0 ]; do case "$1" in --chno) ONLY=",$2,"; shift 2;; --report) REPORT_ONLY=1; shift;; *) echo "unknown arg $1" >&2; exit 2;; esac; done
+
+report() {
+  local latest prev
+  latest=$(ls -1 "$STATE"/*.tsv 2>/dev/null | sort | tail -1); prev=$(ls -1 "$STATE"/*.tsv 2>/dev/null | sort | tail -2 | head -1)
+  [ -n "$latest" ] || { echo "no runs yet"; return; }
+  python3 - "$latest" "$prev" "$EVENT_GROUPS" <<'PY'
+import sys, re, collections
+latest, prev, ev = sys.argv[1], sys.argv[2], re.compile(r"^(%s)$" % sys.argv[3])
+def load(p):
+    d = {}
+    for l in open(p):
+        f = l.rstrip("\n").split("\t")
+        if len(f) >= 8 and f[0] != "chno": d[f[0]] = f
+    return d
+L, P = load(latest), (load(prev) if prev and prev != latest else {})
+tot = collections.Counter(f[7] for f in L.values())
+print(f"lineup-probe {latest.rsplit('/',1)[1][:-4]}: {len(L)} channels -- " + ", ".join(f"{k} {v}" for k, v in sorted(tot.items())))
+bad = [f for f in L.values() if f[7] != "LIVE" and not ev.match(f[2])]
+print(f"\nlinear channels not LIVE ({len(bad)}):")
+for f in sorted(bad, key=lambda f: int(f[0]) if f[0].isdigit() else 0):
+    was = P.get(f[0], [None]*8)[7]
+    flag = "  <-- 2nd run in a row" if was and was != "LIVE" else ("  (was LIVE last run)" if was == "LIVE" else "")
+    print(f"  {f[0]:>5}  {f[1][:40]:40} {f[2][:22]:22} {f[7]}{flag}")
+rep = [f for f in bad if P.get(f[0], [None]*8)[7] not in (None, "LIVE")]
+print(f"\nREPEAT_BAD={len(rep)}")
+PY
+}
+
+if [ "$REPORT_ONLY" = 1 ]; then report; exit 0; fi
+
+# channel list from the live playlist (URLs carry provider credentials: 600, deleted after the run)
+CH="$STATE/.channels.$$"; umask 077
+pct exec 105 -- python3 - <<'PY' > "$CH"
+import re
+lines=open("/srv/media-core/threadfin/conf/playlist.m3u",encoding="utf-8").read().splitlines()
+for i,l in enumerate(lines):
+    if not l.startswith("#EXTINF"): continue
+    g=re.search(r'group-title="([^"]*)"',l); n=re.search(r'tvg-name="([^"]*)"',l); c=re.search(r'tvg-chno="([^"]*)"',l)
+    if not (g and n and c): continue
+    url=lines[i+1].strip() if i+1<len(lines) else ""
+    print(f"{c.group(1)}\t{n.group(1)}\t{g.group(1)}\t{url}")
+PY
+trap 'rm -f "$CH"' EXIT
+[ -f "$OUT" ] || echo -e "chno\tname\tgroup\thttp\tbytes\tfp\tfreeze\tverdict" > "$OUT"
+total=$(wc -l < "$CH"); n=0; echo "lineup-probe: $total channels in playlist" >&2
+
+viewer_present() {
+  pct exec 105 -- bash -c 'K=$(cat /srv/media-core/.jellyfin_api_key); curl -s --max-time 10 -H "X-Emby-Token: $K" http://127.0.0.1:8096/Sessions | python3 -c "import json,sys; sys.exit(0 if any((s.get(\"NowPlayingItem\") or {}).get(\"Type\")==\"TvChannel\" for s in json.load(sys.stdin)) else 1)"' 2>/dev/null
+}
+capture_running() { systemctl list-units 'mct-*' --state=running --no-pager 2>/dev/null | grep -q "MCT capture"; }
+
+while IFS=$'\t' read -r chno name group url; do
+  echo "$group" | grep -Eq "^($EVENT_GROUPS)$" && continue          # slots, not channels
+  [ -n "$ONLY" ] && ! echo "$ONLY" | grep -q ",$chno," && continue
+  [ -z "$ONLY" ] && grep -q "^${chno}	" "$OUT" && continue           # resumable
+  n=$((n+1))
+  while [ $((n % 10)) -eq 1 ] && viewer_present; do echo "$(date +%H:%M) live viewer present, waiting" >&2; sleep 120; done
+  while capture_running; do sleep 300; done
+  res=$(pct exec 105 -- bash -c "out=\$(timeout 12 curl -sL --max-time 8 -r 0-1200000 '$url' -o /tmp/lp.ts -w '%{http_code}'); sz=\$(stat -c %s /tmp/lp.ts 2>/dev/null||echo 0); fp=\$(head -c 1000000 /tmp/lp.ts 2>/dev/null | md5sum | cut -c1-12); fz=n/a; if [ \"\$sz\" -gt 300000 ]; then e=\$(docker exec jellyfin /usr/lib/jellyfin-ffmpeg/ffmpeg -v info -t 6 -i /tmp/lp.ts -an -vf freezedetect=n=-50dB:d=2 -f null - 2>&1); s=\$(echo \"\$e\" | grep -c freeze_start); en=\$(echo \"\$e\" | grep -c freeze_end); [ \"\$s\" -gt 0 ] && [ \"\$en\" -eq 0 ] && fz=frozen || fz=moving; fi; rm -f /tmp/lp.ts; echo \"\$out \$sz \$fp \$fz\"" 2>/dev/null)
+  set -- $res; http=${1:-000}; bytes=${2:-0}; fp=${3:-}; fz=${4:-n/a}
+  if [ "$fp" = "$SLATE_FP" ]; then v=SLATE
+  elif [ "$bytes" -lt 300000 ]; then v=DEAD
+  elif [ "$fz" = frozen ]; then v=FROZEN
+  else v=LIVE; fi
+  [ -n "$ONLY" ] && sed -i "/^${chno}	/d" "$OUT"
+  echo -e "$chno\t$name\t$group\t$http\t$bytes\t$fp\t$fz\t$v" >> "$OUT"
+  [ $((n % 25)) -eq 0 ] && echo "$(date +%H:%M) $n probed" >&2
+  sleep 1
+done < "$CH"
+
+rep=$(report); echo "$rep"
+if [ -z "$ONLY" ] && command -v mail >/dev/null; then
+  if echo "$rep" | grep -q "REPEAT_BAD=[1-9]"; then
+    echo "$rep" | mail -s "[pve-01] lineup-probe: linear channels bad two weeks running" "$MAIL_TO"
+  fi
+fi
