@@ -138,6 +138,8 @@ DEFAULT_SPORTS_CONFIG = {
     "Bucks": True,
     "Brewers": False,
     "Bayern Munich": True,
+    "USWNT": True,
+    "Lionesses": True,
 }
 
 # Baseline durations per sport
@@ -166,6 +168,25 @@ TEAMS = [
     ("Bayern Munich",      "soccer/uefa.champions",              "132"),
 ]
 
+# National teams (owner request 2026-09-18: USWNT and the Lionesses for
+# World Cup qualifying / internationals). ESPN's /teams/{id}/schedule only
+# lists PAST matches for national sides, so these are found by scanning the
+# competition calendars (core API date range -> site scoreboard per day) and
+# keeping events where one competitor is the named team. Channel comes from
+# the guide first (TNT/truTV carry the USWNT; the Lionesses' US carriage
+# varies), then the network map.
+NATIONAL_TEAMS = [
+    ("USWNT",     "United States", ["soccer/fifa.friendly.w", "soccer/concacaf.womens.championship",
+                                    "soccer/fifa.w.concacaf.olympicsq", "soccer/fifa.wwc"],
+     ["uswnt", "united states"]),
+    ("Lionesses", "England",       ["soccer/fifa.wworldq.uefa", "soccer/fifa.wwcq.ply", "soccer/fifa.friendly.w",
+                                    "soccer/uefa.w.nations", "soccer/uefa.weuro", "soccer/fifa.wwc"],
+     ["lionesses", "england"]),
+]
+NATIONAL_TEAM_LOOKAHEAD_DAYS = 21
+NATIONAL_TEAM_CACHE = Path("/var/lib/dvr-dashboard/national-teams-cache.json")
+NATIONAL_TEAM_CACHE_TTL = 6 * 3600   # the calendar scan is ~100 ESPN requests; 4x/day is plenty
+
 # ESPN season types: Preseason=1, Regular=2, Postseason=3
 SEASON_TYPES = [1, 2, 3]
 
@@ -191,6 +212,10 @@ NETWORK_CHANNEL_MAP = {
     "MLB Net": "MLB Network",
     "MLBN": "MLB Network",
     "MLB Network": "MLB Network",
+    "TNT": "TNT West 4K",
+    "TBS": "TBS HD",
+    "truTV": "truTV West 4K",
+    "TruTV": "truTV West 4K",
     "ACCN": "ACC Network HD",
     "ACC Network": "ACC Network HD",
     "TBS": "TBS HD",
@@ -672,10 +697,112 @@ def jf_request(endpoint: str, data: dict[str, Any] | None = None, method: str = 
     return None
 
 
+def _espn_get(url: str, timeout: int = 20) -> dict[str, Any]:
+    req = urllib.request.Request(url, headers={"Accept-Encoding": "identity"})   # a custom UA gets 403 from site.api
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def fetch_national_team_games(seen_ids: set[str]) -> list[dict[str, Any]]:
+    """Upcoming matches for NATIONAL_TEAMS via the competition calendars,
+    cached on disk for NATIONAL_TEAM_CACHE_TTL."""
+    try:
+        cache = json.loads(NATIONAL_TEAM_CACHE.read_text())
+        if time.time() - cache.get("fetched", 0) < NATIONAL_TEAM_CACHE_TTL:
+            out = []
+            for g in cache.get("games", []):
+                if g["id"] in seen_ids:
+                    continue
+                seen_ids.add(g["id"])
+                g["start"] = datetime.fromisoformat(g["start"]); g["end"] = datetime.fromisoformat(g["end"])
+                out.append(g)
+            return out
+    except (OSError, ValueError, KeyError):
+        pass
+    games = _scan_national_team_games(seen_ids)
+    try:
+        ser = [dict(g, start=g["start"].isoformat(), end=g["end"].isoformat()) for g in games]
+        tmp = NATIONAL_TEAM_CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"fetched": time.time(), "games": ser}))
+        tmp.replace(NATIONAL_TEAM_CACHE)
+    except OSError as exc:
+        logging.debug("national-team cache write failed: %s", exc)
+    return games
+
+
+def _scan_national_team_games(seen_ids: set[str]) -> list[dict[str, Any]]:
+    games: list[dict[str, Any]] = []
+    now_utc = datetime.now(timezone.utc)
+    lo = now_utc.strftime("%Y%m%d")
+    hi = (now_utc + timedelta(days=NATIONAL_TEAM_LOOKAHEAD_DAYS)).strftime("%Y%m%d")
+    day_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for label, team_name, leagues, _aliases in NATIONAL_TEAMS:
+        for sport_path in leagues:
+            slug = sport_path.split("/", 1)[1]
+            try:
+                idx = _espn_get(f"https://sports.core.api.espn.com/v2/sports/soccer/leagues/{slug}/events?dates={lo}-{hi}&limit=200")
+            except Exception as exc:  # noqa: BLE001
+                logging.debug("core events failed for %s: %s", slug, exc)
+                continue
+            # the core index only gives event refs; the date is in the ref's
+            # id neighbourhood, so fetch each ref's date cheaply via the site
+            # scoreboard by day -- one call per distinct day per league.
+            days: set[str] = set()
+            for it in idx.get("items", []):
+                ref = it.get("$ref", "")
+                try:
+                    ev = _espn_get(ref, timeout=15)
+                    days.add(ev["date"][:10].replace("-", ""))
+                except Exception:  # noqa: BLE001
+                    continue
+            for d in sorted(days):
+                key = (sport_path, d)
+                if key not in day_cache:
+                    try:
+                        day_cache[key] = _espn_get(
+                            f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/scoreboard?dates={d}").get("events", [])
+                    except Exception:  # noqa: BLE001
+                        day_cache[key] = []
+                for event in day_cache[key]:
+                    comp = (event.get("competitions") or [{}])[0]
+                    names = [((c.get("team") or {}).get("displayName") or "") for c in comp.get("competitors") or []]
+                    if team_name not in names:
+                        continue
+                    event_id = event.get("id")
+                    if not event_id or event_id in seen_ids:
+                        continue
+                    try:
+                        start_dt = datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
+                    except (KeyError, ValueError):
+                        continue
+                    seen_ids.add(event_id)
+                    status_type = ((comp.get("status") or {}).get("type") or {})
+                    broadcast_names = [n for bc in comp.get("broadcasts") or [] for n in bc.get("names") or [] if n]
+                    games.append({
+                        "id": event_id, "team": label, "kind": "soccer",
+                        "name": event.get("name") or event.get("shortName") or "Match",
+                        "shortName": event.get("shortName") or "",
+                        "start": start_dt, "end": start_dt + DURATIONS.get("soccer", timedelta(hours=2, minutes=30)),
+                        "broadcasts": broadcast_names,
+                        "state": status_type.get("state", "pre"),
+                        "completed": bool(status_type.get("completed", False)),
+                        "status_detail": status_type.get("detail") or status_type.get("shortDetail") or "",
+                        "_espn_event": event, "sport_path": sport_path,
+                    })
+    if games:
+        logging.info("National teams: %d upcoming match(es): %s", len(games),
+                     "; ".join(f"{g['team']} {g['start'].astimezone(LOCAL_TZ):%a %d %b %H:%M} {g['name']}" for g in games))
+    return games
+
+
 def fetch_espn_schedule() -> list[dict[str, Any]]:
-    """Fetch schedule for all 5 followed teams from ESPN API."""
+    """Fetch schedule for all followed teams from ESPN API."""
     games: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
+    try:
+        games.extend(fetch_national_team_games(seen_ids))
+    except Exception as exc:  # noqa: BLE001 -- never let the new path break the old one
+        logging.warning("national-team fetch failed: %s", exc)
 
     for team_label, sport_path, team_id in TEAMS:
         if team_label in DYNAMIC_PPV_TEAMS:
@@ -851,6 +978,13 @@ def get_jellyfin_channels() -> dict[str, str]:
 
 def resolve_channel_id(game: dict[str, Any], jf_channels: dict[str, str]) -> tuple[str | None, str]:
     """Resolve ESPN broadcast network to Jellyfin channel ID and channel name."""
+    if game.get("team") in {t[0] for t in NATIONAL_TEAMS}:
+        epg_ch, epg_why = _epg_fixture_channel(game, jf_channels)
+        if epg_ch:
+            cid = jf_channels.get(epg_ch) or jf_channels.get(epg_ch.lower())
+            if cid:
+                logging.info("[NATIONAL] Guide places %s on %s: %s", game["name"], epg_ch, epg_why)
+                return cid, epg_ch
     team = game["team"]
     if team in DYNAMIC_PPV_TEAMS:
         return resolve_dynamic_ppv_channel(team, game, jf_channels)
@@ -1511,6 +1645,10 @@ def _epg_fixture_channel(game: dict[str, Any],
     if not EPG_DB.exists():
         return None, "no EPG database"
     want = _fixture_tokens(game.get("name", ""))
+    for label, team_name, _leagues, aliases in NATIONAL_TEAMS:
+        if game.get("team") == label:
+            # "Spain at United States" is billed as "USWNT vs. Spain" on TNT
+            want |= _fixture_tokens(" ".join(aliases))
     if len(want) < EPG_FIXTURE_MIN_TOKENS:
         return None, f"fixture name {game.get('name','')!r} has too few distinctive words"
 

@@ -184,6 +184,8 @@ DEFAULT_SPORTS_CONFIG = {
     # before kickoff and creates the timer the moment a confident match
     # appears). The toggle governs that path like any other team.
     "Bayern Munich": True,
+    "USWNT": True,
+    "Lionesses": True,
 }
 
 
