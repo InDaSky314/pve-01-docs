@@ -85,6 +85,7 @@ def read_nfo(folder: str, base: str) -> dict:
         return {}
     g = lambda tag: (root.findtext(tag) or "").strip()
     return {"title": g("title"), "plot": g("plot"), "aired": g("aired") or g("premiered") or g("releasedate"),
+            "dateadded": g("dateadded"),
             "genres": [e.text or "" for e in root.findall("genre")]}
 
 
@@ -240,7 +241,10 @@ def main() -> int:
             continue
         nfo = read_nfo(folder, base)
         title = nfo.get("title") or Path(folder).name
-        m = re.search(r"(\d{4})-(\d{2})-(\d{2})", base) or re.search(r"(\d{4})-(\d{2})-(\d{2})", nfo.get("aired", ""))
+        # MCT names files "<title> 2026-09-18"; Jellyfin names them
+        # "<title> 2026_09_18_19_30_00" and dates the nfo in <dateadded>.
+        hay = f"{base} {nfo.get('aired','')} {nfo.get('dateadded','')}"
+        m = re.search(r"(\d{4})[-_](\d{2})[-_](\d{2})", hay)
         if not m:
             print(f"  SKIP {base}: no date"); skipped += 1; continue
         day = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), 12, 0, tzinfo=LOCAL_TZ)
