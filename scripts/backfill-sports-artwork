@@ -130,29 +130,51 @@ def anthropic_key() -> str:
     return r.stdout.strip().strip('"').strip("'")
 
 
-def llm_pick_fixture(key: str, nfo: dict, folder: str, day: datetime, candidates: list[tuple[str, dict]]) -> tuple[dict, str] | None:
-    """Ask Claude which of the day's fixtures a vaguely-titled recording is.
-    Only runs when deterministic matching (pre-rendered store, both team
-    names in title/plot) found nothing. Returns (game, sport_path) or None.
-    The model only ever sees recording metadata and ESPN fixture names, and
-    only answers with an id -- no free-form output is trusted."""
-    if not key or not candidates:
-        return None
+AGY_BIN = "/root/.local/bin/agy"
+AGY_MODEL = "gemini-3.8-flash-high"
+
+
+def _fixture_prompt(nfo: dict, folder: str, day: datetime, candidates: list[tuple[str, dict]]) -> str:
     menu = "\n".join(f"{g['_espn_event'].get('id')} | {sp} | {g['name']} | {g['start'].astimezone(LOCAL_TZ):%a %H:%M}"
                      for sp, g in candidates if g.get("_espn_event", {}).get("id"))
-    prompt = (f"A DVR recorded a sports broadcast. Identify which fixture it is.\n\n"
-              f"Recording title: {nfo.get('title','')}\nFolder: {Path(folder).name}\n"
-              f"Description: {(nfo.get('plot') or '')[:600]}\nRecorded on (local, Europe/Berlin): {day:%Y-%m-%d}\n\n"
-              f"Candidate fixtures (id | league | matchup | local kickoff):\n{menu}\n\n"
-              f"Reply with the single best id, or NONE if no candidate fits.")
+    return (f"A DVR recorded a sports broadcast. Identify which fixture it is.\n\n"
+            f"Recording title: {nfo.get('title','')}\nFolder: {Path(folder).name}\n"
+            f"Description: {(nfo.get('plot') or '')[:600]}\nRecorded on (local, Europe/Berlin): {day:%Y-%m-%d %H:%M}\n\n"
+            f"Candidate fixtures (id | league | matchup | local kickoff):\n{menu}\n\n"
+            f"Reply with the single best id and nothing else, or NONE if no candidate fits.")
+
+
+def _ask_anthropic(key: str, prompt: str) -> str:
     body = json.dumps({"model": "claude-haiku-4-5-20251001", "max_tokens": 16,
                        "messages": [{"role": "user", "content": prompt}]}).encode()
     req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
         "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        out = json.loads(r.read())
+    return "".join(b.get("text", "") for b in out.get("content", [])).strip()
+
+
+def _ask_agy(prompt: str) -> str:
+    """agy (the owner's Gemini CLI) in print mode: ~5 s, answers with the id.
+    Used when no ANTHROPIC_API_KEY is provisioned (owner's call 2026-09-18).
+    It shares the owner's quota, so it only ever runs as the last resort."""
+    r = subprocess.run([AGY_BIN, "-p", prompt, "--model", AGY_MODEL, "--print-timeout", "90s",
+                        "--disable-slash-commands", "--output-format", "text"],
+                       capture_output=True, text=True, timeout=120)
+    return r.stdout.strip().splitlines()[-1].strip() if r.stdout.strip() else ""
+
+
+def llm_pick_fixture(key: str, nfo: dict, folder: str, day: datetime, candidates: list[tuple[str, dict]]) -> tuple[dict, str] | None:
+    """Ask a model which of the day's fixtures a vaguely-titled recording is.
+    Only runs when deterministic matching (pre-rendered store, team names,
+    stadium) found nothing. Anthropic if a key exists, else agy. The model
+    only sees recording metadata and ESPN fixture names and only an id is
+    trusted back -- no free-form output is acted on."""
+    if not candidates:
+        return None
+    prompt = _fixture_prompt(nfo, folder, day, candidates)
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            out = json.loads(r.read())
-        answer = "".join(b.get("text", "") for b in out.get("content", [])).strip()
+        answer = _ask_anthropic(key, prompt) if key else _ask_agy(prompt)
     except Exception as exc:  # noqa: BLE001
         print(f"        llm: request failed ({exc})"); return None
     m = re.search(r"\d{6,}", answer)
@@ -228,8 +250,7 @@ def main() -> int:
     mct = load_mct()
     token = "" if a.dry_run else jf_token()
     key = anthropic_key()
-    if not key:
-        print("note: no ANTHROPIC_API_KEY in CT105 .env -- LLM fixture fallback disabled")
+    llm_available = bool(key) or Path(AGY_BIN).exists()
 
     per_folder: dict[str, int] = {}
     for f, _, _ in recs:
@@ -263,7 +284,7 @@ def main() -> int:
         if not a.force and f"{base}-poster.jpg" in existing:
             continue
         leagues = mct.infer_espn_leagues(title, nfo.get("plot", ""), " ".join(nfo.get("genres", [])), Path(folder).name)
-        if not leagues and not key:
+        if not leagues and not llm_available:
             print(f"  SKIP {base}: cannot infer league from {title!r}"); skipped += 1; continue
 
         # Try each candidate competition; accept the fixture on that day whose
@@ -295,7 +316,7 @@ def main() -> int:
                         best, league = g, cand
             if best:
                 break
-        if not best and key:
+        if not best and llm_available:
             cands = [(sp, g) for sp in (leagues or DEFAULT_LEAGUES) for g in mct.load_espn_scoreboard(sp, day)
                      if abs((g["start"] - day).total_seconds()) <= 20 * 3600 and len(g.get("competitors") or []) == 2]
             pick = llm_pick_fixture(key, nfo, folder, day, cands)
