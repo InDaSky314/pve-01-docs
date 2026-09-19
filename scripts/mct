@@ -929,6 +929,70 @@ def probe_channel_live(c: dict[str, str], slate_fp: str) -> tuple[bool, str]:
 # the wrong subject entirely (a 96x96 "Soccer PPV 18" icon on the Bodo/Glimt
 # game). When a fixture is attached, compose a card from the two team logos
 # instead. sports_card lives on the host; CT 105 has no Pillow.
+# --- In Progress visibility (owner ask 2026-09-19: "why can I not watch MCT
+# recordings in progress?"). Jellyfin's realtime monitor deliberately waits for
+# a file to stop changing before indexing it, so a live capture never appears
+# on its own. A targeted refresh of the capture folder indexes the growing
+# .raw.ts immediately (verified on the Badgers capture: item created, direct
+# play, h264). We publish once the first segment has real data, then every
+# IN_PROGRESS_REFRESH_SEC so the runtime keeps up with the file.
+IN_PROGRESS_MIN_BYTES = 8 * 1024 * 1024
+IN_PROGRESS_FIRST_AFTER_SEC = 45.0
+IN_PROGRESS_REFRESH_SEC = 300.0
+
+
+def jf_item_id_for_path(jf_path: str) -> str:
+    """Jellyfin item id for an exact library path, via the library DB (read-only)."""
+    try:
+        r = subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "python3", "-c",
+                            "import sqlite3,sys;c=sqlite3.connect('file:/srv/media-core/jellyfin/config/data/jellyfin.db?mode=ro',uri=True);"
+                            "r=list(c.execute('select Id from BaseItems where Path=?',(sys.argv[1],)));print(r[0][0] if r else '')",
+                            jf_path], capture_output=True, text=True, timeout=20)
+        return r.stdout.strip().replace("-", "").lower()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def jf_refresh_folder(container_dir: str) -> str:
+    """Targeted refresh so the in-progress file is (re)indexed. Falls back to
+    the category folder when Jellyfin has not created the capture folder yet."""
+    for path in (container_dir, container_dir.rsplit("/", 1)[0]):
+        item = jf_item_id_for_path(path)
+        if item:
+            jf_api(f"/Items/{item}/Refresh?Recursive=true&MetadataRefreshMode=Default&ImageRefreshMode=Default", method="POST")
+            return path
+    jf_api("/Library/Refresh", method="POST")
+    return "library"
+
+
+def maybe_publish_in_progress(state: dict, seg_raw_path: str, seg_launch_mono: float,
+                              meta: dict, poster_path: str, container_dir: str) -> None:
+    """Called from the capture tick loops (every ~2 s); cheap when idle."""
+    now = time.monotonic()
+    if now - state.get("last", 0.0) < (IN_PROGRESS_REFRESH_SEC if state.get("published") else 10.0):
+        return
+    state["last"] = now
+    if not state.get("published"):
+        if now - seg_launch_mono < IN_PROGRESS_FIRST_AFTER_SEC:
+            return
+        try:
+            r = subprocess.run(["/usr/sbin/pct", "exec", CT_ID, "--", "stat", "-c", "%s", f"/srv/media-core{seg_raw_path}"],
+                               capture_output=True, text=True, timeout=15)
+            size = int(r.stdout.strip() or 0)
+        except Exception:  # noqa: BLE001
+            size = 0
+        if size < IN_PROGRESS_MIN_BYTES:
+            return
+        write_artwork(meta, poster_path)          # folder card so the live item is not a blank tile
+    try:
+        where = jf_refresh_folder(container_dir)
+        if not state.get("published"):
+            log(f"[In-Progress] Published live capture to Jellyfin (refreshed {where}); re-indexing every {int(IN_PROGRESS_REFRESH_SEC)}s")
+        state["published"] = True
+    except Exception as exc:  # noqa: BLE001
+        log(f"[In-Progress] Jellyfin refresh failed: {exc}")
+
+
 def write_artwork(meta: dict, poster_path: str, base_file: str | None = None) -> None:
     """Write poster (+thumb) beside a finished recording.
 
@@ -2015,6 +2079,7 @@ def main() -> int:
     prev_sigint = signal.signal(signal.SIGINT, _sig_handler)
 
     try:
+        in_progress_published = [False]
         while True:
             elapsed_total = time.monotonic() - start_mono
             remaining_sec = int(hard_cap_sec - elapsed_total)
@@ -2055,6 +2120,7 @@ def main() -> int:
             p = subprocess.Popen(seg_ffmpeg_cmd, stdin=subprocess.PIPE,
                                  stdout=subprocess.DEVNULL, stderr=ffmpeg_err_f)
             current_p[0] = p
+            in_progress_state = {"published": in_progress_published[0], "last": 0.0}
 
             is_supervising = fixture is not None and not (fixture.get("completed") or fixture.get("state") == "post")
             if is_supervising:
@@ -2064,6 +2130,9 @@ def main() -> int:
                         ret = p.poll()
                         if ret is not None or interrupted[0]:
                             break
+                        if not args.dry_run:
+                            maybe_publish_in_progress(in_progress_state, seg_raw_path, seg_launch_mono, meta, poster_path, container_dir)
+                            in_progress_published[0] = in_progress_state["published"]
                         time.sleep(2)
 
                     if p.poll() is not None or interrupted[0]:
@@ -2130,6 +2199,9 @@ def main() -> int:
                     ret = p.poll()
                     if ret is not None or interrupted[0]:
                         break
+                    if not args.dry_run:
+                        maybe_publish_in_progress(in_progress_state, seg_raw_path, seg_launch_mono, meta, poster_path, container_dir)
+                        in_progress_published[0] = in_progress_state["published"]
                     time.sleep(2)
 
             try:
